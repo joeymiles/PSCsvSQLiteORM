@@ -219,8 +219,19 @@ Describe 'DbQuery Auto join finds a single relationship row' -Tag 'BUG-007' {
 }
 
 Describe 'Invoke-DbQuery PSSQLite fallback raises terminating errors' -Tag 'BUG-009' {
-    BeforeAll { Disable-DirectConnection }
-    AfterAll { Restore-DirectConnection }
+    # A -File runner script executes in the global scope, so its ErrorActionPreference = 'Stop'
+    # is the global preference that PSSQLite's Invoke-SqliteQuery already honours. Pin the
+    # global preference to Continue here so these tests only pass when Invoke-DbQuery itself
+    # requests terminating errors (-ErrorAction Stop) from the fallback.
+    BeforeAll {
+        Disable-DirectConnection
+        $script:oldGlobalEap = $global:ErrorActionPreference
+        $global:ErrorActionPreference = 'Continue'
+    }
+    AfterAll {
+        $global:ErrorActionPreference = $script:oldGlobalEap
+        Restore-DirectConnection
+    }
     It 'throws for a failing -NonQuery statement' {
         $db = New-CoreDbPath -Name 'b009nq'
         { Invoke-DbQuery -Database $db -Query 'INSERT INTO no_such_table VALUES(1)' -NonQuery | Out-Null } | Should -Throw
@@ -277,6 +288,11 @@ Describe 'Invoke-DbQuery result shape is the same on both paths' -Tag 'BUG-026' 
             $rows.Count | Should -Be 3
             @($rows[0].PSObject.Properties.Name) -join ',' | Should -Be 'id,name,note,Table,RowState'
             $null -eq $rows[0].note | Should -BeTrue
+        }
+        It '-NonQuery tolerates a trailing same-line comment and an existing terminator' {
+            [int](Invoke-DbQuery -Database $script:db026 -Query "UPDATE t SET name='q' WHERE id = 1 -- trailing comment" -NonQuery) | Should -Be 1
+            [int](Invoke-DbQuery -Database $script:db026 -Query "UPDATE t SET name='r' WHERE id = 2;" -NonQuery) | Should -Be 1
+            [int](Invoke-DbQuery -Database $script:db026 -Query "UPDATE t SET name='s' WHERE id = 3; -- done" -NonQuery) | Should -Be 1
         }
     }
 }

@@ -62,9 +62,9 @@ function Invoke-DbQuery {
             elseif ($NonQuery) {
                 # BUG-026: return the affected-row count like the direct path does. PSSQLite opens a
                 # new connection per call, so changes() must run in the same statement batch.
-                $batch = $Query.TrimEnd()
-                if (-not $batch.EndsWith(';')) { $batch += ';' }
-                $batch += "`nSELECT changes() AS affected;"
+                # The terminator goes on its own line so a trailing same-line "-- comment" in
+                # $Query cannot swallow it; SQLite skips the empty statement when $Query already ends with ';'.
+                $batch = $Query.TrimEnd() + "`n;`nSELECT changes() AS affected;"
                 $q = @(Invoke-SqliteQuery -DataSource $Database -Query $batch -SqlParameters $SqlParameters -ErrorAction Stop)
                 if ($q.Count -gt 0 -and $null -ne $q[0].affected) { return [int]$q[0].affected } else { return 0 }
             }
