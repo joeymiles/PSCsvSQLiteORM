@@ -87,16 +87,16 @@ Set-DynamicORMClass
 # Create a query builder instance
 $query = New-DbQuery -Database .\myapp.db -From 'assets'
 
-# Add conditions and execute
-$results = $query.Where('status = @status', @{status='active'}).Run()
+# Add conditions (named parameters) and execute
+$results = $query.Where('hostname = @host', @{ host = 'server01' }).Run()
 
-# Or use joins for related data
+# Or join related data with an explicit ON clause: Join(<table>, <on>, <Inner|Left|Right|Full>)
 $query = New-DbQuery -Database .\myapp.db -From 'assets'
-$results = $query.Join('users', 'assets.owner_id = users.id').Select(@('assets.*', 'users.name as owner_name')).Run()
+$results = $query.Join('vulns', 'vulns.asset_id = assets.id', 'Left').Select(@('assets.*', 'vulns.title AS vuln_title')).Run()
 
-# Order, page and let the catalog supply the ON clause ('Auto' uses the confirmed relationship in __fks__)
+# Order, page and let the catalog supply the ON clause ('Auto' uses the relationship confirmed in step 3)
 $query = New-DbQuery -Database .\myapp.db -From 'vulns v'
-$results = $query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(10).Offset(20).Run()
+$results = $query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(2).Offset(1).Run()
 ```
 
 Notes on the query builder:
@@ -136,7 +136,7 @@ $owner = $vulns[0].GetBelongsTo('assets')  # back to the DynamicAssets record
 $creator  = $ticket.GetBelongsTo('users', 'created_by')
 $assigned = $user.GetHasMany('tickets', 'assigned_to')
 
-# Delete a row (the one saved above; a parent row that still has confirmed child rows is refused by the FK trigger)
+# Delete a row (the one saved above, which has no child rows)
 $asset.Delete()
 ```
 

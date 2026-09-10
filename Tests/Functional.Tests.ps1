@@ -176,6 +176,34 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
             $rows = @($Result | Where-Object { $null -ne $_ })
             return , $rows
         }
+        # The README code blocks in order: 1 install, 2 initialize, 3 import, 4 models, 5 query, 6 records,
+        # 7 upserts, 8 validation. Blocks 3-8 are executed verbatim (only the sample paths are rewritten).
+        $script:Blocks10 = @([regex]::Matches($script:ReadmeRaw, '(?s)```powershell\r?\n(.*?)```') | ForEach-Object { $_.Groups[1].Value })
+        function Convert-ReadmePath10([string]$Line) {
+            # Replacement strings are literal apart from '$', so paths are quoted and any '$' is doubled.
+            $map = @(
+                @('.\data\assets.csv', $script:AssetsCsv),
+                @('.\data\vulns.csv', $script:VulnsCsv),
+                @('.\data\assets_more.csv', $script:MoreCsv),
+                @('.\myapp.db', $script:Db10)
+            )
+            foreach ($pair in $map) {
+                $Line = [regex]::Replace($Line, [regex]::Escape($pair[0]), ("'" + ($pair[1] -replace '\$', '$$$$') + "'"))
+            }
+            return $Line
+        }
+        function Get-ReadmeLines10([int]$BlockNumber) {
+            # Returns the executable statements of a README block: comments, blank lines and the two
+            # $ticket/$user stand-in lines (records of tables the Quick Start does not create) are dropped.
+            $lines = @()
+            foreach ($raw in ($script:Blocks10[$BlockNumber - 1] -split "\r?\n")) {
+                $line = $raw.Trim()
+                if (-not $line -or $line.StartsWith('#')) { continue }
+                if ($line -match '\$ticket\.|\$user\.') { continue }
+                $lines += $line
+            }
+            return , $lines
+        }
     }
     AfterAll { Close-DbConnections }
 
@@ -205,72 +233,75 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
         foreach ($c in $called) { $exported | Should -Contain $c }
     }
 
-    It 'step 3: imports, an AppendOnly re-import and relationship confirmation succeed' {
-        Import-CsvToSqlite -CsvPath $script:AssetsCsv -Database $script:Db10 -TableName assets | Out-Null
-        Import-CsvToSqlite -CsvPath $script:VulnsCsv -Database $script:Db10 -TableName vulns | Out-Null
-        Import-CsvToSqlite -CsvPath $script:MoreCsv -Database $script:Db10 -TableName assets -SchemaMode AppendOnly | Out-Null
-        $sugs = @(Find-DbRelationships -Database $script:Db10)
-        $sugs.Count | Should -BeGreaterThan 0
-        Confirm-DbForeignKey -Database $script:Db10 -From vulns -Column asset_id -To assets
+    It 'the README Quick Start blocks 3-8 run line by line without an error on this host' {
+        $script:Blocks10.Count | Should -Be 8
+        $failures = @()
+        $executed = 0
+        foreach ($blockNumber in 3..8) {
+            $lines = Get-ReadmeLines10 $blockNumber
+            $lines.Count | Should -BeGreaterThan 0 -Because "README block $blockNumber must contain executable statements"
+            foreach ($line in $lines) {
+                $cmd = Convert-ReadmePath10 $line
+                # On Windows PowerShell 5.1 SQLite errors surface as non-terminating errors (Get-DbConnection is
+                # null there), so the global error list is inspected as well as catching terminating errors.
+                # The Add-Type failure that Get-DbConnection catches internally on 5.1 is not a README error.
+                $global:Error.Clear()
+                try {
+                    Invoke-Expression $cmd | Out-Null
+                    $errs = @($global:Error | Where-Object { -not ($_ -is [System.Management.Automation.ErrorRecord] -and $_.InvocationInfo -and $_.InvocationInfo.MyCommand -and $_.InvocationInfo.MyCommand.Name -eq 'Add-Type') })
+                    if ($errs.Count -gt 0) { $failures += ("block {0}: {1} :: {2}" -f $blockNumber, $line, $errs[0]) }
+                } catch {
+                    $failures += ("block {0}: {1} :: {2}" -f $blockNumber, $line, $_.Exception.Message)
+                }
+                $executed++
+            }
+        }
+        $global:Error.Clear()
+        $failures | Should -BeNullOrEmpty
+        $executed | Should -BeGreaterThan 25
+        # Objects left behind by the README lines carry the documented results
+        $query | Should -Not -BeNullOrEmpty
+        (Get-Rows10 $results).Count | Should -Be 2
+        $asset.GetType().Name | Should -Be 'DynamicAssets'
+        $asset.Id | Should -Be 0
+        $found.Id | Should -Be 1
+        $found.ip() | Should -Be '10.0.0.1'
+        (Get-Rows10 $rows).Count | Should -Be 3
+        @($vulns).Count | Should -Be 2
+        $vulns[0].GetType().Name | Should -Be 'DynamicVulns'
+        $owner.GetType().Name | Should -Be 'DynamicAssets'
+        $owner.Id | Should -Be 1
+    }
+
+    It 'after the Quick Start the database holds what the README describes' {
         $fk = @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT status FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'")
         $fk[0].status | Should -Be 'confirmed'
+        $hosts = @(Invoke-DbQuery -Database $script:Db10 -Query 'SELECT hostname, ip FROM assets ORDER BY id')
+        # 3 imported + 1 AppendOnly + server04 (deleted again) + BulkUpsert a and b; server01 updated twice to 10.0.0.1
+        @($hosts | ForEach-Object { $_.hostname }) | Should -Be @('server01', 'server02', 'server03', 'server09', 'a', 'b')
+        [string]$hosts[0].ip | Should -Be '10.0.0.1'
+        @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT id FROM assets WHERE hostname='server04'").Count | Should -Be 0
+        $cols = @(Invoke-DbQuery -Database $script:Db10 -Query 'PRAGMA table_info(assets)' | ForEach-Object { $_.name })
+        $cols | Should -Be @('id', 'hostname', 'ip')
     }
 
-    It 'step 4: models export and load' {
-        $script:Types10 = Export-DynamicModelsFromCatalog -Database $script:Db10
-        $script:Types10['assets'] | Should -Be 'DynamicAssets'
-        $script:Types10['vulns'] | Should -Be 'DynamicVulns'
-        { Set-DynamicORMClass } | Should -Not -Throw
-    }
-
-    It 'step 5: Where, Auto join, OrderBy, Limit and Offset run as documented' {
+    It 'step 5 as documented: Where, explicit Join, Auto join, OrderBy, Limit and Offset return the expected rows' {
         $query = New-DbQuery -Database $script:Db10 -From 'assets'
-        $rows = Get-Rows10 ($query.Where('hostname = @h', @{ h = 'server01' }).Run())
+        $rows = Get-Rows10 ($query.Where('hostname = @host', @{ host = 'server01' }).Run())
         $rows.Count | Should -Be 1
+        $rows[0].hostname | Should -Be 'server01'
+        $query = New-DbQuery -Database $script:Db10 -From 'assets'
+        $rows = Get-Rows10 ($query.Join('vulns', 'vulns.asset_id = assets.id', 'Left').Select(@('assets.*', 'vulns.title AS vuln_title')).Run())
+        $rows.Count | Should -Be 7
+        @($rows | Where-Object { $_.hostname -eq 'server01' }).Count | Should -Be 2
         $query = New-DbQuery -Database $script:Db10 -From 'vulns v'
-        $rows = Get-Rows10 ($query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(10).Offset(1).Run())
-        $rows.Count | Should -Be 3
+        $rows = Get-Rows10 ($query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(2).Offset(1).Run())
+        $rows.Count | Should -Be 2
         $rows[0].id | Should -Be 3
         $rows[0].hostname | Should -Be 'server01'
     }
 
-    It 'step 6: create, find, update, query, navigate and delete through New-DynamicRecord' {
-        $asset = New-DynamicRecord -Table 'assets' -Database $script:Db10
-        $asset.hostname('server04')
-        $asset.ip('192.168.1.13')
-        $asset.Save()
-        $asset.Id | Should -BeGreaterThan 0
-        $found = $asset.FindById(1)
-        $found | Should -Not -BeNullOrEmpty
-        $found.ip('10.0.0.1')
-        $found.Save()
-        $asset.FindById(1).ip() | Should -Be '10.0.0.1'
-        $rows = Get-Rows10 ($asset.Where('ip LIKE @net', @{ net = '192.168.%' }))
-        $rows.Count | Should -Be 3
-        $vulns = @($found.GetHasMany('vulns'))
-        $vulns.Count | Should -Be 2
-        $vulns[0].GetType().Name | Should -Be 'DynamicVulns'
-        $owner = $vulns[0].GetBelongsTo('assets')
-        $owner.GetType().Name | Should -Be 'DynamicAssets'
-        $owner.Id | Should -Be 1
-        # Delete the row saved above: it has no child rows, so no FK trigger can refuse it
-        $newId = [int]$asset.Id
-        $asset.Delete()
-        $found.FindById($newId) | Should -BeNullOrEmpty
-        $found.FindById(1) | Should -Not -BeNullOrEmpty
-    }
-
-    It 'step 7: InsertOnConflict and BulkUpsert run as documented' {
-        $asset = New-DynamicRecord -Table 'assets' -Database $script:Db10
-        $asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.1' }, @('hostname'), $null)
-        $asset.BulkUpsert(@(@{ hostname = 'a'; ip = '1' }, @{ hostname = 'b'; ip = '2' }), @('hostname'))
-        $asset.BulkUpsert(@(@{ hostname = 'a'; ip = '11' }), @('hostname'))
-        $r = @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT ip FROM assets WHERE hostname='a'")
-        $r.Count | Should -Be 1
-        [string]$r[0].ip | Should -Be '11'
-    }
-
-    It 'step 8: validators and callbacks run as documented' {
+    It 'step 8 as documented: the BeforeSave callback blocks the write and AfterSave runs after it' {
         $asset = New-DynamicRecord -Table 'assets' -Database $script:Db10
         $asset.AddValidator('hostname', 'Required', $null)
         $asset.On('BeforeSave', { param($record) if ($record.GetAttribute('ip') -eq '0.0.0.0') { throw 'ip not allowed' } })
