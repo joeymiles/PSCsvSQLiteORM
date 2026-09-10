@@ -392,3 +392,118 @@ Describe 'BASE-01 test scripts run on Windows PowerShell 5.1' -Tag 'BASE-01' {
         ($errors | ForEach-Object { $_.ToString() }) | Should -BeNullOrEmpty
     }
 }
+
+Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version from any directory' -Tag 'BUG-059', 'BUG-060', 'BUG-076' {
+    BeforeAll {
+        $script:RepoRoot59 = Split-Path -Parent $PSScriptRoot
+        $script:Root59 = Join-Path $env:TEMP ("orm_build_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Root59 -Force | Out-Null
+        $script:Copy59 = Join-Path $script:Root59 'repo'
+        New-Item -ItemType Directory -Path $script:Copy59 -Force | Out-Null
+        Copy-Item -Recurse -LiteralPath (Join-Path $script:RepoRoot59 'source') -Destination (Join-Path $script:Copy59 'source')
+        Copy-Item -Recurse -LiteralPath (Join-Path $script:RepoRoot59 'docs') -Destination (Join-Path $script:Copy59 'docs')
+        Copy-Item -LiteralPath (Join-Path $script:RepoRoot59 'build-module.ps1') -Destination (Join-Path $script:Copy59 'build-module.ps1')
+        $script:BuildScript59 = Join-Path $script:Copy59 'build-module.ps1'
+        $script:SourceManifest59 = Join-Path (Join-Path $script:Copy59 'source') 'PSCsvSQLiteORM.psd1'
+        $script:Public59 = Join-Path (Join-Path $script:Copy59 'source') 'Public'
+        $script:BuiltBase59 = Join-Path (Join-Path $script:Copy59 'output') 'PSCsvSQLiteORM'
+        $script:PublicCount59 = @(Get-ChildItem -Path (Join-Path (Join-Path $script:RepoRoot59 'source') 'Public') -Filter '*.ps1' -File).Count
+
+        # Bump the copied source manifest without touching the script: the build must follow the manifest.
+        $script:BumpedVersion59 = '9.9.9'
+        $raw = Get-Content -LiteralPath $script:SourceManifest59 -Raw
+        $raw = $raw -replace "ModuleVersion\s*=\s*'[^']+'", ("ModuleVersion = '{0}'" -f $script:BumpedVersion59)
+        Set-Content -LiteralPath $script:SourceManifest59 -Value $raw -NoNewline -Encoding ASCII
+
+        # Runs the copied build script in a child process of THIS host from an unrelated directory.
+        $script:HostExe59 = (Get-Process -Id $PID).Path
+        function Invoke-Build59 {
+            param([string[]]$ScriptArgs = @())
+            $callArgs = @('-NoProfile')
+            if ($PSVersionTable.PSVersion.Major -lt 6) { $callArgs += @('-ExecutionPolicy', 'Bypass') }
+            $callArgs += @('-File', $script:BuildScript59) + $ScriptArgs
+            Push-Location -LiteralPath $script:Root59
+            try {
+                # Stderr from the child host arrives as error records; they are build output here, not test errors.
+                $lines = @(& { $ErrorActionPreference = 'Continue'; & $script:HostExe59 @callArgs 2>&1 } | ForEach-Object { [string]$_ })
+                $code = $LASTEXITCODE
+            } finally {
+                Pop-Location
+            }
+            return [pscustomobject]@{ ExitCode = $code; Lines = $lines; Text = ($lines -join "`n") }
+        }
+
+        function Get-BuiltVersion59([string]$Version) {
+            $psd1 = Join-Path (Join-Path $script:BuiltBase59 $Version) 'PSCsvSQLiteORM.psd1'
+            if (-not (Test-Path -LiteralPath $psd1)) { return $null }
+            return [string](Import-PowerShellDataFile -Path $psd1).ModuleVersion
+        }
+
+        $script:DefaultRun59 = Invoke-Build59
+    }
+    AfterAll {
+        Close-DbConnections
+        if ($script:Root59 -and (Test-Path -LiteralPath $script:Root59)) {
+            Remove-Item -LiteralPath $script:Root59 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'BUG-060: succeeds when the current directory is not the repository root' {
+        $script:DefaultRun59.Text | Should -Not -Match 'determine the module manifest'
+        $script:DefaultRun59.Text | Should -Not -Match 'Build failed'
+        $script:DefaultRun59.ExitCode | Should -Be 0
+        Test-Path -LiteralPath (Join-Path (Join-Path $script:BuiltBase59 $script:BumpedVersion59) 'PSCsvSQLiteORM.psm1') | Should -BeTrue
+    }
+
+    It 'BUG-059: the built version comes from the source manifest, not a value hardcoded in the script' {
+        $script:DefaultRun59.Text | Should -Match ("Building PSCsvSQLiteORM version {0}" -f [regex]::Escape($script:BumpedVersion59))
+        Get-BuiltVersion59 $script:BumpedVersion59 | Should -Be $script:BumpedVersion59
+        $folders = @(Get-ChildItem -LiteralPath $script:BuiltBase59 -Directory | ForEach-Object { $_.Name })
+        $folders | Should -Be @($script:BumpedVersion59)
+    }
+
+    It 'BUG-059: the script declares no default version of its own' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:BuildScript59, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $versionParam = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Version' }
+        $versionParam | Should -Not -BeNullOrEmpty
+        $versionParam.DefaultValue | Should -BeNullOrEmpty
+        $sourceVersion = [string](Import-PowerShellDataFile -Path (Join-Path (Join-Path $script:RepoRoot59 'source') 'PSCsvSQLiteORM.psd1')).ModuleVersion
+        (Get-Content -LiteralPath $script:BuildScript59 -Raw) | Should -Not -Match ("'{0}'" -f [regex]::Escape($sourceVersion))
+    }
+
+    It 'BUG-059: an explicit -Version still overrides the manifest' {
+        $run = Invoke-Build59 -ScriptArgs @('-Version', '1.2.3')
+        $run.ExitCode | Should -Be 0
+        $run.Text | Should -Match 'Building PSCsvSQLiteORM version 1\.2\.3'
+        Get-BuiltVersion59 '1.2.3' | Should -Be '1.2.3'
+        @($run.Lines | Where-Object { $_.Trim() -eq 'Module imported successfully. Version: 1.2.3' }).Count | Should -Be 1
+    }
+
+    It 'BUG-076: the self-test reports the version and command count of the module it just built' {
+        $versionLines = @($script:DefaultRun59.Lines | Where-Object { $_ -match 'Module imported successfully' })
+        $versionLines.Count | Should -Be 1
+        $versionLines[0].Trim() | Should -Be ("Module imported successfully. Version: {0}" -f $script:BumpedVersion59)
+        $commandLines = @($script:DefaultRun59.Lines | Where-Object { $_ -match 'Exported commands:' })
+        $commandLines.Count | Should -Be 1
+        $commandLines[0].Trim() | Should -Be ("Exported commands: {0}" -f $script:PublicCount59)
+        $script:PublicCount59 | Should -BeGreaterThan 2
+    }
+
+    It 'BUG-076: the self-test fails the build when the built module does not export every public function' {
+        # A Public file that defines no function makes the source Public count exceed the exported command
+        # count; the self-test must fail loudly instead of printing whatever Get-Module happened to return.
+        $stub = Join-Path $script:Public59 'Zz-NotAFunction.ps1'
+        Set-Content -LiteralPath $stub -Value '# no function here' -Encoding ASCII
+        try {
+            $run = Invoke-Build59 -ScriptArgs @('-Version', '2.0.0')
+            $run.ExitCode | Should -Not -Be 0
+            $run.Text | Should -Match 'Module import test failed'
+            $run.Text | Should -Not -Match 'Module imported successfully'
+        } finally {
+            Remove-Item -LiteralPath $stub -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
