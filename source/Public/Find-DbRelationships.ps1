@@ -48,7 +48,7 @@ function Find-DbRelationships {
     $suggestions = New-Object System.Collections.ArrayList
 
     $tables = Invoke-DbQuery -Database $Database -Query "SELECT table_name FROM __tables__"
-    $tableNames = $tables | ForEach-Object { $_.table_name }
+    $tableNames = @($tables | ForEach-Object { $_.table_name } | Where-Object { -not (Test-DbInternalTable -Name $_) })
 
     foreach ($tn in $tableNames) {
         $cols = Invoke-DbQuery -Database $Database -Query "SELECT column_name FROM __columns__ WHERE table_name=@t" -SqlParameters @{ t = $tn }

@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -466,5 +466,124 @@ Describe 'Explicit Initialize-ORMVars parameters override the settings file' -Ta
         (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
         (& $m { $script:DbLogPath }) | Should -Be $script:b058FileLog
         (& $m { $script:DbDefaultPath }) | Should -Be 'from_file.db'
+    }
+}
+
+Describe 'Update-DbCatalog keeps per-table source and csv_hash' -Tag 'BUG-012' {
+    BeforeAll {
+        $script:b012Db = New-CoreDbPath -Name 'b012'
+        $script:b012Assets = Join-Path $PSScriptRoot 'assets.csv'
+        $script:b012Vulns = Join-Path $PSScriptRoot 'vulns.csv'
+        Import-CsvToSqlite -CsvPath $script:b012Assets -TableName assets -Database $script:b012Db | Out-Null
+        Import-CsvToSqlite -CsvPath $script:b012Vulns -TableName vulns -Database $script:b012Db | Out-Null
+        $script:b012AssetsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script:b012Assets).Hash
+        $script:b012VulnsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script:b012Vulns).Hash
+        function Get-B012Row {
+            param([string]$Name)
+            return (Invoke-DbQuery -Database $script:b012Db -Query "SELECT source, csv_hash FROM __tables__ WHERE table_name=@t" -SqlParameters @{ t = $Name })[0]
+        }
+    }
+    It 'binds the CSV path and hash only to the imported table' {
+        $a = Get-B012Row -Name 'assets'
+        $v = Get-B012Row -Name 'vulns'
+        $a.source | Should -Be $script:b012Assets
+        $a.csv_hash | Should -Be $script:b012AssetsHash
+        $v.source | Should -Be $script:b012Vulns
+        $v.csv_hash | Should -Be $script:b012VulnsHash
+    }
+    It 'leaves source and csv_hash untouched on a bare Update-DbCatalog' {
+        Update-DbCatalog -Database $script:b012Db
+        $a = Get-B012Row -Name 'assets'
+        $a.source | Should -Be $script:b012Assets
+        $a.csv_hash | Should -Be $script:b012AssetsHash
+    }
+    It 'leaves other tables untouched after Export-DynamicModelsFromCatalog' {
+        Export-DynamicModelsFromCatalog -Database $script:b012Db | Out-Null
+        $v = Get-B012Row -Name 'vulns'
+        $v.source | Should -Be $script:b012Vulns
+        $v.csv_hash | Should -Be $script:b012VulnsHash
+    }
+}
+
+Describe 'Update-DbCatalog removes rows for dropped tables and columns' -Tag 'BUG-031' {
+    BeforeAll {
+        $script:b031Db = New-CoreDbPath -Name 'b031'
+        Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'assets.csv') -TableName assets -Database $script:b031Db | Out-Null
+        Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $script:b031Db | Out-Null
+        Find-DbRelationships -Database $script:b031Db | Out-Null
+        function Get-B031Count {
+            param([string]$Query)
+            return [int](Invoke-DbQuery -Database $script:b031Db -Query $Query)[0].c
+        }
+    }
+    It 'has a suggested FK for vulns before the drop' {
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='vulns'" | Should -BeGreaterThan 0
+    }
+    It 'purges __tables__, __columns__ and __fks__ rows of a dropped table' {
+        Invoke-DbQuery -Database $script:b031Db -Query 'DROP TABLE vulns' -NonQuery | Out-Null
+        Update-DbCatalog -Database $script:b031Db
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='vulns'" | Should -Be 0
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __columns__ WHERE table_name='vulns'" | Should -Be 0
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='vulns'" | Should -Be 0
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='assets'" | Should -Be 1
+    }
+    It 'does not re-suggest relationships for a dropped table' {
+        Find-DbRelationships -Database $script:b031Db | Out-Null
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='vulns'" | Should -Be 0
+    }
+    It 'purges __columns__ rows of a column that no longer exists' {
+        Invoke-DbQuery -Database $script:b031Db -Query 'CREATE TABLE t2(a INTEGER, b TEXT)' -NonQuery | Out-Null
+        Update-DbCatalog -Database $script:b031Db
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __columns__ WHERE table_name='t2' AND column_name='b'" | Should -Be 1
+        Invoke-DbQuery -Database $script:b031Db -Query 'DROP TABLE t2' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:b031Db -Query 'CREATE TABLE t2(a INTEGER)' -NonQuery | Out-Null
+        Update-DbCatalog -Database $script:b031Db
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __columns__ WHERE table_name='t2' AND column_name='b'" | Should -Be 0
+        Get-B031Count -Query "SELECT COUNT(*) AS c FROM __columns__ WHERE table_name='t2' AND column_name='a'" | Should -Be 1
+    }
+}
+
+Describe 'Update-DbCatalog does not catalog the bookkeeping tables' -Tag 'BUG-032' {
+    BeforeAll {
+        $script:b032Db = New-CoreDbPath -Name 'b032'
+        $script:b032Internal = @('__tables__', '__columns__', '__fks__', 'schema_migrations')
+        Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'assets.csv') -TableName assets -Database $script:b032Db | Out-Null
+    }
+    It 'writes no __tables__ or __columns__ rows for internal tables' {
+        Update-DbCatalog -Database $script:b032Db
+        $names = @(Invoke-DbQuery -Database $script:b032Db -Query 'SELECT table_name FROM __tables__' | ForEach-Object { $_.table_name })
+        $names | Should -Be @('assets')
+        $colNames = @(Invoke-DbQuery -Database $script:b032Db -Query 'SELECT DISTINCT table_name FROM __columns__' | ForEach-Object { $_.table_name })
+        foreach ($i in $script:b032Internal) { $colNames | Should -Not -Contain $i }
+    }
+    It 'cleans internal-table rows left by an older catalog' {
+        Invoke-DbQuery -Database $script:b032Db -Query "INSERT INTO __tables__(table_name,rowcount) VALUES('__fks__',0)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:b032Db -Query "INSERT INTO __columns__(table_name,column_name) VALUES('schema_migrations','version')" -NonQuery | Out-Null
+        Update-DbCatalog -Database $script:b032Db
+        [int](Invoke-DbQuery -Database $script:b032Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='__fks__'")[0].c | Should -Be 0
+        [int](Invoke-DbQuery -Database $script:b032Db -Query "SELECT COUNT(*) AS c FROM __columns__ WHERE table_name='schema_migrations'")[0].c | Should -Be 0
+    }
+    It 'Find-DbRelationships ignores internal tables even when the catalog lists them' {
+        Invoke-DbQuery -Database $script:b032Db -Query "INSERT INTO __tables__(table_name,rowcount) VALUES('__fks__',0)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:b032Db -Query "INSERT INTO __columns__(table_name,column_name) VALUES('__fks__','assets_id')" -NonQuery | Out-Null
+        Find-DbRelationships -Database $script:b032Db | Out-Null
+        [int](Invoke-DbQuery -Database $script:b032Db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='__fks__'")[0].c | Should -Be 0
+        Update-DbCatalog -Database $script:b032Db
+    }
+}
+
+Describe 'Update-DbCatalog skips tables whose names ConvertTo-Ident rejects' -Tag 'BUG-043' {
+    BeforeAll {
+        $script:b043Db = New-CoreDbPath -Name 'b043'
+        Invoke-DbQuery -Database $script:b043Db -Query 'CREATE TABLE "t$1"(id INTEGER PRIMARY KEY, x TEXT)' -NonQuery | Out-Null
+    }
+    It 'Import-CsvToSqlite succeeds and catalogs the new table' {
+        { Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $script:b043Db | Out-Null } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $script:b043Db -Query 'SELECT COUNT(*) AS c FROM vulns')[0].c | Should -Be 4
+        [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='vulns'")[0].c | Should -Be 1
+        [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='t`$1'")[0].c | Should -Be 0
+    }
+    It 'Export-DynamicModelsFromCatalog does not throw for the whole database' {
+        { Export-DynamicModelsFromCatalog -Database $script:b043Db | Out-Null } | Should -Not -Throw
     }
 }
