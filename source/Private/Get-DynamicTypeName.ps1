@@ -47,9 +47,11 @@ function Get-DynamicModelDirectory {
     return $script:DynamicModelDir
 }
 
-# Registers cleanup of the generated model files when the module is removed (Remove-Module / Import-Module -Force).
+# Registers cleanup when the module is removed (Remove-Module / Import-Module -Force): pooled SQLite connections are
+# closed and disposed so the database files are unlocked (BUG-048), then the generated model files are deleted.
 if ($ExecutionContext.SessionState.Module) {
     $ExecutionContext.SessionState.Module.OnRemove = {
+        try { Close-DbConnections } catch { Write-Verbose "OnRemove: Close-DbConnections failed: $($_.Exception.Message)" }
         if ($script:DynamicModelDir -and (Test-Path -LiteralPath $script:DynamicModelDir)) {
             Remove-Item -LiteralPath $script:DynamicModelDir -Recurse -Force -ErrorAction SilentlyContinue
         }

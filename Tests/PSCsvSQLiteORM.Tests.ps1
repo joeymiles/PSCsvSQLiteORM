@@ -133,3 +133,67 @@ Describe 'Write-DbLog file output' {
         $text.Contains($eacute) | Should -BeTrue
     }
 }
+
+# Regression tests for BUG-048 (TASK A12): unloading the module must close pooled connections so the database
+# file is no longer locked. On Windows PowerShell 5.1 Get-DbConnection may return $null (no pooled connection);
+# the file assertions still hold there, the state assertions are guarded.
+Describe 'BUG-048 unloading the module closes pooled connections' -Tag 'BUG-048' {
+    BeforeAll {
+        $script:B48ModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+        $script:B48Root = Join-Path $env:TEMP ("orm_b048_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:B48Root -Force | Out-Null
+
+        function New-B48Db {
+            Import-Module $script:B48ModuleFolder -Force
+            Initialize-ORMVars -LogLevel ERROR
+            $db = Join-Path $script:B48Root ("b048_{0}.db" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query "INSERT INTO t (name) VALUES ('a')" -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    AfterAll {
+        # Leave the module loaded for the remaining test files
+        Import-Module $script:B48ModuleFolder -Force
+        Initialize-ORMVars -LogLevel ERROR
+        Close-DbConnections
+        if ($script:B48Root -and (Test-Path -LiteralPath $script:B48Root)) {
+            Remove-Item -LiteralPath $script:B48Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Remove-Module closes the pooled connection and releases the database file' {
+        $db = New-B48Db
+        $conn = Get-DbConnection -Database $db
+        Remove-Module PSCsvSQLiteORM -Force
+        (Get-Module PSCsvSQLiteORM) | Should -BeNullOrEmpty
+        # A disposed SQLiteConnection reports State as Closed (5.1) or $null (7); it must no longer be Open
+        if ($conn) { $conn.State | Should -Not -Be 'Open' }
+        { Remove-Item -LiteralPath $db -Force -ErrorAction Stop } | Should -Not -Throw
+        (Test-Path -LiteralPath $db) | Should -BeFalse
+    }
+
+    It 'Import-Module -Force closes the pooled connections of the replaced module instance' {
+        $db = New-B48Db
+        $conn = Get-DbConnection -Database $db
+        Import-Module $script:B48ModuleFolder -Force
+        # A disposed SQLiteConnection reports State as Closed (5.1) or $null (7); it must no longer be Open
+        if ($conn) { $conn.State | Should -Not -Be 'Open' }
+        { Remove-Item -LiteralPath $db -Force -ErrorAction Stop } | Should -Not -Throw
+        (Test-Path -LiteralPath $db) | Should -BeFalse
+    }
+
+    It 'Close-DbConnections disposes connections that are no longer Open without throwing' {
+        $db = New-B48Db
+        $conn = Get-DbConnection -Database $db
+        if ($conn) { $conn.Close() }
+        { Close-DbConnections } | Should -Not -Throw
+        { Close-DbConnections } | Should -Not -Throw
+        { Remove-Item -LiteralPath $db -Force -ErrorAction Stop } | Should -Not -Throw
+        # The pool is empty afterwards, so a fresh connection is handed out
+        $again = Get-DbConnection -Database $db
+        if ($again) { $again.State | Should -Be 'Open'; [object]::ReferenceEquals($again, $conn) | Should -BeFalse }
+        Close-DbConnections
+    }
+}
