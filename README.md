@@ -45,6 +45,20 @@ $types = Export-DynamicModelsFromCatalog -Database .\myapp.db
 # Create PowerShell classes from the models
 Set-DynamicORMClass
 ```
+- `Export-DynamicModelsFromCatalog` returns a fresh `table -> type name` hashtable for that database only. Models are
+  registered per database, so two databases that share a table name keep their own columns and associations.
+- Type names: simple table names (letters, digits, single underscores) become `Dynamic` + PascalCase
+  (`assets` -> `DynamicAssets`, `user_assets` -> `DynamicUserAssets`). Any other name gets a short hash suffix
+  (`user-assets` -> `DynamicUserAssets_7f06a4e6`), and so does a second database or table whose derived name is already
+  taken in the session. A generated type is never named after an existing type such as `DynamicActiveRecord`.
+- Column accessors: every non-`id` column gets `$rec.<name>()` / `$rec.<name>($value)` accessors. Names that are not
+  valid identifiers are sanitized (`first name` -> `first_name`), colliding sanitized names are numbered
+  (`a b` / `a_b` -> `a_b` / `a_b_2`), and a column named after a base member or a PowerShell keyword
+  (`Save`, `Delete`, `Where`, `class`, ...) is exposed as `Col_<name>()` so `Save()`/`Delete()` keep working.
+  `GetAttribute('<column>')` / `SetAttribute('<column>', $value)` always use the raw column name.
+- Generated class files are written to a per-session directory under `$env:TEMP` (`PSCsvSQLiteORM_<pid>_<id>`)
+  and removed when the module is unloaded. `Set-DynamicORMClass` loads each file once, keeps going past a file that
+  is missing or fails to parse, and then throws one error listing every file it could not load.
 
 ### 5. Query Your Data
 ```powershell

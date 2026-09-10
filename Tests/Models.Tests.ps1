@@ -28,9 +28,22 @@ BeforeAll {
     # that dot-sources it, so the file is loaded and instantiated inside a module-scope scriptblock.
     function New-TestModel([string]$Table, [string]$Database) {
         $m = $script:Orm
-        $entry = & $m { param($t) $script:DynamicClassScripts | Where-Object { $_.Table -eq $t } | Select-Object -Last 1 } $Table
-        $typeName = & $m { param($t) $script:ModelTypes[$t] } $Table
-        return (& $m { param($p, $d, $tn) . $p; New-Object -TypeName $tn -ArgumentList $d } ([string]$entry.ModelPath) ([string]$Database) ([string]$typeName))
+        # Models are registered per database (BUG-017): look the entry up by database and table
+        $entry = Get-ModelEntry $Table $Database
+        return (& $m { param($p, $d, $tn) . $p; New-Object -TypeName $tn -ArgumentList $d } ([string]$entry.ModelPath) ([string]$Database) ([string]$entry.TypeName))
+    }
+
+    # Returns the module's registry entry (TypeName, ModelPath, Columns, Members) for a (database, table) pair.
+    function Get-ModelEntry([string]$Table, [string]$Database) {
+        return (& $script:Orm { param($t, $d) $script:ModelRegistry[(Get-DynamicDatabaseKey -Database $d)][$t] } $Table $Database)
+    }
+
+    function Get-ClassScripts {
+        return @(& $script:Orm { @($script:DynamicClassScripts) })
+    }
+
+    function Get-MethodNames([object]$Record) {
+        return @($Record | Get-Member -MemberType Method | ForEach-Object { $_.Name } | Sort-Object -Unique)
     }
 
     # Creates a plain base DynamicActiveRecord (no generated subclass) through reflection.
@@ -216,5 +229,259 @@ Describe 'BUG-016 tables without an id column use rowid as the record key' -Tag 
         $rec = @($script:x016.Where('code = @c', @{ c = 'B' }))[0]
         $rec.Delete()
         (Get-Count $script:db016 "SELECT COUNT(*) AS c FROM noid WHERE code = 'B'") | Should -Be 0
+    }
+}
+
+Describe 'BUG-002 columns named after base members do not hide Save/Delete' -Tag 'BUG-002' {
+    BeforeAll {
+        $script:db002 = New-TestDbPath 'bug002'
+        $csv = New-TestCsv 'sv.csv' "id,Save,Delete,note`r`n1,y,n,first"
+        Import-CsvToSqlite -CsvPath $csv -Database $script:db002 -TableName 'sv' | Out-Null
+        Export-DynamicModelsFromCatalog -Database $script:db002 | Out-Null
+        Set-DynamicORMClass
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'Save() on a new record inserts a row' {
+        $r = New-TestModel 'sv' $script:db002
+        $r.SetAttribute('note', 'second'); $r.SetAttribute('Save', 'y')
+        $r.Save()
+        $r.Id | Should -BeGreaterThan 0
+        (Get-Count $script:db002 'SELECT COUNT(*) AS c FROM sv') | Should -Be 2
+    }
+
+    It 'Delete() on a found record removes the row' {
+        $r = (New-TestModel 'sv' $script:db002).FindById(1)
+        $r | Should -Not -BeNullOrEmpty
+        $r.Delete()
+        (Get-Count $script:db002 'SELECT COUNT(*) AS c FROM sv WHERE id = 1') | Should -Be 0
+    }
+
+    It 'exposes the colliding columns through Col_ accessors and keeps the base signatures' {
+        $r = New-TestModel 'sv' $script:db002
+        $r.SetAttribute('Save', 'v1')
+        $r.Col_Save() | Should -Be 'v1'
+        $r.Col_Delete('v2')
+        $r.GetAttribute('Delete') | Should -Be 'v2'
+        $defs = @($r | Get-Member -MemberType Method | Where-Object { $_.Name -eq 'Save' -or $_.Name -eq 'Delete' } | ForEach-Object { $_.Definition }) -join ';'
+        $defs | Should -Match 'void Save\(\)'
+        $defs | Should -Match 'void Delete\(\)'
+        $defs | Should -Not -Match 'Object Save\(\)'
+        $defs | Should -Not -Match 'Object Delete\(\)'
+        $entry = Get-ModelEntry 'sv' $script:db002
+        @($entry.Members | Where-Object { $_.Column -eq 'Save' })[0].Member | Should -Be 'Col_Save'
+    }
+
+    It 'never emits an accessor that hides a DynamicActiveRecord or System.Object member' {
+        $cols = @('id', 'Where', 'All', 'First', 'FindById', 'Validate', 'GetAttribute', 'SetAttribute', 'HasMany', 'GetType', 'ToString', 'Equals', 'GetHashCode', 'Columns', 'Database', 'TableName', 'Attributes', 'Id')
+        $typeName = New-DynamicModel -TableName 'members002' -Database $script:db002 -Columns $cols
+        $r = New-TestModel 'members002' $script:db002
+        $names = Get-MethodNames $r
+        foreach ($c in ($cols | Where-Object { $_ -ne 'id' })) { $names | Should -Contain ('Col_' + $c) }
+        $r.ToString() | Should -Be $typeName
+        ($r | Get-Member -Name 'Where').Definition | Should -Match 'Where\(string'
+        $r.Columns.Count | Should -Be $cols.Count
+        $r.Database | Should -Be $script:db002
+    }
+}
+
+Describe 'BUG-018 generated classes always parse and load' -Tag 'BUG-018' {
+    BeforeAll {
+        $script:db018 = New-TestDbPath 'bug018'
+        Invoke-DbQuery -Database $script:db018 -Query 'CREATE TABLE dup(id INTEGER PRIMARY KEY, "a b" TEXT, a_b TEXT, "a-b" TEXT, "a.b" TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018 -Query 'CREATE TABLE q(id INTEGER PRIMARY KEY, "it''s" TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018 -Query 'CREATE TABLE kw(id INTEGER PRIMARY KEY, class TEXT, function TEXT)' -NonQuery | Out-Null
+        $script:e018 = [string][char]0x00E9; $script:u018 = [string][char]0x00FC
+        Invoke-DbQuery -Database $script:db018 -Query ('CREATE TABLE intl(id INTEGER PRIMARY KEY, "{0}" TEXT, "{1}" TEXT)' -f $script:e018, $script:u018) -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018 -Query 'CREATE TABLE zz_last(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        $script:t018 = Export-DynamicModelsFromCatalog -Database $script:db018
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'Set-DynamicORMClass loads every model without error' {
+        $script:t018.Keys.Count | Should -Be 5
+        { Set-DynamicORMClass } | Should -Not -Throw
+    }
+
+    It 'columns whose sanitized names collide get unique member names' {
+        $r = New-TestModel 'dup' $script:db018
+        $entry = Get-ModelEntry 'dup' $script:db018
+        $members = @($entry.Members | ForEach-Object { $_.Member })
+        $members.Count | Should -Be 4
+        @($members | Sort-Object -Unique).Count | Should -Be 4
+        $names = Get-MethodNames $r
+        foreach ($mname in $members) { $names | Should -Contain $mname }
+        foreach ($col in @('a b', 'a_b', 'a-b', 'a.b')) {
+            $mname = @($entry.Members | Where-Object { $_.Column -eq $col })[0].Member
+            $r.$mname("value of $col")
+            $r.GetAttribute($col) | Should -Be "value of $col"
+        }
+    }
+
+    It 'a column containing a quote is escaped in the generated class' {
+        $r = New-TestModel 'q' $script:db018
+        $r.it_s('v')
+        $r.GetAttribute("it's") | Should -Be 'v'
+        $r.Columns | Should -Contain "it's"
+    }
+
+    It 'columns named after PowerShell keywords load on every host' {
+        $r = New-TestModel 'kw' $script:db018
+        $names = Get-MethodNames $r
+        $names | Should -Contain 'Col_class'
+        $names | Should -Contain 'Col_function'
+        $r.SetAttribute('class', 'c1'); $r.SetAttribute('function', 'f1')
+        $r.Save()
+        $r.Id | Should -BeGreaterThan 0
+        $r.Col_class() | Should -Be 'c1'
+    }
+
+    It 'non-ASCII column names do not collide' {
+        $r = New-TestModel 'intl' $script:db018
+        $entry = Get-ModelEntry 'intl' $script:db018
+        $members = @($entry.Members | ForEach-Object { $_.Member })
+        @($members | Sort-Object -Unique).Count | Should -Be 2
+        $r.$($members[0])('first'); $r.$($members[1])('second')
+        $r.GetAttribute($script:e018) | Should -Be 'first'
+        $r.GetAttribute($script:u018) | Should -Be 'second'
+    }
+
+    It 'a broken model file is reported by path and does not stop the other models from loading' {
+        $entry = Get-ModelEntry 'dup' $script:db018
+        $backup = Get-Content -LiteralPath $entry.ModelPath -Raw
+        try {
+            Set-Content -LiteralPath $entry.ModelPath -Value 'class Broken018 : DynamicActiveRecord { this is not valid' -Encoding UTF8
+            $message = $null
+            try { Set-DynamicORMClass } catch { $message = $_.Exception.Message }
+            $message | Should -Not -BeNullOrEmpty
+            $message | Should -Match 'could not load 1 dynamic model file'
+            $message | Should -Match ([regex]::Escape($entry.ModelPath))
+        }
+        finally {
+            Set-Content -LiteralPath $entry.ModelPath -Value $backup -Encoding UTF8
+        }
+        { Set-DynamicORMClass } | Should -Not -Throw
+    }
+}
+
+Describe 'BUG-017 models are registered per database' -Tag 'BUG-017' {
+    BeforeAll {
+        $script:db017a = New-TestDbPath 'bug017a'
+        $script:db017b = New-TestDbPath 'bug017b'
+        $c1 = New-TestCsv 'one017.csv' "id,hostname,ip`r`n1,h1,1.1.1.1"
+        $c2 = New-TestCsv 'two017.csv' "id,name,owner`r`n1,n1,o1"
+        Import-CsvToSqlite -CsvPath $c1 -Database $script:db017a -TableName 'assets' | Out-Null
+        Import-CsvToSqlite -CsvPath $c2 -Database $script:db017b -TableName 'assets' | Out-Null
+        $script:t017a = Export-DynamicModelsFromCatalog -Database $script:db017a
+        $script:t017b = Export-DynamicModelsFromCatalog -Database $script:db017b
+        Set-DynamicORMClass
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'returns a separate result per database with distinct type names' {
+        [object]::ReferenceEquals($script:t017a, $script:t017b) | Should -BeFalse
+        @($script:t017a.Keys).Count | Should -Be 1
+        @($script:t017b.Keys).Count | Should -Be 1
+        # Earlier tests may already own the plain DynamicAssets name; both names derive from it and must differ
+        $script:t017a['assets'] | Should -Match '^DynamicAssets(_[0-9a-f]{8})?$'
+        $script:t017b['assets'] | Should -Match '^DynamicAssets_[0-9a-f]{8}$'
+        $script:t017b['assets'] | Should -Not -Be $script:t017a['assets']
+    }
+
+    It 'each database keeps its own columns, accessors and data' {
+        $a = New-TestModel 'assets' $script:db017a
+        $b = New-TestModel 'assets' $script:db017b
+        ($a.Columns -join '|') | Should -Be 'id|hostname|ip'
+        ($b.Columns -join '|') | Should -Be 'id|name|owner'
+        $a.FindById(1).hostname() | Should -Be 'h1'
+        $b.FindById(1).name() | Should -Be 'n1'
+        (Get-MethodNames $a) | Should -Not -Contain 'name'
+        (Get-MethodNames $b) | Should -Not -Contain 'hostname'
+    }
+
+    It 'does not accumulate registry entries on repeated export' {
+        $before = (Get-ClassScripts).Count
+        Export-DynamicModelsFromCatalog -Database $script:db017a | Out-Null
+        Export-DynamicModelsFromCatalog -Database $script:db017a | Out-Null
+        (Get-ClassScripts).Count | Should -Be $before
+        $entryA = Get-ModelEntry 'assets' $script:db017a
+        @(Get-ClassScripts | Where-Object { $_.ModelPath -eq $entryA.ModelPath }).Count | Should -Be 1
+        $entryA.TypeName | Should -Be $script:t017a['assets']
+    }
+
+    It 'writes generated files into a per-session directory' {
+        $entryA = Get-ModelEntry 'assets' $script:db017a
+        $entryB = Get-ModelEntry 'assets' $script:db017b
+        $entryA.ModelPath | Should -Not -Be $entryB.ModelPath
+        (Split-Path -Parent $entryA.ModelPath) | Should -Match ('PSCsvSQLiteORM_' + $PID + '_')
+        Test-Path -LiteralPath $entryA.ModelPath | Should -BeTrue
+        Test-Path -LiteralPath $entryB.ModelPath | Should -BeTrue
+    }
+
+    It 'Set-DynamicORMClass reports a registered file that is missing' {
+        $entry = Get-ModelEntry 'assets' $script:db017b
+        $moved = $entry.ModelPath + '.moved'
+        Move-Item -LiteralPath $entry.ModelPath -Destination $moved
+        try {
+            $message = $null
+            try { Set-DynamicORMClass } catch { $message = $_.Exception.Message }
+            $message | Should -Match 'file not found'
+            $message | Should -Match ([regex]::Escape($entry.ModelPath))
+        }
+        finally { Move-Item -LiteralPath $moved -Destination $entry.ModelPath }
+        { Set-DynamicORMClass } | Should -Not -Throw
+    }
+}
+
+Describe 'BUG-036 type names are unique per table and never an existing type' -Tag 'BUG-036' {
+    BeforeAll {
+        $script:db036 = New-TestDbPath 'bug036'
+        $script:tables036 = @('user_assets', 'user-assets', 'active_record', '__', 'model')
+        foreach ($t in $script:tables036) {
+            Invoke-DbQuery -Database $script:db036 -Query ('CREATE TABLE {0}(id INTEGER PRIMARY KEY, val TEXT)' -f (ConvertTo-Ident $t)) -NonQuery | Out-Null
+        }
+        $script:t036 = Export-DynamicModelsFromCatalog -Database $script:db036
+        Set-DynamicORMClass
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'assigns a distinct type name to every table' {
+        @($script:t036.Keys).Count | Should -Be $script:tables036.Count
+        @($script:t036.Values | Sort-Object -Unique).Count | Should -Be $script:tables036.Count
+    }
+
+    It 'keeps the readable PascalCase name for simple table names' {
+        $script:t036['user_assets'] | Should -Be 'DynamicUserAssets'
+        $script:t036['model'] | Should -Be 'DynamicModel'
+        $script:t036['user-assets'] | Should -Match '^DynamicUserAssets_[0-9a-f]{8}$'
+    }
+
+    It 'never resolves to DynamicActiveRecord, DbQuery or DbJoinSpec' {
+        foreach ($v in $script:t036.Values) {
+            $v | Should -Not -BeIn @('DynamicActiveRecord', 'DbQuery', 'DbJoinSpec')
+            $v | Should -Match '^Dynamic'
+        }
+    }
+
+    It 'binds each model to its own table' {
+        foreach ($t in $script:tables036) {
+            $r = New-TestModel $t $script:db036
+            $r.GetType().Name | Should -Be $script:t036[$t]
+            $r.TableName | Should -Be $t
+        }
+    }
+
+    It 'a table named active_record gets a real subclass that can save' {
+        $r = New-TestModel 'active_record' $script:db036
+        $r.GetType().Name | Should -Not -Be 'DynamicActiveRecord'
+        $r.GetType().BaseType.Name | Should -Be 'DynamicActiveRecord'
+        $r.SetAttribute('val', 'x'); $r.Save()
+        $r.Id | Should -BeGreaterThan 0
+        $r.val() | Should -Be 'x'
+    }
+
+    It 'New-DynamicModel derives the same name as Export-DynamicModelsFromCatalog' {
+        (New-DynamicModel -TableName 'user-assets' -Database $script:db036 -Columns @('id', 'val')) | Should -Be $script:t036['user-assets']
+        (New-DynamicModel -TableName 'user_assets' -Database $script:db036 -Columns @('id', 'val')) | Should -Be 'DynamicUserAssets'
     }
 }

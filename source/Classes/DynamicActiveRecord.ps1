@@ -66,7 +66,12 @@ class DynamicActiveRecord {
     # record wired with the confirmed relationships from the __fks__ catalog so navigation can continue.
     hidden [DynamicActiveRecord]NewRelatedInstance([string]$table) {
         $typeObj = $null
-        if ($script:ModelTypeObjects -and $script:ModelTypeObjects.ContainsKey($table)) { $typeObj = $script:ModelTypeObjects[$table] }
+        # Prefer the model registered for THIS database (BUG-017); fall back to the table-keyed view
+        $dbKey = Get-DynamicDatabaseKey -Database $this.Database
+        if ($script:ModelRegistry -and $script:ModelRegistry.ContainsKey($dbKey) -and $script:ModelRegistry[$dbKey].ContainsKey($table)) {
+            $typeObj = $script:ModelRegistry[$dbKey][$table].Type
+        }
+        if (-not $typeObj -and $script:ModelTypeObjects -and $script:ModelTypeObjects.ContainsKey($table)) { $typeObj = $script:ModelTypeObjects[$table] }
         if ($typeObj) {
             $ctorInfo = $typeObj.GetConstructor([type[]]@([string]))
             if ($ctorInfo) { return $ctorInfo.Invoke(@($this.Database)) }
