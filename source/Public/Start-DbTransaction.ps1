@@ -8,6 +8,9 @@ function Start-DbTransaction {
         if ($proceed) { return $conn.BeginTransaction() } else { return $null }
     }
     # Fallback path (PSSQLite): no persistent transaction support is guaranteed
+    # BUG-049: make the degraded (auto-commit) mode visible instead of silently returning $null
+    Write-DbLog WARN "Start-DbTransaction: System.Data.SQLite connection unavailable for '$Database'; statements will auto-commit."
+    Write-Warning "Start-DbTransaction: no System.Data.SQLite connection for '$Database'; statements will auto-commit (no transaction)."
     Enable-ForeignKeysPragma -Database $Database
     return $null
 }

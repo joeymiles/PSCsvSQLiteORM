@@ -1,6 +1,6 @@
 # Functional tests for PSCsvSQLiteORM
 
-Import-Module (Join-Path $PSScriptRoot '..' 'output' 'PSCsvSQLiteORM') -Force
+Import-Module (Join-Path (Join-Path (Join-Path $PSScriptRoot '..') 'output') 'PSCsvSQLiteORM') -Force
 
 Describe 'Initialize-ORMVars settings script' {
     It 'Applies settings from a SettingsPath file' {

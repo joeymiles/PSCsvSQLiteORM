@@ -4,6 +4,7 @@ function New-DbQuery {
         [Parameter(Mandatory)][string]$Database,
         [Parameter(Mandatory)][string]$From
     )
-    if ($PSCmdlet) { $null = $PSCmdlet.ShouldProcess("DbQuery from '$From'", 'Create object') }
+    # Honor -WhatIf: return nothing instead of building the object anyway (BUG-044).
+    if ($PSCmdlet -and -not $PSCmdlet.ShouldProcess("DbQuery from '$From'", 'Create object')) { return }
     return [DbQuery]::new($Database, $From)
 }
