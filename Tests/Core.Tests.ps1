@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -961,5 +961,45 @@ Describe 'Enable-UniqueIndex creates a distinct index for every distinct column 
         # a different column set on the same table still gets its own index
         Enable-UniqueIndex -Database $db -Table 't' -Columns @('other') | Should -Be 'ux_t_other'
         @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='t'").Count | Should -Be 2
+    }
+}
+
+Describe 'Invoke-DbQuery -AsDataTable returns a DataTable on both paths' -Tag 'BUG-068' {
+    BeforeAll {
+        $script:db068 = New-CoreDbPath -Name 'b068'
+        Invoke-DbQuery -Database $script:db068 -Query 'CREATE TABLE t(id INTEGER, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db068 -Query "INSERT INTO t VALUES(1,'a'),(2,'b')" -NonQuery | Out-Null
+    }
+    It 'direct path returns one DataTable for multi-row, single-row and empty results' {
+        $dt = Invoke-DbQuery -Database $script:db068 -Query 'SELECT * FROM t ORDER BY id' -AsDataTable
+        $dt.GetType().FullName | Should -Be 'System.Data.DataTable'
+        $dt.Rows.Count | Should -Be 2
+        $dt1 = Invoke-DbQuery -Database $script:db068 -Query 'SELECT * FROM t WHERE id = 1' -AsDataTable
+        $dt1.GetType().FullName | Should -Be 'System.Data.DataTable'
+        $dt1.Rows.Count | Should -Be 1
+        $dt0 = Invoke-DbQuery -Database $script:db068 -Query 'SELECT * FROM t WHERE id = 9' -AsDataTable
+        $dt0.GetType().FullName | Should -Be 'System.Data.DataTable'
+        $dt0.Rows.Count | Should -Be 0
+    }
+    Context 'PSSQLite fallback' {
+        BeforeAll { Disable-DirectConnection }
+        AfterAll { Restore-DirectConnection }
+        It 'returns a DataTable with the result columns and rows instead of PSCustomObjects' {
+            $dt = Invoke-DbQuery -Database $script:db068 -Query 'SELECT * FROM t ORDER BY id' -AsDataTable
+            $dt.GetType().FullName | Should -Be 'System.Data.DataTable'
+            $dt.Rows.Count | Should -Be 2
+            @($dt.Columns | ForEach-Object { $_.ColumnName }) -join ',' | Should -Be 'id,name'
+            $dt.Rows[1].name | Should -Be 'b'
+            @($dt.Select("id = 2")).Count | Should -Be 1
+        }
+        It 'returns a DataTable (not a bare DataRow) for a single-row result and an empty table for no rows' {
+            $dt1 = Invoke-DbQuery -Database $script:db068 -Query 'SELECT * FROM t WHERE id = @id' -SqlParameters @{ id = 1 } -AsDataTable
+            $dt1.GetType().FullName | Should -Be 'System.Data.DataTable'
+            $dt1.Rows.Count | Should -Be 1
+            $dt1.Rows[0].name | Should -Be 'a'
+            $dt0 = Invoke-DbQuery -Database $script:db068 -Query 'SELECT * FROM t WHERE id = 9' -AsDataTable
+            $dt0.GetType().FullName | Should -Be 'System.Data.DataTable'
+            $dt0.Rows.Count | Should -Be 0
+        }
     }
 }

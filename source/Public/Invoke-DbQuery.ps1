@@ -72,6 +72,14 @@ function Invoke-DbQuery {
                 $q = @(Invoke-SqliteQuery -DataSource $Database -Query $batch -SqlParameters $SqlParameters -ErrorAction Stop)
                 if ($q.Count -gt 0 -and $null -ne $q[0].affected) { return [int]$q[0].affected } else { return 0 }
             }
+            elseif ($AsDataTable) {
+                # BUG-068: honor -AsDataTable on the fallback path too. PSSQLite's -As DataTable
+                # emits the table collection, which PowerShell unrolls into DataRows, so ask for
+                # the DataSet (not enumerable) and return its first table with the unary comma.
+                $ds = Invoke-SqliteQuery -DataSource $Database -Query ($fkPrefix + $Query) -SqlParameters $SqlParameters -As DataSet -ErrorAction Stop
+                if ($ds -and $ds.Tables.Count -gt 0) { return , $ds.Tables[0] }
+                return , (New-Object System.Data.DataTable)
+            }
             else {
                 return Invoke-SqliteQuery -DataSource $Database -Query ($fkPrefix + $Query) -SqlParameters $SqlParameters -ErrorAction Stop
             }
