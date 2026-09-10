@@ -375,6 +375,52 @@ Describe 'Invoke-DbQuery result shape is the same on both paths' -Tag 'BUG-026' 
     }
 }
 
+Describe 'DynamicActiveRecord keeps columns whose names match DataRow members' -Tag 'BUG-026' {
+    BeforeAll {
+        $script:dbDar026 = New-CoreDbPath -Name 'dar026'
+        Invoke-DbQuery -Database $script:dbDar026 -Query 'CREATE TABLE s(id INTEGER PRIMARY KEY, name TEXT, "Table" TEXT, RowState TEXT, ItemArray TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:dbDar026 -Query "INSERT INTO s VALUES(1,'a','oak','new','arr'),(2,'b','pine','old','arr2')" -NonQuery | Out-Null
+        # Hydrate through the shipped class code: a subclass with the (string) constructor
+        # FindById/Where expect, defined inside the module scope so the base class resolves.
+        $script:darCode026 = @'
+param($d)
+class CoreTestS026 : DynamicActiveRecord {
+    CoreTestS026([string]$db) : base('s', $db, @('id', 'name', 'Table', 'RowState', 'ItemArray')) {}
+}
+$proto = [CoreTestS026]::new($d)
+$r = $proto.FindById(1)
+$all = @($proto.Where('1=1', @{}))
+$hydratedTable = [string]$r.GetAttribute('Table')
+$r.SetAttribute('Table', 'elm')
+$r.Save()
+$again = $proto.FindById(1)
+[pscustomobject]@{
+    Table     = $hydratedTable
+    RowState  = [string]$r.GetAttribute('RowState')
+    ItemArray = [string]$r.GetAttribute('ItemArray')
+    Keys      = (($r.Attributes.Keys | Sort-Object) -join ',')
+    WhereKeys = ((@($all | ForEach-Object { ($_.Attributes.Keys | Sort-Object) -join ',' })) -join '|')
+    Saved     = [string]$again.GetAttribute('Table')
+}
+'@
+        $m = (Get-Command Invoke-DbQuery).Module
+        $script:dar026 = & $m { param($c, $d) $sb = [scriptblock]::Create($c); & $sb $d } $script:darCode026 $script:dbDar026
+    }
+    It 'FindById hydrates Table, RowState and ItemArray columns' {
+        $script:dar026.Table | Should -Be 'oak'
+        $script:dar026.RowState | Should -Be 'new'
+        $script:dar026.ItemArray | Should -Be 'arr'
+        $script:dar026.Keys | Should -Be 'ItemArray,name,RowState,Table'
+    }
+    It 'Where hydrates the same columns for every row' {
+        $script:dar026.WhereKeys | Should -Be 'ItemArray,name,RowState,Table|ItemArray,name,RowState,Table'
+    }
+    It 'Save writes a changed Table value back' {
+        $script:dar026.Saved | Should -Be 'elm'
+        (Invoke-DbQuery -Database $script:dbDar026 -Query 'SELECT "Table" AS t FROM s WHERE id = 1').t | Should -Be 'elm'
+    }
+}
+
 Describe 'DEBUG logging does not write bound parameter values' -Tag 'BUG-047' {
     It 'logs parameter names but not values' {
         $db = New-CoreDbPath -Name 'b047'

@@ -9,7 +9,9 @@ class DynamicActiveRecord {
     hidden [hashtable]$Callbacks = @{
         BeforeSave = $null; AfterSave = $null; BeforeDelete = $null; AfterDelete = $null
     }
-    hidden [string[]]$ExcludedProperties = @('RowState', 'RowError', 'HasErrors', 'Table', 'ItemArray')
+    # BUG-026: Invoke-DbQuery no longer emits DataRow members, so nothing is excluded; the
+    # old list silently dropped genuine columns named Table, RowState, RowError, ItemArray, HasErrors.
+    hidden [string[]]$ExcludedProperties = @()
 
     DynamicActiveRecord([string]$tableName, [string]$database, [string[]]$columns) {
         $this.TableName = $tableName; $this.Database = $database; $this.Columns = $columns; $this.Id = 0
