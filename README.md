@@ -76,7 +76,21 @@ $results = $query.Where('status = @status', @{status='active'}).Run()
 # Or use joins for related data
 $query = New-DbQuery -Database .\myapp.db -From 'assets'
 $results = $query.Join('users', 'assets.owner_id = users.id').Select(@('assets.*', 'users.name as owner_name')).Run()
+
+# Order, page and let the catalog supply the ON clause ('Auto' uses the confirmed relationship in __fks__)
+$query = New-DbQuery -Database .\myapp.db -From 'vulns v'
+$results = $query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(10).Offset(20).Run()
 ```
+
+Notes on the query builder:
+- Each `Where()` clause is wrapped in parentheses before the clauses are joined with `AND`, so an `OR` inside one
+  clause cannot change the meaning of the others.
+- Table references passed to `New-DbQuery -From` and `Join()` may carry an alias (`'assets a'` or `'assets AS a'`);
+  `Auto` joins qualify the ON clause with the alias when one is given.
+- `Right` and `Full` joins are emulated (SQLite versions before 3.39 have no native support). The `Full` emulation
+  is `LEFT JOIN ... UNION ALL` the unmatched rows of the swapped `LEFT JOIN`, so duplicate rows are preserved; it
+  relies on the `rowid` of the `From` table, so that table must not be `WITHOUT ROWID` or a view. `ORDER BY` on a
+  `Full` join must use result column names (aliases from `Select()`), as SQLite requires for compound selects.
 
 ### 6. Work with Dynamic Models
 ```powershell
