@@ -113,3 +113,155 @@ Describe 'Import-CsvToSqlite AppendOnly column validation' -Tag 'BUG-051' {
         [int]$count.c | Should -Be 2
     }
 }
+
+Describe 'Import-CsvToSqlite numeric inference keeps values intact' -Tag 'BUG-004' {
+    It 'stores leading-zero, oversized and formatted numeric strings as TEXT unchanged' {
+        $csv = New-TestCsv -Name 'b004.csv' -Lines @(
+            'id,zip,acct,phone,version,amount,ratio',
+            '1,02134,12345678901234567890,0015551234567,1.10,1.5,0.5',
+            '2,00501,5,15551234567,1.1,2.25,1.0')
+        $db = New-TestDbPath -Name 'b004'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        ($info | Where-Object { $_.name -eq 'zip' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'acct' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'phone' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'version' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'REAL'
+        ($info | Where-Object { $_.name -eq 'ratio' }).type | Should -Be 'TEXT'
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT * FROM t ORDER BY id')
+        $rows[0].zip | Should -Be '02134'
+        $rows[1].zip | Should -Be '00501'
+        $rows[0].acct | Should -Be '12345678901234567890'
+        $rows[0].phone | Should -Be '0015551234567'
+        $rows[0].version | Should -Be '1.10'
+        $rows[1].version | Should -Be '1.1'
+        [double]$rows[1].amount | Should -Be 2.25
+    }
+    It 'still infers INTEGER and REAL for canonical numbers' {
+        $csv = New-TestCsv -Name 'b004b.csv' -Lines @('id,qty,price', '1,5,1.5', '2,-3,2.25', '3,0,10.75')
+        $db = New-TestDbPath -Name 'b004b'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        ($info | Where-Object { $_.name -eq 'qty' }).type | Should -Be 'INTEGER'
+        ($info | Where-Object { $_.name -eq 'price' }).type | Should -Be 'REAL'
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT qty, typeof(qty) AS tq, price, typeof(price) AS tp FROM t WHERE id=2' | Select-Object -First 1
+        $row.tq | Should -Be 'integer'
+        [long]$row.qty | Should -Be -3
+        $row.tp | Should -Be 'real'
+    }
+}
+
+Describe 'Import-CsvToSqlite reconciles column types across imports' -Tag 'BUG-005' {
+    It 'infers TEXT for a column without any value so later text is read back intact' {
+        $csv1 = New-TestCsv -Name 'b005a.csv' -Lines @('id,notes', '1,', '2,')
+        $csv2 = New-TestCsv -Name 'b005b.csv' -Lines @('id,notes', '5,hello')
+        $db = New-TestDbPath -Name 'b005'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'n' | Out-Null
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(n)')
+        ($info | Where-Object { $_.name -eq 'notes' }).type | Should -Be 'TEXT'
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'n' | Out-Null
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT notes FROM n WHERE id=5' | Select-Object -First 1
+        $row.notes | Should -Be 'hello'
+    }
+    It 'widens an INTEGER column to TEXT in Relaxed mode and keeps old and new values readable' {
+        $csv1 = New-TestCsv -Name 'b005c.csv' -Lines @('id,zip', '1,12345', '2,90210')
+        $csv2 = New-TestCsv -Name 'b005d.csv' -Lines @('id,zip', '3,SW1A 1AA', '4,K1A0B1')
+        $db = New-TestDbPath -Name 'b005w'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'z' | Out-Null
+        Enable-UniqueIndex -Database $db -Table 'z' -Columns @('zip') | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(z)') | Where-Object { $_.name -eq 'zip' }).type | Should -Be 'INTEGER'
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'z' -SchemaMode Relaxed | Out-Null
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(z)')
+        ($info | Where-Object { $_.name -eq 'zip' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'id' }).pk | Should -Be 1
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT id, zip FROM z ORDER BY id')
+        $rows.Count | Should -Be 4
+        "$($rows[0].zip)" | Should -Be '12345'
+        $rows[2].zip | Should -Be 'SW1A 1AA'
+        $rows[3].zip | Should -Be 'K1A0B1'
+        # the unique index survived the rebuild
+        $idx = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='z' AND name='ux_z_zip'")
+        $idx.Count | Should -Be 1
+        # catalog reflects the new type
+        $cat = Invoke-DbQuery -Database $db -Query "SELECT data_type FROM __columns__ WHERE table_name='z' AND column_name='zip'" | Select-Object -First 1
+        $cat.data_type | Should -Be 'TEXT'
+    }
+    It 'refuses text for an INTEGER column in Strict and AppendOnly mode before inserting' {
+        $csv1 = New-TestCsv -Name 'b005e.csv' -Lines @('id,zip', '1,12345')
+        $csv2 = New-TestCsv -Name 'b005f.csv' -Lines @('id,zip', '3,SW1A 1AA')
+        $db = New-TestDbPath -Name 'b005s'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'z' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'z' -SchemaMode Strict } | Should -Throw '*declared INTEGER but the CSV contains TEXT*'
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'z' -SchemaMode AppendOnly } | Should -Throw '*declared INTEGER but the CSV contains TEXT*'
+        $count = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM z' | Select-Object -First 1
+        [int]$count.c | Should -Be 1
+    }
+    It 'infers TEXT when empty strings are values (NullTokens @()) so they are not read back as 0' {
+        $csv = New-TestCsv -Name 'b005g.csv' -Lines @('id,n', '1,5', '2,')
+        $db = New-TestDbPath -Name 'b005n'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'e' -NullTokens @() | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(e)') | Where-Object { $_.name -eq 'n' }).type | Should -Be 'TEXT'
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT n, typeof(n) AS t FROM e WHERE id=2' | Select-Object -First 1
+        $row.t | Should -Be 'text'
+        "$($row.n)" | Should -Be ''
+    }
+}
+
+Describe 'Import-CsvToSqlite id column inference' -Tag 'BUG-013' {
+    It 'declares a text id column as TEXT PRIMARY KEY and imports every row' {
+        $csv = New-TestCsv -Name 'b013a.csv' -Lines @('id,name', 'srv-01,alpha', 'srv-02,beta')
+        $db = New-TestDbPath -Name 'b013a'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Not -Throw
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        $idInfo = $info | Where-Object { $_.name -eq 'id' }
+        $idInfo.type | Should -Be 'TEXT'
+        [int]$idInfo.pk | Should -Be 1
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT id, name FROM t ORDER BY id')
+        $rows.Count | Should -Be 2
+        $rows[0].id | Should -Be 'srv-01'
+        $rows[1].name | Should -Be 'beta'
+        $cat = Invoke-DbQuery -Database $db -Query "SELECT rowcount FROM __tables__ WHERE table_name='t'" | Select-Object -First 1
+        [int]$cat.rowcount | Should -Be 2
+    }
+    It 'handles an upper-case ID header with text values' {
+        $csv = New-TestCsv -Name 'b013b.csv' -Lines @('ID,name', 'A1,alpha')
+        $db = New-TestDbPath -Name 'b013b'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Not -Throw
+        $idInfo = (Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'ID' }
+        $idInfo.type | Should -Be 'TEXT'
+        $count = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$count.c | Should -Be 1
+    }
+    It 'keeps INTEGER PRIMARY KEY AUTOINCREMENT for integer ids' {
+        $csv = New-TestCsv -Name 'b013c.csv' -Lines @('id,name', '1,a', '2,b')
+        $db = New-TestDbPath -Name 'b013c'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $sql = (Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE type='table' AND name='t'" | Select-Object -First 1).sql
+        $sql | Should -Match 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    }
+    It 'numbers blank integer ids past the explicit ids so they do not collide' {
+        $csv = New-TestCsv -Name 'b013d.csv' -Lines @('id,name', '1,a', ',b', '2,c')
+        $db = New-TestDbPath -Name 'b013d'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Not -Throw
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT id, name FROM t ORDER BY name')
+        $rows.Count | Should -Be 3
+        [long]$rows[0].id | Should -Be 1
+        [long]$rows[1].id | Should -Be 3
+        [long]$rows[2].id | Should -Be 2
+    }
+    It 'widens an INTEGER id to TEXT PRIMARY KEY in Relaxed mode when text ids arrive' {
+        $csv1 = New-TestCsv -Name 'b013e.csv' -Lines @('id,name', '1,a')
+        $csv2 = New-TestCsv -Name 'b013f.csv' -Lines @('id,name', 'x9,b')
+        $db = New-TestDbPath -Name 'b013e'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Not -Throw
+        $idInfo = (Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'id' }
+        $idInfo.type | Should -Be 'TEXT'
+        [int]$idInfo.pk | Should -Be 1
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT id FROM t ORDER BY id')
+        $rows.Count | Should -Be 2
+        "$($rows[0].id)" | Should -Be '1'
+        $rows[1].id | Should -Be 'x9'
+    }
+}

@@ -51,7 +51,8 @@ function Import-CsvToSqlite {
         }
     }
 
-    $columnTypes = Test-ColumnTypes -Csv $csv -Headers $headers
+    # When '' is not a null token it is a real value and must never land in a numeric column.
+    $columnTypes = Test-ColumnTypes -Csv $csv -Headers $headers -EmptyIsText:($NullTokens -notcontains '')
     foreach ($h in $headers) { if (-not $columnTypes[$h]) { $columnTypes[$h] = 'TEXT' } }
 
     $quotedCols = ($headers | ForEach-Object { "$(ConvertTo-Ident $_) $($columnTypes[$_])" }) -join ", "
@@ -98,6 +99,56 @@ function Import-CsvToSqlite {
     elseif ($SchemaMode -eq 'AppendOnly') {
         # No schema changes allowed; every CSV column must already exist in the table
         foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "AppendOnly mode: column $h does not exist in table $TableName" } }
+    }
+
+    # Reconcile inferred types with the declared column types. SQLite stores text in an INTEGER
+    # column happily, but System.Data.SQLite reads that column back by its declared type and
+    # returns 0 for the text, so a narrower declared type must be widened (Relaxed) or refused.
+    $rank = @{ INTEGER = 1; REAL = 2; TEXT = 3 }
+    $widen = @{}
+    foreach ($h in $headers) {
+        $hasValue = $false
+        foreach ($row in $csv) { if ($null -ne $row.$h) { $hasValue = $true; break } }
+        if (-not $hasValue) { continue }
+        $inferred = ($columnTypes[$h] -replace '(?i)\s+(PRIMARY\s+KEY|AUTOINCREMENT|UNIQUE)\b.*$', '').Trim().ToUpperInvariant()
+        if (-not $rank.ContainsKey($inferred)) { continue }
+        $info = $existing | Where-Object { $_.name -eq $h } | Select-Object -First 1
+        if (-not $info) { continue }
+        $declared = "$($info.type)".ToUpperInvariant()
+        # SQLite affinity rules: INT -> INTEGER; CHAR/CLOB/TEXT -> TEXT; blank/BLOB -> stored as given; REAL/FLOA/DOUB and NUMERIC -> numeric
+        if ($declared -match 'INT') { $declaredRank = 1 }
+        elseif ($declared -match 'CHAR|CLOB|TEXT' -or $declared -eq '' -or $declared -match 'BLOB') { $declaredRank = 3 }
+        else { $declaredRank = 2 }
+        if ($rank[$inferred] -gt $declaredRank) {
+            if ($SchemaMode -eq 'Relaxed') { $widen[$h] = $inferred }
+            else { throw "$SchemaMode mode: column '$h' in table '$TableName' is declared $($info.type) but the CSV contains $inferred values; use -SchemaMode Relaxed to widen the column" }
+        }
+    }
+    if ($widen.Count -gt 0) {
+        Update-DbColumnType -Database $Database -Table $TableName -ColumnTypes $widen
+        $existing = Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($(ConvertTo-Ident $TableName))"
+    }
+
+    # Blank ids in an INTEGER PRIMARY KEY column would be auto-numbered from the current maximum
+    # and collide with explicit ids later in the same file; number them past every known id first.
+    $idHeader = $headers | Where-Object { $_ -eq 'id' } | Select-Object -First 1
+    if ($idHeader) {
+        $idInfo = $existing | Where-Object { $_.name -eq $idHeader } | Select-Object -First 1
+        if ($idInfo -and [int]$idInfo.pk -eq 1 -and "$($idInfo.type)" -match '(?i)INT') {
+            $blankRows = @($csv | Where-Object { $null -eq $_.$idHeader })
+            $explicitIds = @($csv | Where-Object { $null -ne $_.$idHeader } | ForEach-Object { [long]$_.$idHeader })
+            if ($blankRows.Count -gt 0 -and $explicitIds.Count -gt 0) {
+                $next = ($explicitIds | Measure-Object -Maximum).Maximum
+                $maxRow = Invoke-DbQuery -Database $Database -Query "SELECT MAX($(ConvertTo-Ident $idHeader)) AS m FROM $(ConvertTo-Ident $TableName)" | Select-Object -First 1
+                if ($maxRow -and $null -ne $maxRow.m -and $maxRow.m -isnot [System.DBNull] -and [long]$maxRow.m -gt $next) { $next = [long]$maxRow.m }
+                $hasSeq = Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+                if ($hasSeq) {
+                    $seqRow = Invoke-DbQuery -Database $Database -Query "SELECT seq FROM sqlite_sequence WHERE name=@t" -SqlParameters @{ t = $TableName } | Select-Object -First 1
+                    if ($seqRow -and $null -ne $seqRow.seq -and $seqRow.seq -isnot [System.DBNull] -and [long]$seqRow.seq -gt $next) { $next = [long]$seqRow.seq }
+                }
+                foreach ($row in $blankRows) { $next = [long]$next + 1; $row.$idHeader = $next }
+            }
+        }
     }
 
     # Insert data
