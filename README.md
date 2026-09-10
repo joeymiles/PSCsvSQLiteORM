@@ -94,6 +94,10 @@ $results = $query.Where('hostname = @host', @{ host = 'server01' }).Run()
 $query = New-DbQuery -Database .\myapp.db -From 'assets'
 $results = $query.Join('vulns', 'vulns.asset_id = assets.id', 'Left').Select(@('assets.*', 'vulns.title AS vuln_title')).Run()
 
+# Join(<table>, <on>) is an INNER join; Join(<table>) is an INNER join on the catalog relationship ('Auto')
+$query = New-DbQuery -Database .\myapp.db -From 'assets'
+$results = $query.Join('vulns', 'vulns.asset_id = assets.id').Select(@('assets.hostname', 'vulns.title')).Run()
+
 # Order, page and let the catalog supply the ON clause ('Auto' uses the relationship confirmed in step 3)
 $query = New-DbQuery -Database .\myapp.db -From 'vulns v'
 $results = $query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(2).Offset(1).Run()
@@ -103,7 +107,10 @@ Notes on the query builder:
 - Each `Where()` clause is wrapped in parentheses before the clauses are joined with `AND`, so an `OR` inside one
   clause cannot change the meaning of the others.
 - Table references passed to `New-DbQuery -From` and `Join()` may carry an alias (`'assets a'` or `'assets AS a'`);
-  `Auto` joins qualify the ON clause with the alias when one is given.
+  `Auto` joins qualify the ON clause with the alias when one is given. They are identifiers, not SQL: an unquoted
+  name or alias may only contain word characters, dots and dashes (double-quote a name that needs anything else),
+  and any other text (`'a; DROP TABLE b'`) is rejected. `Select()`, `Where()`, `OrderBy()` and the `ON` clause are
+  raw SQL fragments; bind user input through the `Where()` parameter hashtable rather than concatenating it.
 - `Right` and `Full` joins are emulated (SQLite versions before 3.39 have no native support). The `Full` emulation
   is `LEFT JOIN ... UNION ALL` the unmatched rows of the swapped `LEFT JOIN`, so duplicate rows are preserved; it
   relies on the `rowid` of the `From` table, so that table must not be `WITHOUT ROWID` or a view. `ORDER BY` on a

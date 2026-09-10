@@ -174,3 +174,88 @@ Describe 'DbQuery FULL join emulation keeps duplicates (BUG-028)' -Tag 'BUG-028'
         [int]$rows[0].bid | Should -Be 11
     }
 }
+
+Describe 'DbQuery rejects SQL in From and Join table references (BUG-029)' -Tag 'BUG-029' {
+    BeforeAll {
+        $script:db029 = New-TestDbPath 'bug029'
+        Invoke-DbQuery -Database $script:db029 -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'CREATE TABLE b(id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'CREATE TABLE "my table"(id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'INSERT INTO a(id,b_id) VALUES (1,1),(2,1)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'INSERT INTO b(id) VALUES (1)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'INSERT INTO "my table"(id) VALUES (7)' -NonQuery | Out-Null
+
+        function Test-TableExists([string]$Name) {
+            return (@(Invoke-DbQuery -Database $script:db029 -Query "SELECT name FROM sqlite_master WHERE type='table' AND name=@n" -SqlParameters @{ n = $Name }).Count -eq 1)
+        }
+    }
+
+    It 'a multi-statement From is rejected before any SQL runs' {
+        { New-DbQuery -Database $script:db029 -From 'a; DROP TABLE b' } | Should -Throw -ExpectedMessage '*Invalid From table reference*'
+        Test-TableExists 'b' | Should -BeTrue
+    }
+
+    It 'a multi-statement Join table is rejected before any SQL runs' {
+        $q = New-DbQuery -Database $script:db029 -From 'a'
+        { $q.Join('b x; DROP TABLE b', 'a.b_id = x.id', 'Inner') } | Should -Throw -ExpectedMessage '*Invalid Join table reference*'
+        { $q.Join('b; DROP TABLE b', 'a.b_id = b.id') } | Should -Throw -ExpectedMessage '*Invalid Join table reference*'
+        $q.Joins.Count | Should -Be 0
+        Test-TableExists 'b' | Should -BeTrue
+    }
+
+    It 'an unquoted name with illegal characters is rejected even as a single token' {
+        foreach ($bad in @('a;', 'a/*', "a`nDROP TABLE b", "a'", 'a)', '(SELECT 1) x')) {
+            { New-DbQuery -Database $script:db029 -From $bad } | Should -Throw -ExpectedMessage '*Invalid From table reference*' -Because "'$bad' must not reach the driver"
+        }
+        { New-DbQuery -Database $script:db029 -From '' } | Should -Throw
+        Test-TableExists 'b' | Should -BeTrue
+    }
+
+    It 'plain, aliased, AS-aliased, schema-qualified and double-quoted references are still accepted' {
+        (Get-Rows ((New-DbQuery -Database $script:db029 -From 'a').Run())).Count | Should -Be 2
+        (Get-Rows ((New-DbQuery -Database $script:db029 -From 'a x').Where('x.id = 1', $null).Run())).Count | Should -Be 1
+        (Get-Rows ((New-DbQuery -Database $script:db029 -From 'a AS x').Join('b AS y', 'x.b_id = y.id', 'Left').Run())).Count | Should -Be 2
+        (Get-Rows ((New-DbQuery -Database $script:db029 -From 'main.a').Run())).Count | Should -Be 2
+        $rows = Get-Rows ((New-DbQuery -Database $script:db029 -From '"my table" t').Select(@('t.id AS tid')).Run())
+        $rows.Count | Should -Be 1
+        [int]$rows[0].tid | Should -Be 7
+    }
+
+    It 'a double-quoted name may contain characters that are illegal unquoted' {
+        Invoke-DbQuery -Database $script:db029 -Query 'CREATE TABLE "odd;name"(id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'INSERT INTO "odd;name"(id) VALUES (3)' -NonQuery | Out-Null
+        $rows = Get-Rows ((New-DbQuery -Database $script:db029 -From '"odd;name"').Run())
+        $rows.Count | Should -Be 1
+        [int]$rows[0].id | Should -Be 3
+    }
+}
+
+Describe 'DbQuery two-argument and one-argument Join overloads (BUG-065)' -Tag 'BUG-065' {
+    BeforeAll {
+        $script:db065 = New-RelationalDb
+    }
+
+    It 'Join(<table>, <on>) as documented in the README is an INNER join' {
+        $query = New-DbQuery -Database $script:db065 -From 'assets'
+        $result = $query.Join('vulns', 'vulns.asset_id = assets.id')
+        $result | Should -Be $query
+        $query.Joins.Count | Should -Be 1
+        $query.Joins[0].Type | Should -Be 'Inner'
+        $query.Joins[0].On | Should -Be 'vulns.asset_id = assets.id'
+        $rows = Get-Rows ($query.Select(@('assets.hostname', 'vulns.title')).Run())
+        $rows.Count | Should -Be 4
+    }
+
+    It 'Join(<table>) uses the catalog relationship as an INNER join' {
+        $q = (New-DbQuery -Database $script:db065 -From 'vulns v').Join('assets a')
+        $q.Joins[0].Type | Should -Be 'Inner'
+        $q.Joins[0].On | Should -Be 'v."asset_id" = a."id"'
+        (Get-Rows ($q.Run())).Count | Should -Be 4
+    }
+
+    It 'the three-argument form still selects the join type' {
+        $q = (New-DbQuery -Database $script:db065 -From 'assets').Join('vulns', 'vulns.asset_id = assets.id', 'Left')
+        $q.Joins[0].Type | Should -Be 'Left'
+        { (New-DbQuery -Database $script:db065 -From 'assets').Join('vulns', 'vulns.asset_id = assets.id', 'Cross') } | Should -Throw -ExpectedMessage "*Invalid join type*"
+    }
+}
