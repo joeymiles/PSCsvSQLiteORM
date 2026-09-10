@@ -108,8 +108,8 @@ Notes on the query builder:
   clause cannot change the meaning of the others.
 - Table references passed to `New-DbQuery -From` and `Join()` may carry an alias (`'assets a'` or `'assets AS a'`);
   `Auto` joins qualify the ON clause with the alias when one is given. They are identifiers, not SQL: an unquoted
-  name or alias may only contain word characters, dots and dashes (double-quote a name that needs anything else),
-  and any other text (`'a; DROP TABLE b'`) is rejected. `Select()`, `Where()`, `OrderBy()` and the `ON` clause are
+  name or alias may only contain word characters and dots (double-quote a name that needs anything else, dashes
+  included), and any other text (`'a; DROP TABLE b'`, `'a--'`) is rejected. `Select()`, `Where()`, `OrderBy()` and the `ON` clause are
   raw SQL fragments; bind user input through the `Where()` parameter hashtable rather than concatenating it.
 - `Right` and `Full` joins are emulated (SQLite versions before 3.39 have no native support). The `Full` emulation
   is `LEFT JOIN ... UNION ALL` the unmatched rows of the swapped `LEFT JOIN`, so duplicate rows are preserved; it

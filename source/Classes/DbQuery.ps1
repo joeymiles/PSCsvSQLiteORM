@@ -32,10 +32,12 @@ class DbQuery {
     }
     hidden [string]QuoteIdent([string]$n) { return ('"' + ($n -replace '"', '""') + '"') }
     # From and Join table references are identifiers, not SQL fragments (BUG-029). They are interpolated raw so an
-    # alias can be kept as written, so an unquoted name or alias may only contain word characters, dots and dashes;
-    # anything else ('a; DROP TABLE b', 'a--') is rejected before it can reach the driver, which runs multi-statement
-    # text. A double-quoted name may contain any character. Select/Where/OrderBy/On stay raw SQL by design.
-    hidden static [string]$IdentTokenPattern = '^[\w.\-]+$'
+    # alias can be kept as written, so an unquoted name or alias may only contain word characters and dots; anything
+    # else ('a; DROP TABLE b', 'a--', 'a /* x */') is rejected before it can reach the driver, which runs
+    # multi-statement text. A dash is never valid in a raw identifier ('a-b' is a subtraction, 'a--' starts a comment
+    # that swallows ON/WHERE/ORDER BY/LIMIT). A double-quoted name may contain any character, dashes included.
+    # Select/Where/OrderBy/On stay raw SQL by design.
+    hidden static [string]$IdentTokenPattern = '^[\w.]+$'
     hidden [void]AssertTableRef([string]$t, [string]$what) {
         if ([string]::IsNullOrWhiteSpace($t)) { throw "Invalid $what table reference: value is null or empty" }
         if ($t -notmatch [DbQuery]::TableRefPattern) { throw "Invalid $what table reference '$t': expected <table> or <table> [AS] <alias>" }

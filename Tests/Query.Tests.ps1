@@ -211,6 +211,29 @@ Describe 'DbQuery rejects SQL in From and Join table references (BUG-029)' -Tag 
         Test-TableExists 'b' | Should -BeTrue
     }
 
+    It 'a comment marker in an unquoted name or alias cannot disable the ON and WHERE clauses' {
+        # '--' used to pass the identifier check and comment out everything after the table reference, so a Where()
+        # filter (or a join ON) was silently discarded and every row came back.
+        { New-DbQuery -Database $script:db029 -From 'a--' } | Should -Throw -ExpectedMessage '*Invalid From table reference*'
+        { New-DbQuery -Database $script:db029 -From 'a x--' } | Should -Throw -ExpectedMessage '*Invalid From table reference*'
+        { New-DbQuery -Database $script:db029 -From 'a-b' } | Should -Throw -ExpectedMessage '*Invalid From table reference*'
+        $q = New-DbQuery -Database $script:db029 -From 'a'
+        { $q.Join('b--', 'a.b_id = b.id') } | Should -Throw -ExpectedMessage '*Invalid Join table reference*'
+        { $q.Join('b y--', 'a.b_id = y.id', 'Left') } | Should -Throw -ExpectedMessage '*Invalid Join table reference*'
+        $q.Joins.Count | Should -Be 0
+        # The filter still applies after the rejected calls: only one of the two rows of a has id 1.
+        (Get-Rows ($q.Where('a.id = @i', @{ i = 1 }).Run())).Count | Should -Be 1
+        (Get-Rows ((New-DbQuery -Database $script:db029 -From 'a').Join('b', 'a.b_id = b.id').Where('a.id = @i', @{ i = 1 }).Run())).Count | Should -Be 1
+    }
+
+    It 'a double-quoted name or alias may contain a dash' {
+        Invoke-DbQuery -Database $script:db029 -Query 'CREATE TABLE "dash-name"(id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db029 -Query 'INSERT INTO "dash-name"(id) VALUES (5),(6)' -NonQuery | Out-Null
+        $rows = Get-Rows ((New-DbQuery -Database $script:db029 -From '"dash-name" "d-1"').Where('"d-1".id = @i', @{ i = 6 }).Run())
+        $rows.Count | Should -Be 1
+        [int]$rows[0].id | Should -Be 6
+    }
+
     It 'plain, aliased, AS-aliased, schema-qualified and double-quoted references are still accepted' {
         (Get-Rows ((New-DbQuery -Database $script:db029 -From 'a').Run())).Count | Should -Be 2
         (Get-Rows ((New-DbQuery -Database $script:db029 -From 'a x').Where('x.id = 1', $null).Run())).Count | Should -Be 1
