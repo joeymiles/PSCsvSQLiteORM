@@ -1,6 +1,7 @@
 # Functional tests for PSCsvSQLiteORM
 
-Import-Module (Join-Path $PSScriptRoot '..' 'output' 'PSCsvSQLiteORM') -Force
+# Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
+Import-Module (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM') -Force
 
 Describe 'Initialize-ORMVars settings script' {
     It 'Applies settings from a SettingsPath file' {

@@ -10,9 +10,81 @@ class DynamicActiveRecord {
         BeforeSave = $null; AfterSave = $null; BeforeDelete = $null; AfterDelete = $null
     }
     hidden [string[]]$ExcludedProperties = @('RowState', 'RowError', 'HasErrors', 'Table', 'ItemArray')
+    # Key column used for FindById/Save/Delete: 'id' when the table has one, otherwise 'rowid'. Resolved lazily.
+    hidden [string]$KeyColumn
+    # Upsert mode cache: 0 = unknown, 1 = native ON CONFLICT (SQLite 3.24+), 2 = emulated (UPDATE + conditional INSERT)
+    hidden [int]$UpsertMode = 0
 
     DynamicActiveRecord([string]$tableName, [string]$database, [string[]]$columns) {
         $this.TableName = $tableName; $this.Database = $database; $this.Columns = $columns; $this.Id = 0
+    }
+
+    # ---- Internal helpers (BUG-015 / BUG-016) ----
+
+    # Returns 'id' when the table has an id column, otherwise 'rowid' (tables imported from a CSV without an id header).
+    hidden [string]GetKeyColumn() {
+        if (-not [string]::IsNullOrEmpty($this.KeyColumn)) { return $this.KeyColumn }
+        $key = 'rowid'
+        $info = @(Invoke-DbQuery -Database $this.Database -Query "PRAGMA table_info($(ConvertTo-Ident $($this.TableName)))")
+        foreach ($c in $info) { if ($c -and $c.name -eq 'id') { $key = 'id'; break } }
+        # Only cache when the table exists (PRAGMA returns rows)
+        if ($info.Count -gt 0) { $this.KeyColumn = $key }
+        return $key
+    }
+
+    # SELECT prefix that always exposes the key as 'id' (rowid is aliased when there is no id column).
+    hidden [string]SelectSql() {
+        if ($this.GetKeyColumn() -eq 'id') { return "SELECT * FROM $(ConvertTo-Ident $($this.TableName))" }
+        return "SELECT rowid AS id, * FROM $(ConvertTo-Ident $($this.TableName))"
+    }
+
+    # Copies a result row into this record (Id from the 'id' column, everything else as attributes).
+    hidden [void]LoadRow([object]$row) {
+        if ($row.PSObject.Properties.Name -contains 'id') { $this.Id = [int]$row.id }
+        foreach ($p in $row.PSObject.Properties) {
+            if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) {
+                $this.SetAttribute($p.Name, $p.Value)
+            }
+        }
+    }
+
+    # Creates an empty record of the same model. Generated subclasses expose a (string) constructor; the base class
+    # (and any other subclass without that constructor) is cloned with its table, columns and associations.
+    hidden [DynamicActiveRecord]NewInstance() {
+        $rec = $null
+        $ctorInfo = $this.GetType().GetConstructor([type[]]@([string]))
+        if ($ctorInfo) { $rec = $ctorInfo.Invoke(@($this.Database)) }
+        else {
+            $rec = [DynamicActiveRecord]::new($this.TableName, $this.Database, $this.Columns)
+            foreach ($k in @($this.Associations.Keys)) { $rec.Associations[$k] = $this.Associations[$k] }
+        }
+        $rec.KeyColumn = $this.KeyColumn
+        return $rec
+    }
+
+    # Creates an empty record for a related table: the registered dynamic type when one is known, otherwise a base
+    # record wired with the confirmed relationships from the __fks__ catalog so navigation can continue.
+    hidden [DynamicActiveRecord]NewRelatedInstance([string]$table) {
+        $typeObj = $null
+        if ($script:ModelTypeObjects -and $script:ModelTypeObjects.ContainsKey($table)) { $typeObj = $script:ModelTypeObjects[$table] }
+        if ($typeObj) {
+            $ctorInfo = $typeObj.GetConstructor([type[]]@([string]))
+            if ($ctorInfo) { return $ctorInfo.Invoke(@($this.Database)) }
+        }
+        $cols = [string[]]@(Get-TableColumns -Database $this.Database -TableName $table)
+        $rec = [DynamicActiveRecord]::new($table, $this.Database, $cols)
+        $rec.LoadAssociationsFromCatalog()
+        return $rec
+    }
+
+    # Populates Associations from confirmed rows in __fks__ (no-op when the catalog does not exist).
+    hidden [void]LoadAssociationsFromCatalog() {
+        $exists = @(Invoke-DbQuery -Database $this.Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='__fks__'")
+        if ($exists.Count -eq 0) { return }
+        $fksFrom = @(Invoke-DbQuery -Database $this.Database -Query "SELECT column_name, ref_table FROM __fks__ WHERE table_name=@t AND status='confirmed'" -SqlParameters @{ t = $this.TableName })
+        foreach ($fk in $fksFrom) { if ($fk) { $this.BelongsTo([string]$fk.ref_table, [string]$fk.column_name) } }
+        $fksTo = @(Invoke-DbQuery -Database $this.Database -Query "SELECT table_name, column_name FROM __fks__ WHERE ref_table=@t AND status='confirmed'" -SqlParameters @{ t = $this.TableName })
+        foreach ($fk in $fksTo) { if ($fk) { $this.HasMany([string]$fk.table_name, [string]$fk.column_name) } }
     }
 
     [void]HasMany([string]$relatedTable, [string]$foreignKey) { $this.Associations["has_many_$relatedTable"] = @{ Type = "has_many"; Table = $relatedTable; ForeignKey = $foreignKey } }
@@ -72,7 +144,7 @@ class DynamicActiveRecord {
             else {
                 if (-not $this.Attributes.Keys -or $this.Attributes.Keys.Count -eq 0) { return }
             $setClause = (($this.Attributes.Keys | ForEach-Object { "$(ConvertTo-Ident $_) = @$_" })) -join ", "
-            $query = "UPDATE $(ConvertTo-Ident $($this.TableName)) SET $setClause WHERE id = @id"
+            $query = "UPDATE $(ConvertTo-Ident $($this.TableName)) SET $setClause WHERE $($this.GetKeyColumn()) = @id"
                 $params = @{ id = $this.Id }; foreach ($k in $this.Attributes.Keys) { $params[$k] = $this.Attributes[$k] }
                 [void](Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params -NonQuery)
             }
@@ -85,7 +157,7 @@ class DynamicActiveRecord {
         $this.InvokeCallback('BeforeDelete')
         try {
             if ($this.Id -ne 0) {
-            $query = "DELETE FROM $(ConvertTo-Ident $($this.TableName)) WHERE id = @id"
+            $query = "DELETE FROM $(ConvertTo-Ident $($this.TableName)) WHERE $($this.GetKeyColumn()) = @id"
                 [void](Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters @{id = $this.Id } -NonQuery)
                 $this.Id = 0
             }
@@ -95,38 +167,24 @@ class DynamicActiveRecord {
     }
 
     [object[]]Where([string]$WhereClause, [hashtable]$Params) {
-    $sql = "SELECT * FROM $(ConvertTo-Ident $($this.TableName))"
+    $sql = $this.SelectSql()
         if ($WhereClause -and $WhereClause.Trim().Length -gt 0) { $sql += " WHERE $WhereClause" }
         $results = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters $Params
-        $type = $this.GetType()
-        $ctorInfo = $type.GetConstructor([type[]]@([string]))
         $records = @()
         foreach ($row in $results) {
-            $rec = $ctorInfo.Invoke(@($this.Database))
-            if ($row.PSObject.Properties.Name -contains 'id') { $rec.Id = [int]$row.id }
-            foreach ($p in $row.PSObject.Properties) { 
-                if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) { 
-                    $rec.SetAttribute($p.Name, $p.Value) 
-                } 
-            }            $records += $rec
+            $rec = $this.NewInstance()
+            $rec.LoadRow($row)
+            $records += $rec
         }
         return $records
     }
 
     [psobject]FindById([int]$Id) {
-    $sql = "SELECT * FROM $(ConvertTo-Ident $($this.TableName)) WHERE id = @id"
+    $sql = $this.SelectSql() + " WHERE $($this.GetKeyColumn()) = @id"
         $res = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $Id }
         if (-not $res -or $res.Count -eq 0) { return $null }
-        $type = $this.GetType()
-        $ctorInfo = $type.GetConstructor([type[]]@([string]))
-        $rec = $ctorInfo.Invoke(@($this.Database))
-        $row = $res[0]
-        $rec.Id = [int]$row.id
-        foreach ($p in $row.PSObject.Properties) { 
-            if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) { 
-                $rec.SetAttribute($p.Name, $p.Value) 
-            } 
-        }
+        $rec = $this.NewInstance()
+        $rec.LoadRow($res[0])
         return $rec
     }
 
@@ -146,19 +204,11 @@ class DynamicActiveRecord {
     }
 
     [psobject]First([string]$OrderBy = 'id ASC') {
-    $sql = "SELECT * FROM $(ConvertTo-Ident $($this.TableName)) ORDER BY $OrderBy LIMIT 1"
+    $sql = $this.SelectSql() + " ORDER BY $OrderBy LIMIT 1"
         $res = Invoke-DbQuery -Database $this.Database -Query $sql
         if (-not $res -or $res.Count -eq 0) { return $null }
-        $type = $this.GetType()
-        $ctorInfo = $type.GetConstructor([type[]]@([string]))
-        $rec = $ctorInfo.Invoke(@($this.Database))
-        $row = $res[0]
-        $rec.Id = [int]$row.id
-        foreach ($p in $row.PSObject.Properties) { 
-            if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) { 
-                $rec.SetAttribute($p.Name, $p.Value) 
-            } 
-        }
+        $rec = $this.NewInstance()
+        $rec.LoadRow($res[0])
         return $rec
     }
 
@@ -176,53 +226,83 @@ class DynamicActiveRecord {
         catch { Undo-DbTransaction -Database $this.Database -Transaction $tx; Write-DbLog ERROR "Bulk insert failed" $_.Exception; throw }
     }
 
-    [void]InsertOnConflict([hashtable]$Row, [string[]]$KeyColumns, [hashtable]$UpdateSet) {
-    Enable-UniqueIndex -Database $this.Database -Table $this.TableName -Columns $KeyColumns | Out-Null
-        # version check
-    Enable-UpsertSupported -Database $this.Database
-        $cols = $Row.Keys
-    $this.columns = (($cols | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
+    # True when the engine supports INSERT ... ON CONFLICT DO UPDATE (SQLite 3.24+). Cached per record.
+    hidden [bool]SupportsNativeUpsert() {
+        if ($this.UpsertMode -eq 0) {
+            $v = Invoke-DbQuery -Database $this.Database -Query "SELECT sqlite_version() AS v;"
+            $parts = ([string]$v[0].v) -split '\.'
+            $major = [int]$parts[0]; $minor = 0
+            if ($parts.Count -gt 1) { $minor = [int]$parts[1] }
+            if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 24)) { $this.UpsertMode = 1 } else { $this.UpsertMode = 2 }
+        }
+        return ($this.UpsertMode -eq 1)
+    }
+
+    # Shared upsert implementation (BUG-001 / BUG-010). The version check runs BEFORE any schema change, native
+    # ON CONFLICT is used on SQLite 3.24+, and older engines (PSSQLite on Windows PowerShell ships 3.8.8.3) get an
+    # equivalent UPDATE ... WHERE keys; INSERT ... WHERE NOT EXISTS pair. $Transaction is passed through when set.
+    hidden [void]UpsertRow([hashtable]$Row, [string[]]$KeyColumns, [hashtable]$UpdateSet, [object]$Transaction) {
+        if (-not $Row -or $Row.Keys.Count -eq 0) { throw "No columns supplied for upsert into $($this.TableName)." }
+        if (-not $KeyColumns -or $KeyColumns.Count -eq 0) { throw "KeyColumns are required for upsert into $($this.TableName)." }
+        $native = $this.SupportsNativeUpsert()
+        Enable-UniqueIndex -Database $this.Database -Table $this.TableName -Columns $KeyColumns | Out-Null
+        $cols = @($Row.Keys)
+        $table = ConvertTo-Ident $this.TableName
+        $colList = (($cols | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
         $placeholders = (($cols | ForEach-Object { "@$_" })) -join ', '
-    $onKeys = (($KeyColumns | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
         if (-not $UpdateSet) { $UpdateSet = @{}; foreach ($c in $cols) { if ($KeyColumns -notcontains $c) { $UpdateSet[$c] = "@$c" } } }
-    $updateClause = (($UpdateSet.Keys | ForEach-Object { "$(ConvertTo-Ident $_) = $($UpdateSet[$_])" })) -join ', '
-    $sql = "INSERT INTO $(ConvertTo-Ident $($this.TableName)) (" + $($this.columns) + ") VALUES ($placeholders) ON CONFLICT($onKeys) DO UPDATE SET $updateClause"
-        [void](Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters $Row -NonQuery)
+        $updateClause = (($UpdateSet.Keys | ForEach-Object { "$(ConvertTo-Ident $_) = $($UpdateSet[$_])" })) -join ', '
+        $sql = ''
+        if ($native) {
+            $onKeys = (($KeyColumns | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
+            $action = 'DO NOTHING'
+            if ($updateClause) { $action = "DO UPDATE SET $updateClause" }
+            $sql = "INSERT INTO $table ($colList) VALUES ($placeholders) ON CONFLICT($onKeys) $action"
+        }
+        else {
+            $keyWhere = (($KeyColumns | ForEach-Object { "$(ConvertTo-Ident $_) = @$_" })) -join ' AND '
+            if ($updateClause) {
+                # excluded.<col> refers to the proposed row in ON CONFLICT syntax; map it to the bound parameter here
+                $emulatedSet = $updateClause -replace '(?i)\bexcluded\.(\w+)', '@$1'
+                $sql = "UPDATE $table SET $emulatedSet WHERE $keyWhere; "
+            }
+            $sql += "INSERT INTO $table ($colList) SELECT $placeholders WHERE NOT EXISTS (SELECT 1 FROM $table WHERE $keyWhere)"
+        }
+        $splat = @{ Database = $this.Database; Query = $sql; SqlParameters = $Row; NonQuery = $true }
+        if ($Transaction) { $splat['Transaction'] = $Transaction }
+        [void](Invoke-DbQuery @splat)
+    }
+
+    [void]InsertOnConflict([hashtable]$Row, [string[]]$KeyColumns, [hashtable]$UpdateSet) {
+        $this.UpsertRow($Row, $KeyColumns, $UpdateSet, $null)
     }
 
     [void]BulkUpsert([System.Collections.IEnumerable]$Rows, [string[]]$KeyColumns) {
-    Enable-UpsertSupported -Database $this.Database
         $tx = Start-DbTransaction -Database $this.Database
         try {
-            foreach ($row in $Rows) { $this.InsertOnConflict($row, $KeyColumns, $null) }
+            foreach ($row in $Rows) { $this.UpsertRow($row, $KeyColumns, $null, $tx) }
             Complete-DbTransaction -Database $this.Database -Transaction $tx
         }
-        catch { Rollback-DbTransaction -Database $this.Database -Transaction $tx; throw }
+        catch {
+            $err = $_
+            try { Undo-DbTransaction -Database $this.Database -Transaction $tx }
+            catch { Write-DbLog WARN "Bulk upsert rollback failed" $_.Exception }
+            Write-DbLog ERROR "Bulk upsert failed" $err.Exception
+            throw $err
+        }
     }
 
     [object]Raw([string]$Sql, [hashtable]$Params) { return Invoke-DbQuery -Database $this.Database -Query $Sql -SqlParameters $Params }
 
     [object[]]GetHasMany([string]$relatedTable) {
         $assoc = $this.Associations["has_many_$relatedTable"]; if (-not $assoc) { throw "No has_many '$relatedTable' defined" }
-    $sql = "SELECT * FROM $(ConvertTo-Ident $($assoc.Table)) WHERE $(ConvertTo-Ident $($assoc.ForeignKey)) = @id"
+        $proto = $this.NewRelatedInstance($assoc.Table)
+    $sql = $proto.SelectSql() + " WHERE $(ConvertTo-Ident $($assoc.ForeignKey)) = @id"
         $results = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $this.Id }
-        $relatedTypeObj = $script:ModelTypeObjects[$assoc.Table]
-        $cols = Get-TableColumns -Database $this.Database -TableName $assoc.Table
         $records = @()
         foreach ($row in $results) {
-            if ($relatedTypeObj) {
-                $ctorInfo = $relatedTypeObj.GetConstructor([type[]]@([string]))
-                $rec = $ctorInfo.Invoke(@($this.Database))
-            }
-            else {
-                $rec = [DynamicActiveRecord]::new($assoc.Table, $this.Database, $cols)
-            }
-            if ($row.PSObject.Properties.Name -contains 'id') { $rec.Id = [int]$row.id }
-            foreach ($p in $row.PSObject.Properties) { 
-                if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) { 
-                    $rec.SetAttribute($p.Name, $p.Value) 
-                } 
-            }
+            $rec = $proto.NewInstance()
+            $rec.LoadRow($row)
             $records += $rec
         }
         return $records
@@ -231,24 +311,12 @@ class DynamicActiveRecord {
     [DynamicActiveRecord]GetBelongsTo([string]$relatedTable) {
         $assoc = $this.Associations["belongs_to_$relatedTable"]; if (-not $assoc) { throw "No belongs_to '$relatedTable' defined" }
         $fkId = $this.Attributes[$assoc.ForeignKey]; if ($null -eq $fkId) { return $null }
-    $sql = "SELECT * FROM $(ConvertTo-Ident $($assoc.Table)) WHERE id = @id"
+        $proto = $this.NewRelatedInstance($assoc.Table)
+    $sql = $proto.SelectSql() + " WHERE $($proto.GetKeyColumn()) = @id"
         $res = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $fkId }
         if (-not $res -or $res.Count -eq 0) { return $null }
-        $relatedTypeObj = $script:ModelTypeObjects[$assoc.Table]
-        $cols = Get-TableColumns -Database $this.Database -TableName $assoc.Table
-        $row = $res[0]
-        if ($relatedTypeObj) {
-            $ctorInfo = $relatedTypeObj.GetConstructor([type[]]@([string]))
-            $rec = $ctorInfo.Invoke(@($this.Database))
-        }
-        else {
-            $rec = [DynamicActiveRecord]::new($assoc.Table, $this.Database, $cols)
-        }
-        $rec.Id = [int]$row.id
-        foreach ($p in $row.PSObject.Properties) { 
-            if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) { 
-                $rec.SetAttribute($p.Name, $p.Value) 
-            } 
-        }        return $rec
+        $rec = $proto.NewInstance()
+        $rec.LoadRow($res[0])
+        return $rec
     }
 }

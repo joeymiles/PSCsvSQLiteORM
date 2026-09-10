@@ -77,3 +77,18 @@ $asset.Save()
 # Delete a record
 $asset.Delete()
 ```
+
+### 7. Upserts and Tables Without an `id` Column
+```powershell
+# Insert or update by key column(s); a UNIQUE index on the key columns is created if missing
+$asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.1' }, @('hostname'), $null)
+$asset.BulkUpsert(@(@{ hostname = 'a'; ip = '1' }, @{ hostname = 'b'; ip = '2' }), @('hostname'))
+```
+- On SQLite 3.24+ (PowerShell 7 with PSSQLite) the native `INSERT ... ON CONFLICT DO UPDATE` statement is used.
+- On older engines (Windows PowerShell 5.1 with PSSQLite ships SQLite 3.8.8.3) the same result is produced with
+  `UPDATE ... WHERE <keys>` followed by `INSERT ... WHERE NOT EXISTS`. An explicit `UpdateSet` may reference
+  `excluded.<column>` on both paths; other `UpdateSet` values are raw SQL expressions.
+- A failed `BulkUpsert` rolls back its transaction and rethrows the original error.
+- Tables without an `id` column (for example a CSV imported without an `id` header) use SQLite's `rowid` as the
+  record key: `Where()`, `First()` and `FindById()` expose it as `Id`, and `Save()`/`Delete()` update or delete
+  that row instead of inserting a duplicate.
