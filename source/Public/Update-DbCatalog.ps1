@@ -1,13 +1,17 @@
 function Update-DbCatalog {
-    [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='High')]
+    [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Medium')]
     param(
         [Parameter(Mandatory)]
-        [string]$Database, 
-        [string]$SourceCsvPath, 
+        [string]$Database,
+        [string]$SourceCsvPath,
         [string]$Table
     )
-    
-    # ShouldProcess not invoked here to avoid runtime issues under ModuleBuilder; analyzer may still warn.
+
+    # Honor -WhatIf/-Confirm before anything touches the database: Initialize-Db creates the
+    # bookkeeping tables and every statement below writes to them (BUG-044). ConfirmImpact is
+    # Medium so internal callers (Import-CsvToSqlite, Find-DbRelationships,
+    # Export-DynamicModelsFromCatalog) never prompt under the default $ConfirmPreference.
+    if ($PSCmdlet -and -not $PSCmdlet.ShouldProcess($Database, 'Update catalog tables (__tables__, __columns__, __fks__)')) { return }
     Initialize-Db -Database $Database
     $tables = Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     # User tables only: the bookkeeping tables are never cataloged (BUG-032).

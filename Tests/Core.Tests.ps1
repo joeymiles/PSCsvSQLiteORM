@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -846,5 +846,60 @@ Describe 'Find-DbRelationships refreshes the catalog first' -Tag 'BUG-066' {
         $sugs = @(Find-DbRelationships -Database $db)
         $sugs.Count | Should -Be 1
         $sugs[0].ref_table | Should -Be 'teams'
+    }
+}
+
+Describe 'Update-DbCatalog and New-DbQuery honor ShouldProcess' -Tag 'BUG-044' {
+    BeforeAll {
+        function Get-B044TableCount {
+            param([string]$Database, [string]$Name)
+            return @(Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name=@n" -SqlParameters @{ n = $Name }).Count
+        }
+        function New-B044Db {
+            $db = New-CoreDbPath -Name 'b044'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE things(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+    It 'Update-DbCatalog -WhatIf does not create the catalog tables' {
+        $db = New-B044Db
+        Update-DbCatalog -Database $db -WhatIf
+        Get-B044TableCount -Database $db -Name '__tables__' | Should -Be 0
+        Get-B044TableCount -Database $db -Name '__columns__' | Should -Be 0
+    }
+    It 'Update-DbCatalog -WhatIf does not overwrite an existing catalog entry' {
+        $db = New-CoreDbPath -Name 'b044w'
+        $csv = Join-Path $PSScriptRoot 'assets.csv'
+        Import-CsvToSqlite -CsvPath $csv -TableName assets -Database $db | Out-Null
+        $before = (Invoke-DbQuery -Database $db -Query "SELECT source, csv_hash FROM __tables__ WHERE table_name='assets'")[0]
+        # A table created after the import is not cataloged yet; -WhatIf must leave it that way.
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE things(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Update-DbCatalog -Database $db -WhatIf
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='things'" | Should -Be 0
+        $after = (Invoke-DbQuery -Database $db -Query "SELECT source, csv_hash FROM __tables__ WHERE table_name='assets'")[0]
+        $after.source | Should -Be $before.source
+        $after.csv_hash | Should -Be $before.csv_hash
+    }
+    It 'Update-DbCatalog writes without prompting when -Confirm:$false is given or by default' {
+        $db = New-B044Db
+        Update-DbCatalog -Database $db -Confirm:$false
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='things'" | Should -Be 1
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE more(id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Update-DbCatalog -Database $db
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='more'" | Should -Be 1
+    }
+    It 'Import-CsvToSqlite still catalogs the imported table (ConfirmImpact does not prompt)' {
+        $db = New-CoreDbPath -Name 'b044i'
+        $csv = Join-Path $PSScriptRoot 'vulns.csv'
+        Import-CsvToSqlite -CsvPath $csv -TableName vulns -Database $db | Out-Null
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='vulns'" | Should -Be 1
+    }
+    It 'New-DbQuery -WhatIf returns nothing and the plain call returns a DbQuery' {
+        $db = New-B044Db
+        $q = New-DbQuery -Database $db -From things -WhatIf
+        $q | Should -BeNullOrEmpty
+        $q2 = New-DbQuery -Database $db -From things
+        $q2 | Should -Not -BeNullOrEmpty
+        $q2.GetType().Name | Should -Be 'DbQuery'
     }
 }
