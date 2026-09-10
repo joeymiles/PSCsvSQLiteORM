@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -32,6 +32,25 @@ BeforeAll {
         if ($script:origGetDbConnection) {
             & $m { param($sb) Set-Item function:script:Get-DbConnection -Value $sb } $script:origGetDbConnection
         }
+    }
+    # TASK B8 helpers: a small parent/child schema for the Confirm-DbForeignKey tests
+    function New-FkProbeDb {
+        $db = New-CoreDbPath -Name 'fk'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE assets(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE vulns(id INTEGER PRIMARY KEY, asset_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE hosts(id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO assets(id,name) VALUES(1,'a'),(2,'b'),(3,'c')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO vulns(id,asset_id) VALUES(1,1),(2,2)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO hosts(id) VALUES(500)' -NonQuery | Out-Null
+        return $db
+    }
+    function Get-FkTriggerNames {
+        param([string]$Database)
+        return @(Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name" | ForEach-Object { $_.name })
+    }
+    function Get-ScalarInt {
+        param([string]$Database, [string]$Query)
+        return [int](Invoke-DbQuery -Database $Database -Query $Query)[0].c
     }
 }
 
@@ -585,5 +604,113 @@ Describe 'Update-DbCatalog skips tables whose names ConvertTo-Ident rejects' -Ta
     }
     It 'Export-DynamicModelsFromCatalog does not throw for the whole database' {
         { Export-DynamicModelsFromCatalog -Database $script:b043Db | Out-Null } | Should -Not -Throw
+    }
+}
+
+Describe 'Confirm-DbForeignKey enforces every OnDelete mode at delete time' -Tag 'BUG-022' {
+    It 'RESTRICT blocks deleting a parent that still has children' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete RESTRICT
+        (Get-FkTriggerNames -Database $db) | Should -Contain 'trg_fk_vulns_asset_id_ondelete'
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 1' -NonQuery | Out-Null } | Should -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM assets' | Should -Be 3
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns WHERE asset_id NOT IN (SELECT id FROM assets)' | Should -Be 0
+    }
+    It 'RESTRICT still allows deleting a parent without children' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete RESTRICT
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 3' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM assets' | Should -Be 2
+    }
+    It 'NO ACTION (the default) blocks deleting a parent that still has children' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 2' -NonQuery | Out-Null } | Should -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM assets' | Should -Be 3
+    }
+    It 'SET NULL nulls the child column when the parent is deleted' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete 'SET NULL'
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 2' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns' | Should -Be 2
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns WHERE id = 2 AND asset_id IS NULL' | Should -Be 1
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns WHERE id = 1 AND asset_id = 1' | Should -Be 1
+    }
+    It 'CASCADE still deletes the children' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete CASCADE
+        Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 1' -NonQuery | Out-Null
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns' | Should -Be 1
+    }
+}
+
+Describe 'Confirm-DbForeignKey replaces stale triggers when a column is re-confirmed' -Tag 'BUG-023' {
+    It 're-confirming against another table enforces only the new target' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete CASCADE
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To hosts -OnDelete 'NO ACTION'
+        $names = Get-FkTriggerNames -Database $db
+        $names | Should -Be @('trg_fk_vulns_asset_id_check', 'trg_fk_vulns_asset_id_check_upd', 'trg_fk_vulns_asset_id_ondelete')
+        $checkSql = (Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE name='trg_fk_vulns_asset_id_check'")[0].sql
+        $checkSql | Should -Not -Match 'assets'
+        $checkSql | Should -Match 'hosts'
+        # 500 exists only in hosts, 3 exists only in assets
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO vulns(id,asset_id) VALUES(9,500)' -NonQuery | Out-Null } | Should -Not -Throw
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO vulns(id,asset_id) VALUES(10,3)' -NonQuery | Out-Null } | Should -Throw
+        (Invoke-DbQuery -Database $db -Query "SELECT ref_table FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'")[0].ref_table | Should -Be 'hosts'
+    }
+    It 'switching from CASCADE to NO ACTION stops the cascade' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete CASCADE
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete 'NO ACTION'
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 1' -NonQuery | Out-Null } | Should -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns' | Should -Be 2
+        (Invoke-DbQuery -Database $db -Query "SELECT on_delete FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'")[0].on_delete | Should -Be 'NO ACTION'
+    }
+    It 'switching from NO ACTION to CASCADE starts cascading' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete CASCADE
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM assets WHERE id = 1' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns' | Should -Be 1
+    }
+}
+
+Describe 'Confirm-DbForeignKey trigger text is ASCII on every build host' -Tag 'BUG-027' {
+    It 'the source file contains no non-ASCII bytes' {
+        $src = Join-Path (Join-Path (Join-Path $PSScriptRoot '..') 'source') 'Public\Confirm-DbForeignKey.ps1'
+        $bytes = [IO.File]::ReadAllBytes($src)
+        @($bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+    }
+    It 'the stored trigger and the violation message use an ASCII arrow' {
+        $db = New-FkProbeDb
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets
+        $checkSql = (Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE name='trg_fk_vulns_asset_id_check'")[0].sql
+        $checkSql | Should -Match 'FK violation: vulns\.asset_id -> assets\.id'
+        @($checkSql.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count | Should -Be 0
+        $msg = $null
+        try { Invoke-DbQuery -Database $db -Query 'INSERT INTO vulns(id,asset_id) VALUES(9,999)' -NonQuery | Out-Null } catch { $msg = $_.Exception.Message }
+        $msg | Should -Match 'vulns\.asset_id -> assets\.id'
+    }
+}
+
+Describe 'Confirm-DbForeignKey validates the referenced table and column' -Tag 'BUG-030' {
+    It 'throws for a missing referenced table and leaves no trigger or catalog row behind' {
+        $db = New-FkProbeDb
+        { Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To nosuchtable } | Should -Throw -ExpectedMessage '*nosuchtable*'
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='vulns'" | Should -Be 0
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO vulns(id,asset_id) VALUES(9,NULL)' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM vulns' | Should -Be 3
+    }
+    It 'throws for a missing referenced column' {
+        $db = New-FkProbeDb
+        { Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -RefColumn nosuchcol } | Should -Throw -ExpectedMessage '*nosuchcol*'
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+    }
+    It 'accepts an existing table and column regardless of case' {
+        $db = New-FkProbeDb
+        { Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To ASSETS -RefColumn ID } | Should -Not -Throw
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
     }
 }
