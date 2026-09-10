@@ -873,3 +873,147 @@ Describe 'BASE-12 Export-DynamicModelsFromCatalog derives type names like New-Dy
         $src | Should -Not -Match "-replace\s+'\^\.'"
     }
 }
+
+Describe 'BUG-041 InsertOnConflict binds UpdateSet values instead of interpolating them' -Tag 'BUG-041' {
+    BeforeAll {
+        $script:db041 = New-TestDbPath 'bug041'
+        Initialize-AssetsDb $script:db041
+        $script:a041 = New-DynamicRecord -Table 'assets' -Database $script:db041
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '1.1.1.1' }, @('hostname'), $null)
+        function Get-Ip041([string]$HostName) {
+            return (Invoke-DbQuery -Database $script:db041 -Query 'SELECT ip FROM assets WHERE hostname = @h' -SqlParameters @{ h = $HostName } | Select-Object -First 1).ip
+        }
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'stores a plain string UpdateSet value as a literal' {
+        { $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '2.2.2.2' }, @('hostname'), @{ ip = 'literal value' }) } | Should -Not -Throw
+        Get-Ip041 'lit1' | Should -Be 'literal value'
+    }
+
+    It 'never interpolates UpdateSet text into the statement' {
+        $hostile = "x'; DROP TABLE assets; --"
+        { $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '3.3.3.3' }, @('hostname'), @{ ip = $hostile }) } | Should -Not -Throw
+        Get-Ip041 'lit1' | Should -Be $hostile
+        (Get-Count $script:db041 'SELECT COUNT(*) AS c FROM assets') | Should -BeGreaterThan 1
+    }
+
+    It 'binds numbers and nulls' {
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '3.3.3.3' }, @('hostname'), @{ ip = 42 })
+        [string](Get-Ip041 'lit1') | Should -Be '42'
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '3.3.3.3' }, @('hostname'), @{ ip = $null })
+        (Get-Count $script:db041 "SELECT COUNT(*) AS c FROM assets WHERE hostname = 'lit1' AND ip IS NULL") | Should -Be 1
+    }
+
+    It 'keeps the excluded.<column> and @<column> reference forms' {
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '4.4.4.4' }, @('hostname'), @{ ip = 'excluded.ip' })
+        Get-Ip041 'lit1' | Should -Be '4.4.4.4'
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '5.5.5.5' }, @('hostname'), @{ ip = '@ip' })
+        Get-Ip041 'lit1' | Should -Be '5.5.5.5'
+    }
+
+    It 'accepts a raw SQL expression through @{ Sql = ... }' {
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '6.6.6.6' }, @('hostname'), @{ ip = @{ Sql = "excluded.ip || '-raw'" } })
+        Get-Ip041 'lit1' | Should -Be '6.6.6.6-raw'
+        $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '7.7.7.7' }, @('hostname'), @{ ip = @{ Sql = "@ip || '-p'" } })
+        Get-Ip041 'lit1' | Should -Be '7.7.7.7-p'
+    }
+
+    It 'a row with only key columns and an empty UpdateSet insert or do nothing' {
+        { $script:a041.InsertOnConflict(@{ hostname = 'lit1' }, @('hostname'), $null) } | Should -Not -Throw
+        { $script:a041.InsertOnConflict(@{ hostname = 'lit1'; ip = '9.9.9.9' }, @('hostname'), @{}) } | Should -Not -Throw
+        Get-Ip041 'lit1' | Should -Be '7.7.7.7-p'
+        (Get-Count $script:db041 "SELECT COUNT(*) AS c FROM assets WHERE hostname = 'lit1'") | Should -Be 1
+        { $script:a041.InsertOnConflict(@{ hostname = 'keyonly' }, @('hostname'), $null) } | Should -Not -Throw
+        (Get-Count $script:db041 "SELECT COUNT(*) AS c FROM assets WHERE hostname = 'keyonly'") | Should -Be 1
+    }
+}
+
+Describe 'BUG-042 InsertMany and BulkUpsert accept object rows' -Tag 'BUG-042' {
+    BeforeAll {
+        $script:db042 = New-TestDbPath 'bug042'
+        Initialize-AssetsDb $script:db042
+        $script:a042 = New-DynamicRecord -Table 'assets' -Database $script:db042
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'InsertMany inserts [pscustomobject] rows' {
+        { $script:a042.InsertMany(@([pscustomobject]@{ hostname = 'pc1'; ip = '6.6.6.1' }, [pscustomobject]@{ hostname = 'pc2'; ip = '6.6.6.2' })) } | Should -Not -Throw
+        (Get-Count $script:db042 "SELECT COUNT(*) AS c FROM assets WHERE hostname IN ('pc1', 'pc2')") | Should -Be 2
+        (Invoke-DbQuery -Database $script:db042 -Query "SELECT ip FROM assets WHERE hostname = 'pc2'" | Select-Object -First 1).ip | Should -Be '6.6.6.2'
+    }
+
+    It 'InsertMany inserts Import-Csv rows' {
+        $csv = New-TestCsv 'bug042.csv' "hostname,ip`ncsv1,7.7.7.1`ncsv2,7.7.7.2"
+        $rows = Import-Csv -LiteralPath $csv
+        { $script:a042.InsertMany($rows) } | Should -Not -Throw
+        (Get-Count $script:db042 "SELECT COUNT(*) AS c FROM assets WHERE hostname IN ('csv1', 'csv2')") | Should -Be 2
+    }
+
+    It 'InsertMany still inserts hashtable and ordered rows' {
+        { $script:a042.InsertMany(@(@{ hostname = 'ht1'; ip = '8.8.8.1' }, [ordered]@{ hostname = 'ht2'; ip = '8.8.8.2' })) } | Should -Not -Throw
+        (Get-Count $script:db042 "SELECT COUNT(*) AS c FROM assets WHERE hostname IN ('ht1', 'ht2')") | Should -Be 2
+    }
+
+    It 'names the offending row when it has no columns or is not row-like' {
+        $message = $null
+        try { $script:a042.InsertMany(@(@{ hostname = 'e0'; ip = '1' }, @{})) } catch { $message = $_.Exception.Message }
+        $message | Should -Match 'Row 1 for assets has no columns'
+        $message = $null
+        try { $script:a042.InsertMany(@('just a string')) } catch { $message = $_.Exception.Message }
+        $message | Should -Match 'Row 0 for assets is String'
+    }
+
+    It 'BulkUpsert accepts [pscustomobject] rows' {
+        { $script:a042.BulkUpsert(@([pscustomobject]@{ hostname = 'pc1'; ip = '9.9.9.1' }, [pscustomobject]@{ hostname = 'pc3'; ip = '9.9.9.3' }), @('hostname')) } | Should -Not -Throw
+        (Invoke-DbQuery -Database $script:db042 -Query "SELECT ip FROM assets WHERE hostname = 'pc1'" | Select-Object -First 1).ip | Should -Be '9.9.9.1'
+        (Get-Count $script:db042 "SELECT COUNT(*) AS c FROM assets WHERE hostname = 'pc3'") | Should -Be 1
+    }
+}
+
+Describe 'BUG-069 record keys are 64-bit' -Tag 'BUG-069' {
+    BeforeAll {
+        $script:db069 = New-TestDbPath 'bug069'
+        Initialize-AssetsDb $script:db069
+        $script:a069 = New-DynamicRecord -Table 'assets' -Database $script:db069
+        $script:big069 = [long]3000000000
+        Invoke-DbQuery -Database $script:db069 -Query "INSERT INTO assets(id, hostname, ip) VALUES($($script:big069), 'big', '9.9.9.9')" -NonQuery | Out-Null
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'Id is a [long]' {
+        $script:a069.FindById(1).Id | Should -BeOfType [long]
+    }
+
+    It 'FindById fetches a row whose id exceeds Int32.MaxValue' {
+        $rec = $script:a069.FindById($script:big069)
+        $rec | Should -Not -BeNullOrEmpty
+        $rec.Id | Should -Be $script:big069
+        $rec.GetAttribute('hostname') | Should -Be 'big'
+        $script:a069.FindById(1).GetAttribute('hostname') | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Where() and First() no longer throw when the table holds a large id' {
+        $rows = @($script:a069.Where('hostname = @h', @{ h = 'big' }))
+        $rows.Count | Should -Be 1
+        $rows[0].Id | Should -Be $script:big069
+        @($script:a069.Where('', @{})).Count | Should -BeGreaterThan 1
+        $script:a069.First('id DESC').Id | Should -Be $script:big069
+    }
+
+    It 'Save() and Delete() address the large row' {
+        $rec = $script:a069.FindById($script:big069)
+        $rec.SetAttribute('ip', '8.8.8.8'); $rec.Save()
+        (Invoke-DbQuery -Database $script:db069 -Query "SELECT ip FROM assets WHERE id = $($script:big069)" | Select-Object -First 1).ip | Should -Be '8.8.8.8'
+        $rec.Delete()
+        $rec.Id | Should -Be 0
+        (Get-Count $script:db069 "SELECT COUNT(*) AS c FROM assets WHERE id = $($script:big069)") | Should -Be 0
+    }
+
+    It 'a saved record gets a large id back from the engine' {
+        Invoke-DbQuery -Database $script:db069 -Query "INSERT INTO assets(id, hostname, ip) VALUES(4000000000, 'seed', '1.1.1.1')" -NonQuery | Out-Null
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db069
+        $rec.SetAttribute('hostname', 'after'); $rec.SetAttribute('ip', '2.2.2.2'); $rec.Save()
+        $rec.Id | Should -BeGreaterThan ([long]4000000000)
+    }
+}

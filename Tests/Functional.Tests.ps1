@@ -277,9 +277,10 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
         $fk = @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT status FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'")
         $fk[0].status | Should -Be 'confirmed'
         $hosts = @(Invoke-DbQuery -Database $script:Db10 -Query 'SELECT hostname, ip FROM assets ORDER BY id')
-        # 3 imported + 1 AppendOnly + server04 (deleted again) + BulkUpsert a and b; server01 updated twice to 10.0.0.1
-        @($hosts | ForEach-Object { $_.hostname }) | Should -Be @('server01', 'server02', 'server03', 'server09', 'a', 'b')
-        [string]$hosts[0].ip | Should -Be '10.0.0.1'
+        # 3 imported + 1 AppendOnly + server04 (deleted again) + BulkUpsert a and b + InsertMany c; server01 is
+        # upserted to 10.0.0.1, then by the three explicit UpdateSet forms (the last one is the raw expression)
+        @($hosts | ForEach-Object { $_.hostname }) | Should -Be @('server01', 'server02', 'server03', 'server09', 'a', 'b', 'c')
+        [string]$hosts[0].ip | Should -Be '10.0.0.2-x'
         @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT id FROM assets WHERE hostname='server04'").Count | Should -Be 0
         $cols = @(Invoke-DbQuery -Database $script:Db10 -Query 'PRAGMA table_info(assets)' | ForEach-Object { $_.name })
         $cols | Should -Be @('id', 'hostname', 'ip')
@@ -292,7 +293,8 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
         $rows[0].hostname | Should -Be 'server01'
         $query = New-DbQuery -Database $script:Db10 -From 'assets'
         $rows = Get-Rows10 ($query.Join('vulns', 'vulns.asset_id = assets.id', 'Left').Select(@('assets.*', 'vulns.title AS vuln_title')).Run())
-        $rows.Count | Should -Be 7
+        # 7 assets (server01 twice for its two vulns, server02, server03, server09, a, b, c) = 8 joined rows
+        $rows.Count | Should -Be 8
         @($rows | Where-Object { $_.hostname -eq 'server01' }).Count | Should -Be 2
         $query = New-DbQuery -Database $script:Db10 -From 'vulns v'
         $rows = Get-Rows10 ($query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(2).Offset(1).Run())

@@ -2,7 +2,8 @@ class DynamicActiveRecord {
     hidden [string]$TableName
     hidden [string]$Database
     hidden [hashtable]$Attributes = @{}
-    hidden [int]$Id
+    # SQLite rowids are 64-bit, so the key is a [long] (BUG-069)
+    hidden [long]$Id
     hidden [string[]]$Columns
     hidden [hashtable]$Associations = @{}
     hidden [hashtable]$Validators = @{}
@@ -45,7 +46,7 @@ class DynamicActiveRecord {
 
     # Copies a result row into this record (Id from the 'id' column, everything else as attributes).
     hidden [void]LoadRow([object]$row) {
-        if ($row.PSObject.Properties.Name -contains 'id') { $this.Id = [int]$row.id }
+        if ($row.PSObject.Properties.Name -contains 'id') { $this.Id = [long]$row.id }
         foreach ($p in $row.PSObject.Properties) {
             if ($p.Name -ne 'id' -and $p.Name -notin $this.ExcludedProperties) {
                 $this.SetAttribute($p.Name, $p.Value)
@@ -214,7 +215,7 @@ class DynamicActiveRecord {
                 $query = "INSERT INTO $(ConvertTo-Ident $($this.TableName)) ($columnList) VALUES ($placeholders); SELECT last_insert_rowid() AS id;"
                 $params = @{}; foreach ($k in $keys) { $params[$map[$k]] = $this.Attributes[$k] }
                 $res = @(Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params)
-                if ($res.Count -gt 0 -and $res[0] -and $res[0].id) { $this.Id = [int]$res[0].id }
+                if ($res.Count -gt 0 -and $res[0] -and $res[0].id) { $this.Id = [long]$res[0].id }
                 else { throw "Insert into $($this.TableName) did not return a row id." }
             }
             else {
@@ -227,7 +228,7 @@ class DynamicActiveRecord {
                 $affected = Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params -NonQuery
                 if ($null -ne $affected -and [int]$affected -eq 0) { Write-DbLog WARN "Save updated no rows in $($this.TableName) for $($this.GetKeyColumn()) = $($this.Id)." }
                 # Keep Id in step with the row when the id column itself was changed
-                if ($this.GetKeyColumn() -eq 'id' -and $this.Attributes.ContainsKey('id') -and $null -ne $this.Attributes['id']) { $this.Id = [int]$this.Attributes['id'] }
+                if ($this.GetKeyColumn() -eq 'id' -and $this.Attributes.ContainsKey('id') -and $null -ne $this.Attributes['id']) { $this.Id = [long]$this.Attributes['id'] }
             }
         }
         catch { Write-DbLog ERROR "Error saving record" $_.Exception; throw }
@@ -260,7 +261,8 @@ class DynamicActiveRecord {
         return $records
     }
 
-    [psobject]FindById([int]$Id) {
+    # [long] so that rowids above Int32.MaxValue can be fetched (BUG-069); [int] arguments widen implicitly
+    [psobject]FindById([long]$Id) {
     $sql = $this.SelectSql() + " WHERE $($this.GetKeyColumn()) = @id"
         $res = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $Id }
         if (-not $res -or $res.Count -eq 0) { return $null }
@@ -296,12 +298,38 @@ class DynamicActiveRecord {
         return $rec
     }
 
+    # Normalizes one bulk row into a column -> value hashtable (BUG-042). Dictionaries are used as they are; any
+    # other object (Import-Csv / Select-Object output, [pscustomobject], DataRow) contributes its properties.
+    # $Index names the offending row in the error when it has no columns or is not a row-like value.
+    hidden [hashtable]ToRowHashtable([object]$Row, [int]$Index) {
+        if ($Row -is [hashtable]) {
+            if ($Row.Count -eq 0) { throw "Row $Index for $($this.TableName) has no columns." }
+            return $Row
+        }
+        if ($null -eq $Row -or $Row -is [string] -or $Row.GetType().IsValueType) {
+            $kind = 'null'; if ($null -ne $Row) { $kind = $Row.GetType().Name }
+            throw "Row $Index for $($this.TableName) is $kind; expected a hashtable or an object with properties."
+        }
+        $dict = @{}
+        if ($Row -is [System.Collections.IDictionary]) {
+            foreach ($k in $Row.Keys) { $dict[[string]$k] = $Row[$k] }
+        }
+        else {
+            foreach ($p in $Row.PSObject.Properties) {
+                if ($p.Name -notin $this.ExcludedProperties) { $dict[$p.Name] = $p.Value }
+            }
+        }
+        if ($dict.Count -eq 0) { throw "Row $Index for $($this.TableName) has no columns (expected a hashtable or an object with properties)." }
+        return $dict
+    }
+
     [void]InsertMany([System.Collections.IEnumerable]$Rows) {
         $tx = Start-DbTransaction -Database $this.Database
         try {
-            foreach ($row in $Rows) {
+            $index = 0
+            foreach ($item in $Rows) {
+                $row = $this.ToRowHashtable($item, $index); $index++
                 $keys = [string[]]@($row.Keys)
-                if ($keys.Count -eq 0) { throw "No columns supplied for insert into $($this.TableName)." }
                 $map = $this.GetParameterMap($keys)
                 $columnList = (($keys | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
                 $placeholders = (($keys | ForEach-Object { "@$($map[$_])" })) -join ', '
@@ -344,11 +372,33 @@ class DynamicActiveRecord {
         $placeholders = (($cols | ForEach-Object { "@$($map[$_])" })) -join ', '
         $callerSet = ($null -ne $UpdateSet)
         if (-not $callerSet) { $UpdateSet = @{}; foreach ($c in $cols) { if ($KeyColumns -notcontains $c) { $UpdateSet[$c] = "@$($map[$c])" } } }
-        $updateClause = (($UpdateSet.Keys | ForEach-Object { "$(ConvertTo-Ident $_) = $($UpdateSet[$_])" })) -join ', '
+        # Caller-supplied UpdateSet values are bound as parameters (BUG-041) except for two documented forms:
+        #   'excluded.<column>' or '@<column>'  - the proposed value of a row column (rewritten to its bound name)
+        #   @{ Sql = '<expression>' }           - a raw SQL expression; @<column> / excluded.<column> inside it are rewritten
+        # Everything else (strings, numbers, nulls, dates) is a literal value, never interpolated into the SQL.
+        $refPattern = '^(?i)(?:excluded\.|@)([A-Za-z_][A-Za-z0-9_]*)$'
+        $setParts = @()
+        $literalIndex = 0
+        foreach ($k in @($UpdateSet.Keys)) {
+            $v = $UpdateSet[$k]
+            $expr = $null
+            if (-not $callerSet) { $expr = $v }
+            elseif ($v -is [System.Collections.IDictionary] -and $v.Contains('Sql')) {
+                $expr = $this.RewriteParameterReferences([string]$v['Sql'], $map, (-not $native))
+            }
+            elseif ($v -is [string] -and [regex]::IsMatch($v, $refPattern) -and $map.Contains([regex]::Match($v, $refPattern).Groups[1].Value)) {
+                $expr = '@' + $map[[regex]::Match($v, $refPattern).Groups[1].Value]
+            }
+            else {
+                $pname = "v$literalIndex"; $literalIndex++
+                $params[$pname] = $v
+                $expr = "@$pname"
+            }
+            $setParts += "$(ConvertTo-Ident $k) = $expr"
+        }
+        $updateClause = $setParts -join ', '
         $sql = ''
         if ($native) {
-            # A caller-supplied UpdateSet may reference the proposed value as @<column>; rewrite it to the bound name
-            if ($callerSet) { $updateClause = $this.RewriteParameterReferences($updateClause, $map, $false) }
             $onKeys = (($KeyColumns | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
             $action = 'DO NOTHING'
             if ($updateClause) { $action = "DO UPDATE SET $updateClause" }
@@ -357,10 +407,7 @@ class DynamicActiveRecord {
         else {
             $keyWhere = (($KeyColumns | ForEach-Object { "$(ConvertTo-Ident $_) = @$($map[$_])" })) -join ' AND '
             if ($updateClause) {
-                # excluded.<col> refers to the proposed row in ON CONFLICT syntax; map it (and @<column>) to the bound parameter
-                $emulatedSet = $updateClause
-                if ($callerSet) { $emulatedSet = $this.RewriteParameterReferences($updateClause, $map, $true) }
-                $sql = "UPDATE $table SET $emulatedSet WHERE $keyWhere; "
+                $sql = "UPDATE $table SET $updateClause WHERE $keyWhere; "
             }
             $sql += "INSERT INTO $table ($colList) SELECT $placeholders WHERE NOT EXISTS (SELECT 1 FROM $table WHERE $keyWhere)"
         }
@@ -376,7 +423,8 @@ class DynamicActiveRecord {
     [void]BulkUpsert([System.Collections.IEnumerable]$Rows, [string[]]$KeyColumns) {
         $tx = Start-DbTransaction -Database $this.Database
         try {
-            foreach ($row in $Rows) { $this.UpsertRow($row, $KeyColumns, $null, $tx) }
+            $index = 0
+            foreach ($row in $Rows) { $this.UpsertRow($this.ToRowHashtable($row, $index), $KeyColumns, $null, $tx); $index++ }
             Complete-DbTransaction -Database $this.Database -Transaction $tx
         }
         catch {

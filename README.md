@@ -145,12 +145,25 @@ $asset.Delete()
 # Insert or update by key column(s); a UNIQUE index on the key columns is created if missing
 $asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.1' }, @('hostname'), $null)
 $asset.BulkUpsert(@(@{ hostname = 'a'; ip = '1' }, @{ hostname = 'b'; ip = '2' }), @('hostname'))
+# Explicit UpdateSet: a row-column reference, a bound literal value, and a raw SQL expression
+$asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.2' }, @('hostname'), @{ ip = 'excluded.ip' })
+$asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.2' }, @('hostname'), @{ ip = 'fixed literal' })
+$asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.2' }, @('hostname'), @{ ip = @{ Sql = "excluded.ip || '-x'" } })
+# Bulk rows may be hashtables or objects with properties (Import-Csv output, [pscustomobject])
+$asset.InsertMany(@([pscustomobject]@{ hostname = 'c'; ip = '3' }))
 ```
 - On SQLite 3.24+ (PowerShell 7 with PSSQLite) the native `INSERT ... ON CONFLICT DO UPDATE` statement is used.
 - On older engines (Windows PowerShell 5.1 with PSSQLite ships SQLite 3.8.8.3) the same result is produced with
-  `UPDATE ... WHERE <keys>` followed by `INSERT ... WHERE NOT EXISTS`. An explicit `UpdateSet` may reference
-  `excluded.<column>` on both paths; other `UpdateSet` values are raw SQL expressions.
+  `UPDATE ... WHERE <keys>` followed by `INSERT ... WHERE NOT EXISTS`.
+- An explicit `UpdateSet` (third argument of `InsertOnConflict`) maps column names to values. Values are bound as
+  parameters, never interpolated, except for two forms: the strings `'excluded.<column>'` and `'@<column>'` refer to
+  the proposed value of that row column (on both paths), and `@{ Sql = '<expression>' }` injects a raw SQL expression
+  (which may itself use `excluded.<column>` or `@<column>`). An empty `UpdateSet` (`@{}`) means "insert or do
+  nothing". See the examples in the block above.
+- `InsertMany()` and `BulkUpsert()` accept hashtables as well as objects with properties (the output of
+  `Import-Csv`, `Select-Object` or `[pscustomobject]@{...}`); every row must supply at least one column.
 - A failed `BulkUpsert` rolls back its transaction and rethrows the original error.
+- Record keys (`Id`, `FindById()`) are 64-bit, matching SQLite's rowid range.
 - Tables without an `id` column (for example a CSV imported without an `id` header) use SQLite's `rowid` as the
   record key: `Where()`, `First()` and `FindById()` expose it as `Id`, and `Save()`/`Delete()` update or delete
   that row instead of inserting a duplicate.
