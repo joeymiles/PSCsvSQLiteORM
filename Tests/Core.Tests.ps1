@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -372,5 +372,99 @@ Describe 'DEBUG logging does not write bound parameter values' -Tag 'BUG-047' {
         $text | Should -Not -Match 'alice'
         $text | Should -Match 'INSERT INTO users'
         $text | Should -Match 'password'
+    }
+}
+
+Describe 'Module import sets defaults without calling module functions' -Tag 'BUG-011' {
+    It 'loads exactly one module instance from the output folder and records no error' {
+        # A child process of the current host gives a clean session with the default PSModulePath
+        # (installed copies of the module present), which is where the auto-load used to happen.
+        $exe = (Get-Process -Id $PID).Path
+        $folder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
+        $expectedRoot = (Resolve-Path -LiteralPath $folder).Path
+        $probe = @'
+param($Folder)
+$Error.Clear()
+Import-Module $Folder -Force
+$mods = @(Get-Module PSCsvSQLiteORM)
+"COUNT=$($mods.Count)"
+foreach ($m in $mods) { "PATH=$($m.Path)" }
+"ERRORS=$($Error.Count)"
+foreach ($e in $Error) { "ERR=$($e.Exception.Message)" }
+'@
+        $probePath = Join-Path $script:coreWorkDir 'b011_import_probe.ps1'
+        Set-Content -LiteralPath $probePath -Value $probe -Encoding ASCII
+        $out = @(& $exe -NoProfile -ExecutionPolicy Bypass -File $probePath $folder 2>&1 | ForEach-Object { "$_" })
+        ($out -join "`n") | Should -Match 'COUNT=1'
+        ($out -join "`n") | Should -Match 'ERRORS=0'
+        $paths = @($out | Where-Object { $_ -like 'PATH=*' })
+        $paths.Count | Should -Be 1
+        $paths[0].Substring(5).StartsWith($expectedRoot, [System.StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+    }
+    It 'has working defaults in the current session after import' {
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'INFO'
+        (& $m { $script:DbPool -is [hashtable] }) | Should -BeTrue
+    }
+}
+
+Describe 'Initialize-ORMVars closes pooled connections and validates before resetting' -Tag 'BUG-025' {
+    AfterAll { Initialize-ORMVars }
+    It 'closes the pooled connection so the database file can be removed' {
+        $db = New-CoreDbPath -Name 'b025'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(id INTEGER)' -NonQuery | Out-Null
+        $m = (Get-Command Get-DbConnection).Module
+        $conn = & $m { @($script:DbPool.Values)[0] }
+        $conn | Should -Not -BeNullOrEmpty
+        $conn.State | Should -Be 'Open'
+        Initialize-ORMVars
+        # a disposed SQLiteConnection reports State as $null; it must not be Open
+        "$($conn.State)" | Should -Not -Be 'Open'
+        (Get-DbPoolCount) | Should -Be 0
+        Close-DbConnections
+        { Remove-Item -LiteralPath $db -ErrorAction Stop } | Should -Not -Throw
+        $db | Should -Not -Exist
+    }
+    It 'leaves the previous configuration in place when SettingsPath does not exist' {
+        $log = Join-Path $script:coreWorkDir 'b025.log'
+        Initialize-ORMVars -LogLevel DEBUG -LogPath $log
+        { Initialize-ORMVars -SettingsPath (Join-Path $script:coreWorkDir 'b025_missing.ps1') } | Should -Throw '*SettingsPath not found*'
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $log
+    }
+    It 'reports an invalid LogLevel in the settings file with a friendly error and keeps the previous state' {
+        $log = Join-Path $script:coreWorkDir 'b025b.log'
+        Initialize-ORMVars -LogLevel WARN -LogPath $log
+        $settings = Join-Path $script:coreWorkDir 'b025_bad_level.ps1'
+        "@{ LogLevel = 'TRACE' }" | Set-Content -LiteralPath $settings -Encoding ASCII
+        { Initialize-ORMVars -SettingsPath $settings } | Should -Throw '*Failed to load settings*TRACE*'
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+        (& $m { $script:DbLogPath }) | Should -Be $log
+    }
+}
+
+Describe 'Explicit Initialize-ORMVars parameters override the settings file' -Tag 'BUG-058' {
+    BeforeAll {
+        $script:b058Settings = Join-Path $script:coreWorkDir 'b058_settings.ps1'
+        $script:b058FileLog = Join-Path $script:coreWorkDir 'b058_file.log'
+        "@{ LogLevel = 'DEBUG'; LogPath = '$script:b058FileLog'; DbPath = 'from_file.db' }" | Set-Content -LiteralPath $script:b058Settings -Encoding ASCII
+    }
+    AfterAll { Initialize-ORMVars }
+    It 'keeps -LogLevel, -LogPath and -DbPath when the settings file also sets them' {
+        $explicitLog = Join-Path $script:coreWorkDir 'b058_explicit.log'
+        Initialize-ORMVars -LogLevel ERROR -LogPath $explicitLog -DbPath 'explicit.db' -SettingsPath $script:b058Settings
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'ERROR'
+        (& $m { $script:DbLogPath }) | Should -Be $explicitLog
+        (& $m { $script:DbDefaultPath }) | Should -Be 'explicit.db'
+    }
+    It 'still takes values from the settings file for parameters that were not given' {
+        Initialize-ORMVars -LogLevel WARN -SettingsPath $script:b058Settings
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+        (& $m { $script:DbLogPath }) | Should -Be $script:b058FileLog
+        (& $m { $script:DbDefaultPath }) | Should -Be 'from_file.db'
     }
 }
