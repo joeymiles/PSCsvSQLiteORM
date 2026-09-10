@@ -24,9 +24,12 @@ Import-Module PSCsvSQLiteORM
 # Initialize with logging (optional but recommended)
 Initialize-ORMVars -LogLevel DEBUG -LogPath 'C:\temp\orm.log'
 
-# Or use a settings file for configuration
+# Or use a settings file for configuration (a sample ships as Examples\orm.settings.ps1 inside the module folder)
 Initialize-ORMVars -SettingsPath .\orm.settings.ps1
 ```
+
+The log directory is created on first write, the file is UTF-8, and writers from several sessions may share one
+file. A log path that cannot be written is reported once as a warning; logging failures never abort database calls.
 
 ### 3. Import CSV Data
 ```powershell
