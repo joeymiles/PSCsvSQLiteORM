@@ -30,12 +30,29 @@ Initialize-ORMVars -SettingsPath .\orm.settings.ps1
 
 ### 3. Import CSV Data
 ```powershell
-# Import a CSV file into SQLite database
+# Import CSV files into the SQLite database (the table is created from the CSV headers)
 Import-CsvToSqlite -CsvPath .\data\assets.csv -Database .\myapp.db -TableName assets
+Import-CsvToSqlite -CsvPath .\data\vulns.csv -Database .\myapp.db -TableName vulns
 
-# Import with specific schema mode (optional)
-Import-CsvToSqlite -CsvPath .\data\users.csv -Database .\myapp.db -TableName users -SchemaMode AppendOnly
+# Append more rows to a table that already exists without touching its schema (optional)
+Import-CsvToSqlite -CsvPath .\data\assets_more.csv -Database .\myapp.db -TableName assets -SchemaMode AppendOnly
+
+# Discover foreign keys from *_id column names, then confirm the ones you want.
+# Confirmed relationships drive 'Auto' joins (step 5) and GetHasMany()/GetBelongsTo() navigation (step 6).
+Find-DbRelationships -Database .\myapp.db
+Confirm-DbForeignKey -Database .\myapp.db -From vulns -Column asset_id -To assets
 ```
+`-SchemaMode` controls what an import may do to the table (default `Relaxed`):
+- `Relaxed`: creates the table when it is missing, adds a column for every CSV header the table lacks, then
+  inserts the rows.
+- `Strict`: creates the table when it is missing but never alters an existing one; a CSV header that is not a
+  column of the table throws `Strict mode: missing column <name> in <table>` before any row is inserted.
+- `AppendOnly`: only inserts rows. The table must already exist (a fresh database throws
+  `AppendOnly mode: table '<table>' does not exist.`) and its schema is never changed, so use it for the second and
+  later loads of a table, never for the first.
+
+Every mode appends rows; nothing is deleted or replaced. An `id` header becomes `INTEGER PRIMARY KEY AUTOINCREMENT`,
+so importing a file whose ids are already in the table fails with a UNIQUE constraint error.
 
 ### 4. Generate Dynamic Models
 ```powershell
@@ -108,19 +125,19 @@ $found = $asset.FindById(1)
 $found.ip('10.0.0.1')
 $found.Save()
 
-# Query rows and navigate relationships discovered from the catalog
+# Query rows and navigate the relationships confirmed in step 3 (Confirm-DbForeignKey)
 $rows = $asset.Where('ip LIKE @net', @{ net = '192.168.%' })
 $vulns = $found.GetHasMany('vulns')       # DynamicVulns records
 $owner = $vulns[0].GetBelongsTo('assets')  # back to the DynamicAssets record
 
 # A table with several foreign keys to the same parent (tickets.created_by and tickets.assigned_to -> users)
 # keeps one association per column; pick it by foreign key. The one-argument form uses the first column
-# (alphabetical when read from the catalog).
+# (alphabetical when read from the catalog). $ticket and $user stand for records of those two tables.
 $creator  = $ticket.GetBelongsTo('users', 'created_by')
 $assigned = $user.GetHasMany('tickets', 'assigned_to')
 
-# Delete a row
-$found.Delete()
+# Delete a row (the one saved above; a parent row that still has confirmed child rows is refused by the FK trigger)
+$asset.Delete()
 ```
 
 ### 7. Upserts and Tables Without an `id` Column

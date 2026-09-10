@@ -79,3 +79,209 @@ Describe 'DbQuery RIGHT/FULL join emulation' {
         ($full | Where-Object { ( $null -eq $_.aid -or $_.aid -is [System.DBNull] ) -and $_.bid -eq 11 } | Measure-Object).Count | Should -Be 1
     }
 }
+
+Describe 'BUG-064 README SchemaMode example and documentation' -Tag 'BUG-064' {
+    BeforeAll {
+        $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+        $script:Readme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md')
+        $script:ReadmeRaw = ($script:Readme -join "`n")
+        $script:Root064 = Join-Path $env:TEMP ("orm_064_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Root064 -Force | Out-Null
+        Initialize-ORMVars -LogLevel ERROR
+        function New-Csv064([string]$Name, [string]$Content) {
+            $f = Join-Path $script:Root064 $Name
+            Set-Content -LiteralPath $f -Value $Content -Encoding ASCII
+            return $f
+        }
+        function Get-Count064([string]$Database, [string]$Table) {
+            $r = Invoke-DbQuery -Database $Database -Query "SELECT COUNT(*) AS c FROM $Table"
+            return [int]($r | Select-Object -First 1).c
+        }
+        $script:Assets064 = Join-Path $PSScriptRoot 'assets.csv'
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'the README never uses AppendOnly for the first import of a table' {
+        $appendLines = @($script:Readme | Where-Object { $_ -match 'Import-CsvToSqlite' -and $_ -match '-SchemaMode\s+AppendOnly' })
+        $appendLines.Count | Should -BeGreaterThan 0
+        foreach ($line in $appendLines) {
+            $line | Should -Match '-TableName\s+(\S+)'
+            $table = [regex]::Match($line, '-TableName\s+(\S+)').Groups[1].Value
+            $index = [array]::IndexOf($script:Readme, $line)
+            $earlier = @($script:Readme[0..($index - 1)] | Where-Object {
+                $_ -match 'Import-CsvToSqlite' -and $_ -match ('-TableName\s+' + [regex]::Escape($table) + '(\s|$)') -and $_ -notmatch 'AppendOnly'
+            })
+            $earlier.Count | Should -BeGreaterThan 0 -Because "table '$table' must be created by an earlier import before an AppendOnly import"
+        }
+    }
+
+    It 'the README documents every SchemaMode value' {
+        foreach ($mode in @('Relaxed', 'Strict', 'AppendOnly')) {
+            $script:ReadmeRaw | Should -Match ('`' + $mode + '`:')
+        }
+        $script:ReadmeRaw | Should -Match 'default `Relaxed`'
+    }
+
+    It 'AppendOnly on a fresh database throws the documented message' {
+        $db = Join-Path $script:Root064 'fresh.db'
+        { Import-CsvToSqlite -CsvPath $script:Assets064 -Database $db -TableName users -SchemaMode AppendOnly } |
+            Should -Throw -ExpectedMessage "*AppendOnly mode: table 'users' does not exist.*"
+    }
+
+    It 'AppendOnly appends rows to an existing table and keeps its schema' {
+        $db = Join-Path $script:Root064 'append.db'
+        Import-CsvToSqlite -CsvPath $script:Assets064 -Database $db -TableName assets | Out-Null
+        $more = New-Csv064 'assets_more.csv' "id,hostname,ip`r`n9,server09,10.0.0.9"
+        Import-CsvToSqlite -CsvPath $more -Database $db -TableName assets -SchemaMode AppendOnly | Out-Null
+        Get-Count064 $db 'assets' | Should -Be 4
+        $cols = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(assets)' | ForEach-Object { $_.name })
+        $cols | Should -Be @('id', 'hostname', 'ip')
+    }
+
+    It 'Strict creates a missing table but rejects a CSV header the table lacks' {
+        $db = Join-Path $script:Root064 'strict.db'
+        Import-CsvToSqlite -CsvPath $script:Assets064 -Database $db -TableName assets -SchemaMode Strict | Out-Null
+        Get-Count064 $db 'assets' | Should -Be 3
+        $extra = New-Csv064 'assets_extra.csv' "id,hostname,ip,extra`r`n9,server09,10.0.0.9,x"
+        { Import-CsvToSqlite -CsvPath $extra -Database $db -TableName assets -SchemaMode Strict } |
+            Should -Throw -ExpectedMessage '*Strict mode: missing column extra in assets*'
+        Get-Count064 $db 'assets' | Should -Be 3
+        @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(assets)' | ForEach-Object { $_.name }) | Should -Not -Contain 'extra'
+    }
+
+    It 'Relaxed adds a missing column' {
+        $db = Join-Path $script:Root064 'relaxed.db'
+        Import-CsvToSqlite -CsvPath $script:Assets064 -Database $db -TableName assets | Out-Null
+        $extra = New-Csv064 'assets_extra2.csv' "id,hostname,ip,extra`r`n9,server09,10.0.0.9,x"
+        Import-CsvToSqlite -CsvPath $extra -Database $db -TableName assets -SchemaMode Relaxed | Out-Null
+        Get-Count064 $db 'assets' | Should -Be 4
+        @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(assets)' | ForEach-Object { $_.name }) | Should -Contain 'extra'
+    }
+}
+
+Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
+    BeforeAll {
+        $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+        $script:ReadmeRaw = (Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw)
+        $script:HelpRaw = (Get-Content -LiteralPath (Join-Path (Join-Path $script:RepoRoot 'docs') 'about_PSCsvSQLiteORM.help.txt') -Raw)
+        $script:Root10 = Join-Path $env:TEMP ("orm_base10_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Root10 -Force | Out-Null
+        Initialize-ORMVars -LogLevel ERROR
+        $script:Db10 = Join-Path $script:Root10 'myapp.db'
+        $script:AssetsCsv = Join-Path $PSScriptRoot 'assets.csv'
+        $script:VulnsCsv = Join-Path $PSScriptRoot 'vulns.csv'
+        $script:MoreCsv = Join-Path $script:Root10 'assets_more.csv'
+        Set-Content -LiteralPath $script:MoreCsv -Value "id,hostname,ip`r`n9,server09,10.0.0.9" -Encoding ASCII
+        function Get-Rows10([object]$Result) {
+            $rows = @($Result | Where-Object { $null -ne $_ })
+            return , $rows
+        }
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'the README and help topic do not describe the removed API' {
+        foreach ($doc in @($script:ReadmeRaw, $script:HelpRaw)) {
+            $doc | Should -Not -Match 'New-DynamicModel\s+-Type'
+            $doc | Should -Not -Match '-Properties\s+@\{'
+            $doc | Should -Not -Match '\[Asset\]::'
+            $doc | Should -Not -Match '\$asset\.status\s*='
+        }
+        $script:ReadmeRaw | Should -Match 'New-DynamicRecord -Table'
+    }
+
+    It 'every command the README Quick Start calls is exported by the module' {
+        $exported = @((Get-Module PSCsvSQLiteORM | Where-Object { $_.ModuleBase -like ($script:RepoRoot + '*') } | Select-Object -First 1).ExportedCommands.Keys)
+        if ($exported.Count -eq 0) { $exported = @((Get-Module PSCsvSQLiteORM | Select-Object -First 1).ExportedCommands.Keys) }
+        $blocks = [regex]::Matches($script:ReadmeRaw, '(?s)```powershell\r?\n(.*?)```')
+        $blocks.Count | Should -BeGreaterThan 5
+        $called = @()
+        foreach ($b in $blocks) {
+            foreach ($m in [regex]::Matches($b.Groups[1].Value, '(?m)^\s*(?:\$\w+\s*=\s*)?((?:Import|Initialize|Export|Set|New|Find|Confirm|Invoke|Close|Update|Start|Complete|Undo|Get|Add|Enable|Test|Write)-\w+)')) {
+                $called += $m.Groups[1].Value
+            }
+        }
+        $called = @($called | Where-Object { $_ -ne 'Import-Module' -and $_ -ne 'Install-Module' } | Sort-Object -Unique)
+        $called.Count | Should -BeGreaterThan 5
+        foreach ($c in $called) { $exported | Should -Contain $c }
+    }
+
+    It 'step 3: imports, an AppendOnly re-import and relationship confirmation succeed' {
+        Import-CsvToSqlite -CsvPath $script:AssetsCsv -Database $script:Db10 -TableName assets | Out-Null
+        Import-CsvToSqlite -CsvPath $script:VulnsCsv -Database $script:Db10 -TableName vulns | Out-Null
+        Import-CsvToSqlite -CsvPath $script:MoreCsv -Database $script:Db10 -TableName assets -SchemaMode AppendOnly | Out-Null
+        $sugs = @(Find-DbRelationships -Database $script:Db10)
+        $sugs.Count | Should -BeGreaterThan 0
+        Confirm-DbForeignKey -Database $script:Db10 -From vulns -Column asset_id -To assets
+        $fk = @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT status FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'")
+        $fk[0].status | Should -Be 'confirmed'
+    }
+
+    It 'step 4: models export and load' {
+        $script:Types10 = Export-DynamicModelsFromCatalog -Database $script:Db10
+        $script:Types10['assets'] | Should -Be 'DynamicAssets'
+        $script:Types10['vulns'] | Should -Be 'DynamicVulns'
+        { Set-DynamicORMClass } | Should -Not -Throw
+    }
+
+    It 'step 5: Where, Auto join, OrderBy, Limit and Offset run as documented' {
+        $query = New-DbQuery -Database $script:Db10 -From 'assets'
+        $rows = Get-Rows10 ($query.Where('hostname = @h', @{ h = 'server01' }).Run())
+        $rows.Count | Should -Be 1
+        $query = New-DbQuery -Database $script:Db10 -From 'vulns v'
+        $rows = Get-Rows10 ($query.Join('assets a', 'Auto', 'Inner').Select(@('v.*', 'a.hostname')).OrderBy('v.id DESC').Limit(10).Offset(1).Run())
+        $rows.Count | Should -Be 3
+        $rows[0].id | Should -Be 3
+        $rows[0].hostname | Should -Be 'server01'
+    }
+
+    It 'step 6: create, find, update, query, navigate and delete through New-DynamicRecord' {
+        $asset = New-DynamicRecord -Table 'assets' -Database $script:Db10
+        $asset.hostname('server04')
+        $asset.ip('192.168.1.13')
+        $asset.Save()
+        $asset.Id | Should -BeGreaterThan 0
+        $found = $asset.FindById(1)
+        $found | Should -Not -BeNullOrEmpty
+        $found.ip('10.0.0.1')
+        $found.Save()
+        $asset.FindById(1).ip() | Should -Be '10.0.0.1'
+        $rows = Get-Rows10 ($asset.Where('ip LIKE @net', @{ net = '192.168.%' }))
+        $rows.Count | Should -Be 3
+        $vulns = @($found.GetHasMany('vulns'))
+        $vulns.Count | Should -Be 2
+        $vulns[0].GetType().Name | Should -Be 'DynamicVulns'
+        $owner = $vulns[0].GetBelongsTo('assets')
+        $owner.GetType().Name | Should -Be 'DynamicAssets'
+        $owner.Id | Should -Be 1
+        # Delete the row saved above: it has no child rows, so no FK trigger can refuse it
+        $newId = [int]$asset.Id
+        $asset.Delete()
+        $found.FindById($newId) | Should -BeNullOrEmpty
+        $found.FindById(1) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'step 7: InsertOnConflict and BulkUpsert run as documented' {
+        $asset = New-DynamicRecord -Table 'assets' -Database $script:Db10
+        $asset.InsertOnConflict(@{ hostname = 'server01'; ip = '10.0.0.1' }, @('hostname'), $null)
+        $asset.BulkUpsert(@(@{ hostname = 'a'; ip = '1' }, @{ hostname = 'b'; ip = '2' }), @('hostname'))
+        $asset.BulkUpsert(@(@{ hostname = 'a'; ip = '11' }), @('hostname'))
+        $r = @(Invoke-DbQuery -Database $script:Db10 -Query "SELECT ip FROM assets WHERE hostname='a'")
+        $r.Count | Should -Be 1
+        [string]$r[0].ip | Should -Be '11'
+    }
+
+    It 'step 8: validators and callbacks run as documented' {
+        $asset = New-DynamicRecord -Table 'assets' -Database $script:Db10
+        $asset.AddValidator('hostname', 'Required', $null)
+        $asset.On('BeforeSave', { param($record) if ($record.GetAttribute('ip') -eq '0.0.0.0') { throw 'ip not allowed' } })
+        $script:Saved10 = @()
+        $asset.On('AfterSave', { param($record) $script:Saved10 += $record.Id })
+        $asset.hostname('server05')
+        $asset.ip('0.0.0.0')
+        { $asset.Save() } | Should -Throw -ExpectedMessage '*ip not allowed*'
+        $asset.ip('10.0.0.5')
+        $asset.Save()
+        $asset.Id | Should -BeGreaterThan 0
+        @($script:Saved10).Count | Should -Be 1
+    }
+}

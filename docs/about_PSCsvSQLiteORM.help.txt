@@ -28,6 +28,17 @@ EXAMPLES
     Import a CSV and build the schema:
         Import-CsvToSqlite -CsvPath .\assets.csv -Database .\sample.db -TableName assets
 
+    -SchemaMode (default Relaxed) controls what an import may do to the table:
+        Relaxed     create the table if missing, add missing columns, insert rows
+        Strict      create the table if missing, never alter it; an unknown CSV
+                    header throws before any row is inserted
+        AppendOnly  insert rows only; the table must already exist, so use it
+                    for the second and later loads of a table
+
+    Confirm a relationship (drives 'Auto' joins and GetHasMany/GetBelongsTo):
+        Find-DbRelationships -Database .\sample.db
+        Confirm-DbForeignKey -Database .\sample.db -From vulns -Column asset_id -To assets
+
     Generate models and set dynamic class:
         $types = Export-DynamicModelsFromCatalog -Database .\sample.db
         Set-DynamicORMClass
