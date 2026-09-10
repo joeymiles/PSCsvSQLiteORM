@@ -36,6 +36,8 @@ function Invoke-DbQuery {
     }
     else {
         # Fallback path via PSSQLite
+        # BUG-072: PSSQLite concatenates the path into its connection string, so ';' cannot be handled here
+        if ($Database -match ';') { throw "Invoke-DbQuery: database path '$Database' contains ';' which is not supported by the PSSQLite fallback path (System.Data.SQLite is not available)." }
         Enable-ForeignKeysPragma -Database $Database
         try {
             if ($Scalar) {
