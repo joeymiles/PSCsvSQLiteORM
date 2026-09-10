@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -250,6 +250,65 @@ Describe 'Invoke-DbQuery PSSQLite fallback raises terminating errors' -Tag 'BUG-
             } -WarningAction SilentlyContinue
         } | Should -Throw
         @(Get-AppliedMigrations -Database $db) | Should -Not -Contain 'bad002'
+    }
+}
+
+Describe 'Foreign keys are enforced on both connection paths' -Tag 'BUG-008' {
+    BeforeAll {
+        function New-FkSchema {
+            param([string]$Database)
+            Invoke-DbQuery -Database $Database -Query 'CREATE TABLE parent(id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $Database -Query 'CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $Database -Query 'INSERT INTO parent(id) VALUES(1)' -NonQuery | Out-Null
+        }
+    }
+    Context 'direct System.Data.SQLite path' {
+        It 'rejects an orphan insert and reports the pragma as on' {
+            $db = New-CoreDbPath -Name 'b008direct'
+            New-FkSchema -Database $db
+            Invoke-DbQuery -Database $db -Query 'PRAGMA foreign_keys' -Scalar | Should -Be 1
+            { Invoke-DbQuery -Database $db -Query 'INSERT INTO child(parent_id) VALUES(999)' -NonQuery | Out-Null } | Should -Throw
+            Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM child' -Scalar | Should -Be 0
+        }
+    }
+    Context 'PSSQLite fallback path' {
+        BeforeAll {
+            Disable-DirectConnection
+            $script:oldGlobalEap008 = $global:ErrorActionPreference
+            $global:ErrorActionPreference = 'Continue'
+        }
+        AfterAll {
+            $global:ErrorActionPreference = $script:oldGlobalEap008
+            Restore-DirectConnection
+        }
+        It 'reports the pragma as on for a fresh fallback call' {
+            $db = New-CoreDbPath -Name 'b008fbpragma'
+            New-FkSchema -Database $db
+            # -Scalar and a plain SELECT each run on their own PSSQLite connection
+            Invoke-DbQuery -Database $db -Query 'PRAGMA foreign_keys' -Scalar | Should -Be 1
+            $rows = @(Invoke-DbQuery -Database $db -Query 'PRAGMA foreign_keys')
+            $rows.Count | Should -Be 1
+            $rows[0].foreign_keys | Should -Be 1
+        }
+        It 'rejects an orphan insert with a terminating error and leaves no orphan row' {
+            $db = New-CoreDbPath -Name 'b008fbinsert'
+            New-FkSchema -Database $db
+            { Invoke-DbQuery -Database $db -Query 'INSERT INTO child(parent_id) VALUES(999)' -NonQuery | Out-Null } | Should -Throw
+            Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM child' -Scalar | Should -Be 0
+        }
+        It 'still accepts a valid child row and returns the affected count' {
+            $db = New-CoreDbPath -Name 'b008fbvalid'
+            New-FkSchema -Database $db
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO child(parent_id) VALUES(@p)' -SqlParameters @{ p = 1 } -NonQuery | Should -Be 1
+            Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM child' -Scalar | Should -Be 1
+        }
+        It 'rejects deleting a referenced parent row' {
+            $db = New-CoreDbPath -Name 'b008fbdelete'
+            New-FkSchema -Database $db
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO child(parent_id) VALUES(1)' -NonQuery | Out-Null
+            { Invoke-DbQuery -Database $db -Query 'DELETE FROM parent WHERE id = 1' -NonQuery | Out-Null } | Should -Throw
+            Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM parent' -Scalar | Should -Be 1
+        }
     }
 }
 
