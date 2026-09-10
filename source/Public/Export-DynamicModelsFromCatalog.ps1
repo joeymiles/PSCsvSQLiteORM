@@ -18,11 +18,19 @@ function Export-DynamicModelsFromCatalog {
         $colNames = [string[]]@($cols | ForEach-Object { $_.name })
         if (-not $colNames -or $colNames.Count -eq 0) { continue }
 
+        # One association per __fks__ row: a related table maps to the ordered list of its foreign key columns, so a
+        # table with two foreign keys to the same parent keeps both and both sides agree on the default (BUG-019)
         $hasMany = @{}; $belongsTo = @{}
-        $fksFrom = Invoke-DbQuery -Database $Database -Query "SELECT column_name, ref_table FROM __fks__ WHERE table_name=@t AND status='confirmed'" -SqlParameters @{ t = $tn }
-        foreach ($fk in $fksFrom) { $belongsTo[$fk.ref_table] = $fk.column_name }
-        $fksTo = Invoke-DbQuery -Database $Database -Query "SELECT table_name, column_name FROM __fks__ WHERE ref_table=@t AND status='confirmed'" -SqlParameters @{ t = $tn }
-        foreach ($fk in $fksTo) { $hasMany[$fk.table_name] = $fk.column_name }
+        $fksFrom = @(Invoke-DbQuery -Database $Database -Query "SELECT column_name, ref_table FROM __fks__ WHERE table_name=@t AND status='confirmed' ORDER BY column_name" -SqlParameters @{ t = $tn })
+        foreach ($fk in $fksFrom) {
+            if (-not $fk) { continue }
+            $belongsTo[[string]$fk.ref_table] = [string[]](@($belongsTo[[string]$fk.ref_table]) + @([string]$fk.column_name) | Where-Object { $_ })
+        }
+        $fksTo = @(Invoke-DbQuery -Database $Database -Query "SELECT table_name, column_name FROM __fks__ WHERE ref_table=@t AND status='confirmed' ORDER BY table_name, column_name" -SqlParameters @{ t = $tn })
+        foreach ($fk in $fksTo) {
+            if (-not $fk) { continue }
+            $hasMany[[string]$fk.table_name] = [string[]](@($hasMany[[string]$fk.table_name]) + @([string]$fk.column_name) | Where-Object { $_ })
+        }
 
         # New-DynamicModel derives the type name (BUG-036) and (re)generates the class file for this database (BUG-017)
         $typeName = New-DynamicModel -TableName $tn -Database $Database -Columns $colNames -HasMany $hasMany -BelongsTo $belongsTo

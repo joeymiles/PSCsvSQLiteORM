@@ -104,12 +104,22 @@ function New-DynamicModel {
     $ctorCols = ($Columns | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', '
 
     # ---- Associations (emit literal $this.* without string expansion)
+    # A value is one foreign key column or a list of them (a child with several foreign keys to the same parent,
+    # BUG-019); one association line is emitted per column, in the given order.
     $hmLines = ($HasMany.GetEnumerator() | ForEach-Object {
-            '        $this.HasMany(''{0}'',''{1}'');' -f ([string]$_.Key -replace "'", "''"), ([string]$_.Value -replace "'", "''")
+            $relTable = [string]$_.Key
+            foreach ($fkCol in @($_.Value)) {
+                if ($null -eq $fkCol) { continue }
+                '        $this.HasMany(''{0}'',''{1}'');' -f ($relTable -replace "'", "''"), ([string]$fkCol -replace "'", "''")
+            }
         }) -join "`n"
 
     $btLines = ($BelongsTo.GetEnumerator() | ForEach-Object {
-            '        $this.BelongsTo(''{0}'',''{1}'');' -f ([string]$_.Key -replace "'", "''"), ([string]$_.Value -replace "'", "''")
+            $relTable = [string]$_.Key
+            foreach ($fkCol in @($_.Value)) {
+                if ($null -eq $fkCol) { continue }
+                '        $this.BelongsTo(''{0}'',''{1}'');' -f ($relTable -replace "'", "''"), ([string]$fkCol -replace "'", "''")
+            }
         }) -join "`n"
 
     # ---- Class template with property-like methods

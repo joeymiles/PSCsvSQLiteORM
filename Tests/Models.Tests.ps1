@@ -763,3 +763,113 @@ Describe 'BUG-039 Before* callbacks can veto and After* callbacks only run on su
         (Get-Count $script:db039 'SELECT COUNT(*) AS c FROM assets WHERE id = 3') | Should -Be 0
     }
 }
+
+Describe 'BUG-019 a child with two foreign keys to the same parent keeps both associations' -Tag 'BUG-019' {
+    BeforeAll {
+        $script:db019 = New-TestDbPath 'bug019'
+        $users = New-TestCsv 'users019.csv' "id,name`r`n1,alice`r`n2,bob"
+        $tickets = New-TestCsv 'tickets019.csv' "id,title,created_by,assigned_to`r`n1,t1,1,2`r`n2,t2,2,1`r`n3,t3,1,1"
+        Import-CsvToSqlite -CsvPath $users -Database $script:db019 -TableName 'users' | Out-Null
+        Import-CsvToSqlite -CsvPath $tickets -Database $script:db019 -TableName 'tickets' | Out-Null
+        Confirm-DbForeignKey -Database $script:db019 -From 'tickets' -Column 'created_by' -To 'users'
+        Confirm-DbForeignKey -Database $script:db019 -From 'tickets' -Column 'assigned_to' -To 'users'
+        Export-DynamicModelsFromCatalog -Database $script:db019 | Out-Null
+        Set-DynamicORMClass
+        $script:u019 = New-DynamicRecord -Table 'users' -Database $script:db019
+        $script:t019 = New-DynamicRecord -Table 'tickets' -Database $script:db019
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'emits one association line per foreign key on both sides' {
+        $ticketsFile = Get-Content -LiteralPath (Get-ModelEntry 'tickets' $script:db019).ModelPath
+        @($ticketsFile | Where-Object { $_ -match "BelongsTo\('users','created_by'\)" }).Count | Should -Be 1
+        @($ticketsFile | Where-Object { $_ -match "BelongsTo\('users','assigned_to'\)" }).Count | Should -Be 1
+        $usersFile = Get-Content -LiteralPath (Get-ModelEntry 'users' $script:db019).ModelPath
+        @($usersFile | Where-Object { $_ -match "HasMany\('tickets','created_by'\)" }).Count | Should -Be 1
+        @($usersFile | Where-Object { $_ -match "HasMany\('tickets','assigned_to'\)" }).Count | Should -Be 1
+    }
+
+    It 'GetBelongsTo(table, foreignKey) reaches each parent' {
+        $t1 = $script:t019.FindById(1)
+        $t1.GetBelongsTo('users', 'created_by').GetAttribute('name') | Should -Be 'alice'
+        $t1.GetBelongsTo('users', 'assigned_to').GetAttribute('name') | Should -Be 'bob'
+    }
+
+    It 'GetHasMany(table, foreignKey) returns the rows for each column' {
+        $u1 = $script:u019.FindById(1)
+        @($u1.GetHasMany('tickets', 'created_by') | ForEach-Object { $_.GetAttribute('title') } | Sort-Object) | Should -Be @('t1', 't3')
+        @($u1.GetHasMany('tickets', 'assigned_to') | ForEach-Object { $_.GetAttribute('title') } | Sort-Object) | Should -Be @('t2', 't3')
+    }
+
+    It 'the one-argument form uses the same foreign key on both sides' {
+        $default = $script:t019.Associations['belongs_to_users'].ForeignKey
+        $default | Should -Be 'assigned_to'
+        $script:u019.Associations['has_many_tickets'].ForeignKey | Should -Be $default
+        $script:t019.FindById(1).GetBelongsTo('users').GetAttribute('name') | Should -Be 'bob'
+        @($script:u019.FindById(2).GetHasMany('tickets') | ForEach-Object { $_.GetAttribute('title') }) | Should -Be @('t1')
+    }
+
+    It 'an unknown foreign key names the column in the error' {
+        $message = ''
+        try { $script:t019.FindById(1).GetBelongsTo('users', 'nosuch') | Out-Null } catch { $message = $_.Exception.Message }
+        $message | Should -Match "belongs_to 'users' via 'nosuch'"
+    }
+
+    It 'HasMany/BelongsTo called by hand keep the plain key for the first foreign key' {
+        $base = New-BaseRecord 'tickets' $script:db019 @('id', 'title', 'created_by', 'assigned_to')
+        $base.BelongsTo('users', 'created_by'); $base.BelongsTo('users', 'assigned_to')
+        $base.Associations['belongs_to_users'].ForeignKey | Should -Be 'created_by'
+        $base.FindById(2).GetBelongsTo('users', 'assigned_to').GetAttribute('name') | Should -Be 'alice'
+        $base.FindById(2).GetBelongsTo('users').GetAttribute('name') | Should -Be 'bob'
+    }
+
+    It 'related records reached through navigation keep both associations' {
+        $ticket = @($script:u019.FindById(1).GetHasMany('tickets', 'created_by') | Where-Object { $_.GetAttribute('title') -eq 't1' })[0]
+        $ticket.GetBelongsTo('users', 'assigned_to').GetAttribute('name') | Should -Be 'bob'
+        $ticket.GetBelongsTo('users', 'created_by').GetAttribute('name') | Should -Be 'alice'
+    }
+
+    It 'New-DynamicModel accepts a list of foreign key columns per related table' {
+        $name = New-DynamicModel -TableName 'notes019' -Database $script:db019 -Columns @('id', 'author_id', 'editor_id') -BelongsTo @{ users = @('author_id', 'editor_id') }
+        $file = Get-Content -LiteralPath (Get-ModelEntry 'notes019' $script:db019).ModelPath
+        @($file | Where-Object { $_ -match "BelongsTo\('users','author_id'\)" }).Count | Should -Be 1
+        @($file | Where-Object { $_ -match "BelongsTo\('users','editor_id'\)" }).Count | Should -Be 1
+        $name | Should -Match '^DynamicNotes019'
+    }
+}
+
+Describe 'BASE-12 Export-DynamicModelsFromCatalog derives type names like New-DynamicModel on every host' -Tag 'BASE-12' {
+    BeforeAll {
+        $script:db12 = New-TestDbPath 'base12'
+        Invoke-DbQuery -Database $script:db12 -Query 'CREATE TABLE user_assets(id INTEGER PRIMARY KEY, val TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db12 -Query 'CREATE TABLE assets(id INTEGER PRIMARY KEY, val TEXT)' -NonQuery | Out-Null
+        $script:t12 = Export-DynamicModelsFromCatalog -Database $script:db12
+        Set-DynamicORMClass
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'produces a clean identifier and not a stringified scriptblock' {
+        foreach ($v in $script:t12.Values) {
+            $v | Should -Match '^[A-Za-z_][A-Za-z0-9_]*$'
+            $v | Should -Not -Match 'ToUpper'
+        }
+    }
+
+    It 'uses the PascalCase rule shared with New-DynamicModel for multi-word tables' {
+        $script:t12['user_assets'] | Should -Match '^DynamicUserAssets(_[0-9a-f]{8})?$'
+        $script:t12['assets'] | Should -Match '^DynamicAssets(_[0-9a-f]{8})?$'
+        (& $script:Orm { Get-DynamicTypeName -TableName 'user_assets' }) | Should -Be 'DynamicUserAssets'
+        (New-DynamicModel -TableName 'user_assets' -Database $script:db12 -Columns @('id', 'val')) | Should -Be $script:t12['user_assets']
+    }
+
+    It 'the exported name is a loadable class for this database' {
+        $rec = New-DynamicRecord -Table 'user_assets' -Database $script:db12
+        $rec.GetType().Name | Should -Be $script:t12['user_assets']
+        (Get-ModelEntry 'user_assets' $script:db12).TypeName | Should -Be $script:t12['user_assets']
+    }
+
+    It 'the source no longer uses a scriptblock replacement' {
+        $src = Get-Content -Raw -LiteralPath (Join-Path (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'source') 'Public') 'Export-DynamicModelsFromCatalog.ps1')
+        $src | Should -Not -Match "-replace\s+'\^\.'"
+    }
+}

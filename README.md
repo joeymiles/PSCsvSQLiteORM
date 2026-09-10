@@ -99,6 +99,12 @@ $rows = $asset.Where('ip LIKE @net', @{ net = '192.168.%' })
 $vulns = $found.GetHasMany('vulns')       # DynamicVulns records
 $owner = $vulns[0].GetBelongsTo('assets')  # back to the DynamicAssets record
 
+# A table with several foreign keys to the same parent (tickets.created_by and tickets.assigned_to -> users)
+# keeps one association per column; pick it by foreign key. The one-argument form uses the first column
+# (alphabetical when read from the catalog).
+$creator  = $ticket.GetBelongsTo('users', 'created_by')
+$assigned = $user.GetHasMany('tickets', 'assigned_to')
+
 # Delete a row
 $found.Delete()
 ```

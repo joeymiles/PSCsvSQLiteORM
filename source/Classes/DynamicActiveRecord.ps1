@@ -95,14 +95,38 @@ class DynamicActiveRecord {
     hidden [void]LoadAssociationsFromCatalog() {
         $exists = @(Invoke-DbQuery -Database $this.Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='__fks__'")
         if ($exists.Count -eq 0) { return }
-        $fksFrom = @(Invoke-DbQuery -Database $this.Database -Query "SELECT column_name, ref_table FROM __fks__ WHERE table_name=@t AND status='confirmed'" -SqlParameters @{ t = $this.TableName })
+        # Ordered by column name so both sides of a relationship pick the same default when a table has several
+        # foreign keys to the same parent (BUG-019)
+        $fksFrom = @(Invoke-DbQuery -Database $this.Database -Query "SELECT column_name, ref_table FROM __fks__ WHERE table_name=@t AND status='confirmed' ORDER BY column_name" -SqlParameters @{ t = $this.TableName })
         foreach ($fk in $fksFrom) { if ($fk) { $this.BelongsTo([string]$fk.ref_table, [string]$fk.column_name) } }
-        $fksTo = @(Invoke-DbQuery -Database $this.Database -Query "SELECT table_name, column_name FROM __fks__ WHERE ref_table=@t AND status='confirmed'" -SqlParameters @{ t = $this.TableName })
+        $fksTo = @(Invoke-DbQuery -Database $this.Database -Query "SELECT table_name, column_name FROM __fks__ WHERE ref_table=@t AND status='confirmed' ORDER BY table_name, column_name" -SqlParameters @{ t = $this.TableName })
         foreach ($fk in $fksTo) { if ($fk) { $this.HasMany([string]$fk.table_name, [string]$fk.column_name) } }
     }
 
-    [void]HasMany([string]$relatedTable, [string]$foreignKey) { $this.Associations["has_many_$relatedTable"] = @{ Type = "has_many"; Table = $relatedTable; ForeignKey = $foreignKey } }
-    [void]BelongsTo([string]$relatedTable, [string]$foreignKey) { $this.Associations["belongs_to_$relatedTable"] = @{ Type = "belongs_to"; Table = $relatedTable; ForeignKey = $foreignKey } }
+    # Associations are keyed by (table, foreign key) so a table with several foreign keys to the same parent keeps
+    # every relationship (BUG-019). The plain "<type>_<table>" key stays for the first registered foreign key so
+    # GetHasMany($table) / GetBelongsTo($table) keep working when there is only one.
+    [void]HasMany([string]$relatedTable, [string]$foreignKey) { $this.AddAssociation('has_many', $relatedTable, $foreignKey) }
+    [void]BelongsTo([string]$relatedTable, [string]$foreignKey) { $this.AddAssociation('belongs_to', $relatedTable, $foreignKey) }
+
+    hidden [void]AddAssociation([string]$type, [string]$relatedTable, [string]$foreignKey) {
+        $assoc = @{ Type = $type; Table = $relatedTable; ForeignKey = $foreignKey }
+        $this.Associations[$type + '_' + $relatedTable + '|' + $foreignKey] = $assoc
+        $plain = $this.Associations[$type + '_' + $relatedTable]
+        if (-not $plain -or $plain.ForeignKey -eq $foreignKey) { $this.Associations[$type + '_' + $relatedTable] = $assoc }
+    }
+
+    # Finds an association by table and optional foreign key; throws when it is not defined.
+    hidden [hashtable]FindAssociation([string]$type, [string]$relatedTable, [string]$foreignKey) {
+        $assoc = $null
+        if ([string]::IsNullOrEmpty($foreignKey)) { $assoc = $this.Associations[$type + '_' + $relatedTable] }
+        else { $assoc = $this.Associations[$type + '_' + $relatedTable + '|' + $foreignKey] }
+        if (-not $assoc) {
+            $via = ''; if (-not [string]::IsNullOrEmpty($foreignKey)) { $via = " via '$foreignKey'" }
+            throw "No $type '$relatedTable'$via defined"
+        }
+        return $assoc
+    }
 
     [void]SetAttribute([string]$key, [object]$value) { $this.Attributes[$key] = $value }
     [object]GetAttribute([string]$key) { return $this.Attributes[$key] }
@@ -366,8 +390,11 @@ class DynamicActiveRecord {
 
     [object]Raw([string]$Sql, [hashtable]$Params) { return Invoke-DbQuery -Database $this.Database -Query $Sql -SqlParameters $Params }
 
-    [object[]]GetHasMany([string]$relatedTable) {
-        $assoc = $this.Associations["has_many_$relatedTable"]; if (-not $assoc) { throw "No has_many '$relatedTable' defined" }
+    [object[]]GetHasMany([string]$relatedTable) { return $this.GetHasMany($relatedTable, $null) }
+
+    # Overload selecting the relationship by foreign key column when the related table has several (BUG-019)
+    [object[]]GetHasMany([string]$relatedTable, [string]$foreignKey) {
+        $assoc = $this.FindAssociation('has_many', $relatedTable, $foreignKey)
         $proto = $this.NewRelatedInstance($assoc.Table)
     $sql = $proto.SelectSql() + " WHERE $(ConvertTo-Ident $($assoc.ForeignKey)) = @id"
         $results = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $this.Id }
@@ -380,8 +407,11 @@ class DynamicActiveRecord {
         return $records
     }
 
-    [DynamicActiveRecord]GetBelongsTo([string]$relatedTable) {
-        $assoc = $this.Associations["belongs_to_$relatedTable"]; if (-not $assoc) { throw "No belongs_to '$relatedTable' defined" }
+    [DynamicActiveRecord]GetBelongsTo([string]$relatedTable) { return $this.GetBelongsTo($relatedTable, $null) }
+
+    # Overload selecting the relationship by foreign key column when this table has several to the same parent (BUG-019)
+    [DynamicActiveRecord]GetBelongsTo([string]$relatedTable, [string]$foreignKey) {
+        $assoc = $this.FindAssociation('belongs_to', $relatedTable, $foreignKey)
         $fkId = $this.Attributes[$assoc.ForeignKey]; if ($null -eq $fkId) { return $null }
         $proto = $this.NewRelatedInstance($assoc.Table)
     $sql = $proto.SelectSql() + " WHERE $($proto.GetKeyColumn()) = @id"
