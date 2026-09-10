@@ -29,8 +29,9 @@ WHERE (table_name=@a AND ref_table=@b) OR (table_name=@b AND ref_table=@a)
 ORDER BY status='confirmed' DESC, confidence DESC
 LIMIT 1
 "@
-            $rel = Invoke-DbQuery -Database $this.Database -Query $q -SqlParameters @{ a = $baseA; b = $baseB }
-            if ($rel -and $rel.Count -gt 0) {
+            # BUG-007: @() so a single __fks__ row (bare PSCustomObject on 5.1, .Count is $null) is counted
+            $rel = @(Invoke-DbQuery -Database $this.Database -Query $q -SqlParameters @{ a = $baseA; b = $baseB })
+            if ($rel.Count -gt 0) {
                 $r = $rel[0]
                 if ($r.table_name -eq $baseB -and $r.ref_table -eq $baseA) { $spec.On = "$Table.`"$($r.column_name)`" = $($this.From).`"$($r.ref_column)`"" }
                 else { $spec.On = "$($this.From).`"$($r.column_name)`" = $Table.`"$($r.ref_column)`"" }

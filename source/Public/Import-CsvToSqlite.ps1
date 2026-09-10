@@ -9,8 +9,10 @@ function Import-CsvToSqlite {
         [ValidateSet('Strict', 'Relaxed', 'AppendOnly')][string]$SchemaMode = 'Relaxed',
         [int]$BatchSize = 0  # 0 = all
     )
-    $csv = Import-Csv -Path $CsvPath
-    if (-not $csv) { throw "CSV file is empty or invalid." }
+    # BUG-007: @() so a one-row CSV (a bare PSCustomObject on 5.1, where .Count is $null) is counted
+    $csv = @(Import-Csv -Path $CsvPath)
+    if ($csv.Count -eq 0) { throw "CSV file is empty or invalid." }
+    $total = [math]::Max(1, $csv.Count)
     
     $headers = $csv[0].PSObject.Properties.Name
     if (-not $headers -or $headers.Count -eq 0) { throw "No columns in CSV." }
@@ -65,8 +67,8 @@ function Import-CsvToSqlite {
         }
     } else {
         # AppendOnly: ensure table exists; do not create
-        $exists = Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name=@t" -SqlParameters @{ t = $TableName }
-        if (-not $exists -or $exists.Count -eq 0) { throw "AppendOnly mode: table '$TableName' does not exist." }
+        $exists = @(Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name=@t" -SqlParameters @{ t = $TableName })
+        if ($exists.Count -eq 0) { throw "AppendOnly mode: table '$TableName' does not exist." }
     }
 
     # Evolve schema
@@ -171,8 +173,8 @@ function Import-CsvToSqlite {
             [void](Invoke-DbQuery -Database $Database -Query $query -SqlParameters $params -NonQuery -Transaction $tx)
             $count++
             if ($BatchSize -gt 0 -and ($count % $BatchSize) -eq 0) {
-                $pct = [int](($count / [double]$csv.Count) * 100)
-                Write-Progress -Activity "Importing $TableName" -Status "$count / $($csv.Count)" -PercentComplete $pct
+                $pct = [int][math]::Min(100, ($count / [double]$total) * 100)
+                Write-Progress -Activity "Importing $TableName" -Status "$count / $total" -PercentComplete $pct
             }
         }
         Complete-DbTransaction -Database $Database -Transaction $tx

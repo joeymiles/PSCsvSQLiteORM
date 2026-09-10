@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -19,6 +19,19 @@ BeforeAll {
     function Get-DbPoolCount {
         $m = (Get-Command Get-DbConnection).Module
         return (& $m { $script:DbPool.Count })
+    }
+    # Force the PSSQLite fallback path by replacing Get-DbConnection inside the module
+    # scope (Pester's Mock -ModuleName fails when another copy of the module is loaded).
+    function Disable-DirectConnection {
+        $m = (Get-Command Invoke-DbQuery).Module
+        $script:origGetDbConnection = & $m { (Get-Item function:Get-DbConnection).ScriptBlock }
+        & $m { Set-Item function:script:Get-DbConnection -Value { param([string]$Database) return $null } }
+    }
+    function Restore-DirectConnection {
+        $m = (Get-Command Invoke-DbQuery).Module
+        if ($script:origGetDbConnection) {
+            & $m { param($sb) Set-Item function:script:Get-DbConnection -Value $sb } $script:origGetDbConnection
+        }
     }
 }
 
@@ -166,5 +179,123 @@ Describe 'Test-ColumnTypes id column' -Tag 'BUG-013' {
         (Test-ColumnTypes -Csv (New-Rows 'id' @('srv-01', 'srv-02')) -Headers @('id'))['id'] | Should -Be 'TEXT PRIMARY KEY'
         (Test-ColumnTypes -Csv (New-Rows 'ID' @('A1')) -Headers @('ID'))['ID'] | Should -Be 'TEXT PRIMARY KEY'
         (Test-ColumnTypes -Csv (New-Rows 'id' @('007')) -Headers @('id'))['id'] | Should -Be 'TEXT PRIMARY KEY'
+    }
+}
+
+Describe 'Invoke-DbQuery PSSQLite fallback counts a one-row result' -Tag 'BUG-007' {
+    BeforeAll { Disable-DirectConnection }
+    AfterAll { Restore-DirectConnection }
+    It '-Scalar returns the value of a one-row result' {
+        $db = New-CoreDbPath -Name 'b007scalar'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(7),(8)' -NonQuery | Out-Null
+        $v = Invoke-DbQuery -Database $db -Query 'SELECT count(*) FROM t' -Scalar
+        $v | Should -Not -BeNullOrEmpty
+        [int]$v | Should -Be 2
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT max(x) FROM t' -Scalar) | Should -Be 8
+    }
+    It '-Scalar returns $null for an empty result' {
+        $db = New-CoreDbPath -Name 'b007empty'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        $v = Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar
+        $null -eq $v | Should -BeTrue
+    }
+}
+
+Describe 'DbQuery Auto join finds a single relationship row' -Tag 'BUG-007' {
+    It 'joins through the only confirmed __fks__ row instead of throwing' {
+        $db = New-CoreDbPath -Name 'b007join'
+        Initialize-Db -Database $db
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE assets(id INTEGER PRIMARY KEY, hostname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE vulns(id INTEGER PRIMARY KEY, asset_id INTEGER, cve TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO assets VALUES(1,'h1')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO vulns VALUES(1,1,'CVE-1'),(2,1,'CVE-2')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO __fks__(table_name,column_name,ref_table,ref_column,confidence,status) VALUES('vulns','asset_id','assets','id',0.9,'confirmed')" -NonQuery | Out-Null
+        $q = New-DbQuery -Database $db -From 'vulns'
+        $q = $q.Join('assets', 'Auto', 'Inner')
+        $rows = @($q.Run())
+        $rows.Count | Should -Be 2
+    }
+}
+
+Describe 'Invoke-DbQuery PSSQLite fallback raises terminating errors' -Tag 'BUG-009' {
+    BeforeAll { Disable-DirectConnection }
+    AfterAll { Restore-DirectConnection }
+    It 'throws for a failing -NonQuery statement' {
+        $db = New-CoreDbPath -Name 'b009nq'
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO no_such_table VALUES(1)' -NonQuery | Out-Null } | Should -Throw
+    }
+    It 'throws for a failing SELECT and a failing -Scalar' {
+        $db = New-CoreDbPath -Name 'b009sel'
+        { $null = Invoke-DbQuery -Database $db -Query 'SELECT * FROM no_such_table' } | Should -Throw
+        { $null = Invoke-DbQuery -Database $db -Query 'SELECT * FROM no_such_table' -Scalar } | Should -Throw
+    }
+    It 'does not record a migration whose Up SQL failed' {
+        $db = New-CoreDbPath -Name 'b009mig'
+        {
+            Add-DbMigration -Database $db -Version 'bad002' -Up {
+                param($d)
+                Invoke-DbQuery -Database $d -Query 'INSERT INTO no_such_table VALUES(1)' -NonQuery | Out-Null
+            } -WarningAction SilentlyContinue
+        } | Should -Throw
+        @(Get-AppliedMigrations -Database $db) | Should -Not -Contain 'bad002'
+    }
+}
+
+Describe 'Invoke-DbQuery result shape is the same on both paths' -Tag 'BUG-026' {
+    BeforeAll {
+        $script:db026 = New-CoreDbPath -Name 'b026'
+        Invoke-DbQuery -Database $script:db026 -Query 'CREATE TABLE t(id INTEGER, name TEXT, note TEXT, "Table" TEXT, RowState TEXT)' -NonQuery | Out-Null
+        $script:nq026 = Invoke-DbQuery -Database $script:db026 -Query "INSERT INTO t VALUES(1,'a',NULL,'oak','new'),(2,'b','x','pine','old')" -NonQuery
+    }
+    It 'direct path returns only the result columns, in order' {
+        $rows = @(Invoke-DbQuery -Database $script:db026 -Query 'SELECT * FROM t ORDER BY id')
+        $rows.Count | Should -Be 2
+        @($rows[0].PSObject.Properties.Name) -join ',' | Should -Be 'id,name,note,Table,RowState'
+        $rows[0].Table | Should -Be 'oak'
+        $rows[0].RowState | Should -Be 'new'
+    }
+    It 'direct path maps NULL to $null instead of DBNull' {
+        $row = Invoke-DbQuery -Database $script:db026 -Query 'SELECT note FROM t WHERE id=1'
+        $null -eq $row.note | Should -BeTrue
+        ($row.note -is [System.DBNull]) | Should -BeFalse
+    }
+    It 'direct path -NonQuery returns the affected-row count and -AsDataTable still returns a DataTable' {
+        [int]$script:nq026 | Should -Be 2
+        $dt = Invoke-DbQuery -Database $script:db026 -Query 'SELECT * FROM t' -AsDataTable
+        $dt.GetType().FullName | Should -Be 'System.Data.DataTable'
+        $dt.Rows.Count | Should -Be 2
+    }
+    Context 'PSSQLite fallback' {
+        BeforeAll { Disable-DirectConnection }
+        AfterAll { Restore-DirectConnection }
+        It 'returns the same property names, $null for NULL and an affected-row count' {
+            $n = Invoke-DbQuery -Database $script:db026 -Query "INSERT INTO t VALUES(3,'c',NULL,'fir','x')" -NonQuery
+            [int]$n | Should -Be 1
+            [int](Invoke-DbQuery -Database $script:db026 -Query "UPDATE t SET name='z' WHERE id IN (1,2,3);" -NonQuery) | Should -Be 3
+            $rows = @(Invoke-DbQuery -Database $script:db026 -Query 'SELECT * FROM t ORDER BY id')
+            $rows.Count | Should -Be 3
+            @($rows[0].PSObject.Properties.Name) -join ',' | Should -Be 'id,name,note,Table,RowState'
+            $null -eq $rows[0].note | Should -BeTrue
+        }
+    }
+}
+
+Describe 'DEBUG logging does not write bound parameter values' -Tag 'BUG-047' {
+    It 'logs parameter names but not values' {
+        $db = New-CoreDbPath -Name 'b047'
+        $log = Join-Path $script:coreWorkDir 'b047.log'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE users(id INTEGER, username TEXT, password TEXT)' -NonQuery | Out-Null
+        Set-DbLogging -Level DEBUG -Path $log -Confirm:$false
+        try {
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO users VALUES(@id, @username, @password)' -SqlParameters @{ id = 1; username = 'alice'; password = 'S3cr3tP@ss' } -NonQuery | Out-Null
+        }
+        finally { Set-DbLogging -Level INFO -Path '' -Confirm:$false }
+        $log | Should -Exist
+        $text = Get-Content -LiteralPath $log -Raw
+        $text | Should -Not -Match 'S3cr3tP@ss'
+        $text | Should -Not -Match 'alice'
+        $text | Should -Match 'INSERT INTO users'
+        $text | Should -Match 'password'
     }
 }

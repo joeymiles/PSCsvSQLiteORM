@@ -3,7 +3,7 @@ function Enable-ForeignKeysPragma {
     $key = Resolve-DbPath -Database $Database
     if ($script:PragmaSet[$key]) { return }
     try {
-        Invoke-SqliteQuery -DataSource $Database -Query 'PRAGMA foreign_keys = ON;'
+        Invoke-SqliteQuery -DataSource $Database -Query 'PRAGMA foreign_keys = ON;' -ErrorAction Stop
         $script:PragmaSet[$key] = $true
         Write-DbLog DEBUG "PRAGMA foreign_keys = ON (fallback)"
     }

@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -263,5 +263,16 @@ Describe 'Import-CsvToSqlite id column inference' -Tag 'BUG-013' {
         $rows.Count | Should -Be 2
         "$($rows[0].id)" | Should -Be '1'
         $rows[1].id | Should -Be 'x9'
+    }
+}
+
+Describe 'Import-CsvToSqlite one-row CSV with -BatchSize' -Tag 'BUG-007' {
+    It 'imports a single-row CSV with -BatchSize 1 and records it in the catalog' {
+        $csv = New-TestCsv -Name 'b007.csv' -Lines @('id,hostname', '1,only-host')
+        $db = New-TestDbPath -Name 'b007'
+        $headers = @(Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'hosts' -BatchSize 1)
+        $headers -join ',' | Should -Be 'id,hostname'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT count(*) FROM hosts' -Scalar) | Should -Be 1
+        [int](Invoke-DbQuery -Database $db -Query "SELECT count(*) FROM __tables__ WHERE table_name='hosts'" -Scalar) | Should -Be 1
     }
 }
