@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -901,5 +901,65 @@ Describe 'Update-DbCatalog and New-DbQuery honor ShouldProcess' -Tag 'BUG-044' {
         $q2 = New-DbQuery -Database $db -From things
         $q2 | Should -Not -BeNullOrEmpty
         $q2.GetType().Name | Should -Be 'DbQuery'
+    }
+}
+
+Describe 'Enable-UniqueIndex creates a distinct index for every distinct column set' -Tag 'BUG-034' {
+    BeforeAll {
+        function Get-B034IndexSql {
+            param([string]$Database, [string]$Name)
+            return @(Invoke-DbQuery -Database $Database -Query "SELECT sql FROM sqlite_master WHERE type='index' AND name=@n" -SqlParameters @{ n = $Name } | ForEach-Object { [string]$_.sql })
+        }
+    }
+    It 'keeps the historical name for a non-colliding column list' {
+        $db = New-CoreDbPath -Name 'b034plain'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE z(id INTEGER PRIMARY KEY, zip TEXT)' -NonQuery | Out-Null
+        Enable-UniqueIndex -Database $db -Table 'z' -Columns @('zip') | Should -Be 'ux_z_zip'
+        (Get-B034IndexSql -Database $db -Name 'ux_z_zip').Count | Should -Be 1
+        # calling again is idempotent and returns the same index
+        Enable-UniqueIndex -Database $db -Table 'z' -Columns @('zip') | Should -Be 'ux_z_zip'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='z'").Count | Should -Be 1
+    }
+    It 'creates a second index when columns a_b and (a, b) derive the same name' {
+        $db = New-CoreDbPath -Name 'b034cols'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE ux(id INTEGER PRIMARY KEY, a TEXT, b TEXT, a_b TEXT)' -NonQuery | Out-Null
+        $n1 = Enable-UniqueIndex -Database $db -Table 'ux' -Columns @('a_b')
+        $n2 = Enable-UniqueIndex -Database $db -Table 'ux' -Columns @('a', 'b')
+        $n1 | Should -Be 'ux_ux_a_b'
+        $n2 | Should -Not -Be $n1
+        @(Get-B034IndexSql -Database $db -Name $n1)[0] | Should -Match '\("a_b"\)'
+        @(Get-B034IndexSql -Database $db -Name $n2)[0] | Should -Match '\("a", "b"\)'
+        # both constraints are enforced
+        Invoke-DbQuery -Database $db -Query "INSERT INTO ux(a,b,a_b) VALUES('1','2','x')" -NonQuery | Out-Null
+        { Invoke-DbQuery -Database $db -Query "INSERT INTO ux(a,b,a_b) VALUES('1','2','y')" -NonQuery -ErrorAction Stop } | Should -Throw
+        { Invoke-DbQuery -Database $db -Query "INSERT INTO ux(a,b,a_b) VALUES('3','4','x')" -NonQuery -ErrorAction Stop } | Should -Throw
+        Invoke-DbQuery -Database $db -Query "INSERT INTO ux(a,b,a_b) VALUES('3','4','y')" -NonQuery | Out-Null
+        # repeated calls return the existing names and create nothing new
+        Enable-UniqueIndex -Database $db -Table 'ux' -Columns @('a_b') | Should -Be $n1
+        Enable-UniqueIndex -Database $db -Table 'ux' -Columns @('a', 'b') | Should -Be $n2
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ux'").Count | Should -Be 2
+    }
+    It 'creates a second index when table a (b_c) and table a_b (c) derive the same name' {
+        $db = New-CoreDbPath -Name 'b034tbl'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, b_c TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a_b(id INTEGER PRIMARY KEY, c TEXT)' -NonQuery | Out-Null
+        $n1 = Enable-UniqueIndex -Database $db -Table 'a' -Columns @('b_c')
+        $n2 = Enable-UniqueIndex -Database $db -Table 'a_b' -Columns @('c')
+        $n1 | Should -Be 'ux_a_b_c'
+        $n2 | Should -Not -Be $n1
+        $rows = @(Invoke-DbQuery -Database $db -Query "SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name LIKE 'ux_a%' ORDER BY tbl_name")
+        $rows.Count | Should -Be 2
+        ($rows | Where-Object { $_.name -eq $n1 }).tbl_name | Should -Be 'a'
+        ($rows | Where-Object { $_.name -eq $n2 }).tbl_name | Should -Be 'a_b'
+    }
+    It 'reuses an existing unique index or constraint that already covers the columns' {
+        $db = New-CoreDbPath -Name 'b034reuse'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(id INTEGER PRIMARY KEY, code TEXT, other TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE UNIQUE INDEX my_code_idx ON t(code)' -NonQuery | Out-Null
+        Enable-UniqueIndex -Database $db -Table 't' -Columns @('code') | Should -Be 'my_code_idx'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='t'").Count | Should -Be 1
+        # a different column set on the same table still gets its own index
+        Enable-UniqueIndex -Database $db -Table 't' -Columns @('other') | Should -Be 'ux_t_other'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='t'").Count | Should -Be 2
     }
 }
