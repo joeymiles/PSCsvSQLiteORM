@@ -416,13 +416,18 @@ Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version f
         Set-Content -LiteralPath $script:SourceManifest59 -Value $raw -NoNewline -Encoding ASCII
 
         # Runs the copied build script in a child process of THIS host from an unrelated directory.
+        # That directory is an empty sibling of the copied repo: when ModuleBuilder is given a folder it
+        # searches the current location recursively for a *.psd1, so running from a parent of the copy
+        # (or from the copy itself) would still find the manifest and hide BUG-060.
+        $script:Cwd59 = Join-Path $script:Root59 'elsewhere'
+        New-Item -ItemType Directory -Path $script:Cwd59 -Force | Out-Null
         $script:HostExe59 = (Get-Process -Id $PID).Path
         function Invoke-Build59 {
             param([string[]]$ScriptArgs = @())
             $callArgs = @('-NoProfile')
             if ($PSVersionTable.PSVersion.Major -lt 6) { $callArgs += @('-ExecutionPolicy', 'Bypass') }
             $callArgs += @('-File', $script:BuildScript59) + $ScriptArgs
-            Push-Location -LiteralPath $script:Root59
+            Push-Location -LiteralPath $script:Cwd59
             try {
                 # Stderr from the child host arrives as error records; they are build output here, not test errors.
                 $lines = @(& { $ErrorActionPreference = 'Continue'; & $script:HostExe59 @callArgs 2>&1 } | ForEach-Object { [string]$_ })
@@ -449,6 +454,9 @@ Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version f
     }
 
     It 'BUG-060: succeeds when the current directory is not the repository root' {
+        # Guard the test itself: the working directory must hold no manifest and must not contain the copy.
+        @(Get-ChildItem -LiteralPath $script:Cwd59 -Recurse -Filter '*.psd1' -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+        $script:Copy59 | Should -Not -BeLike ($script:Cwd59.TrimEnd('\') + '\*')
         $script:DefaultRun59.Text | Should -Not -Match 'determine the module manifest'
         $script:DefaultRun59.Text | Should -Not -Match 'Build failed'
         $script:DefaultRun59.ExitCode | Should -Be 0
