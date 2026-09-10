@@ -82,17 +82,19 @@ function Import-CsvToSqlite {
     foreach ($h in $headers) { if (-not $columnTypes[$h]) { $columnTypes[$h] = 'TEXT' } }
 
     $quotedCols = ($headers | ForEach-Object { "$(ConvertTo-Ident $_) $($columnTypes[$_])" }) -join ", "
-    # Handle schema creation based on SchemaMode
-    if ($SchemaMode -ne 'AppendOnly') {
+    # Handle schema creation based on SchemaMode. Only Relaxed creates the table; Strict and
+    # AppendOnly require it to exist so a misspelled -TableName fails instead of quietly
+    # creating a second table (BUG-074).
+    if ($SchemaMode -eq 'Relaxed') {
         if (-not [string]::IsNullOrWhiteSpace($quotedCols)) {
             $createQuery = "CREATE TABLE IF NOT EXISTS $(ConvertTo-Ident $TableName) ($quotedCols)"
             Write-DbLog DEBUG "Creating table with query: $createQuery"
             Invoke-DbQuery -Database $Database -Query $createQuery -NonQuery | Out-Null
         }
     } else {
-        # AppendOnly: ensure table exists; do not create
+        # Strict / AppendOnly: ensure table exists; do not create
         $exists = @(Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name=@t" -SqlParameters @{ t = $TableName })
-        if ($exists.Count -eq 0) { throw "AppendOnly mode: table '$TableName' does not exist." }
+        if ($exists.Count -eq 0) { throw "$SchemaMode mode: table '$TableName' does not exist." }
     }
 
     # Evolve schema

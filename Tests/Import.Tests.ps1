@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -381,5 +381,32 @@ Describe 'Import-CsvToSqlite trims whitespace around header names' -Tag 'BUG-073
         $csv = New-TestCsv -Name 'b073dup.csv' -Lines @('id,name,name ', '1,a,b')
         $db = New-TestDbPath -Name 'b073b'
         { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Throw '*duplicate column names*'
+    }
+}
+
+Describe 'Import-CsvToSqlite Strict mode requires an existing table' -Tag 'BUG-074' {
+    It 'throws on a misspelled table name in Strict mode instead of creating a new table' {
+        $csv = New-TestCsv -Name 'b074.csv' -Lines @('id,name', '1,alpha')
+        $db = New-TestDbPath -Name 'b074'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'assets' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'asets' -SchemaMode Strict } | Should -Throw "*Strict mode: table 'asets' does not exist*"
+        $names = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'as%'" | ForEach-Object { $_.name })
+        $names | Should -Be @('assets')
+    }
+    It 'still imports into an existing table in Strict mode' {
+        $csv = New-TestCsv -Name 'b074b.csv' -Lines @('id,name', '1,alpha')
+        $csv2 = New-TestCsv -Name 'b074c.csv' -Lines @('id,name', '2,beta')
+        $db = New-TestDbPath -Name 'b074b'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'assets' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'assets' -SchemaMode Strict | Out-Null
+        $count = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM assets' | Select-Object -First 1
+        [int]$count.c | Should -Be 2
+    }
+    It 'still creates the table in Relaxed mode' {
+        $csv = New-TestCsv -Name 'b074d.csv' -Lines @('id,name', '1,alpha')
+        $db = New-TestDbPath -Name 'b074d'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'fresh' -SchemaMode Relaxed | Out-Null
+        $count = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM fresh' | Select-Object -First 1
+        [int]$count.c | Should -Be 1
     }
 }
