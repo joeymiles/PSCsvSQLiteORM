@@ -9,5 +9,5 @@ function Write-DbLog {
     $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
     $line = "[$ts][$Level] $Message"
     if ($Exception) { $line += " :: " + $Exception.Message }
-    if ($script:DbLogPath) { Add-Content -Path $script:DbLogPath -Value $line } else { Write-Verbose $line }
+    if ($script:DbLogPath) { Add-Content -LiteralPath $script:DbLogPath -Value $line } else { Write-Verbose $line }
 }

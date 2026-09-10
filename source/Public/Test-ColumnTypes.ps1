@@ -1,6 +1,7 @@
 function Test-ColumnTypes {
     param (
-        [Parameter(Mandatory)][array]$Csv,
+        # A header-only CSV carries no rows (BUG-054).
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Csv,
         [Parameter(Mandatory)][string[]]$Headers,
         # Treat empty strings as text values instead of missing values. Import-CsvToSqlite
         # sets this when '' is not a null token, so '' is never stored in a numeric column.

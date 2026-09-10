@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -274,5 +274,112 @@ Describe 'Import-CsvToSqlite one-row CSV with -BatchSize' -Tag 'BUG-007' {
         $headers -join ',' | Should -Be 'id,hostname'
         [int](Invoke-DbQuery -Database $db -Query 'SELECT count(*) FROM hosts' -Scalar) | Should -Be 1
         [int](Invoke-DbQuery -Database $db -Query "SELECT count(*) FROM __tables__ WHERE table_name='hosts'" -Scalar) | Should -Be 1
+    }
+}
+
+Describe 'Import-CsvToSqlite null tokens match case-sensitively' -Tag 'BUG-052' {
+    BeforeAll {
+        $script:csv052 = New-TestCsv -Name 'b052.csv' -Lines @('id,surname,code', '1,Null,nan', '2,Smith,n/a', '3,Jones,x', '4,NULL,N/A')
+    }
+    It 'keeps values that only differ from a null token by case' {
+        $db = New-TestDbPath -Name 'b052a'
+        Import-CsvToSqlite -CsvPath $script:csv052 -Database $db -TableName 't' | Out-Null
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT id, quote(surname) AS s, quote(code) AS c FROM t ORDER BY id')
+        $rows[0].s | Should -Be "'Null'"
+        $rows[0].c | Should -Be "'nan'"
+        $rows[1].c | Should -Be "'n/a'"
+        $rows[2].c | Should -Be "'x'"
+    }
+    It 'still stores the exact default tokens as NULL' {
+        $db = New-TestDbPath -Name 'b052b'
+        Import-CsvToSqlite -CsvPath $script:csv052 -Database $db -TableName 't' | Out-Null
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT quote(surname) AS s, quote(code) AS c FROM t WHERE id = 4' | Select-Object -First 1
+        $row.s | Should -Be 'NULL'
+        $row.c | Should -Be 'NULL'
+    }
+    It 'restores case-insensitive matching with -IgnoreNullTokenCase' {
+        $db = New-TestDbPath -Name 'b052c'
+        Import-CsvToSqlite -CsvPath $script:csv052 -Database $db -TableName 't' -IgnoreNullTokenCase | Out-Null
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT quote(surname) AS s, quote(code) AS c FROM t WHERE id = 1' | Select-Object -First 1
+        $row.s | Should -Be 'NULL'
+        $row.c | Should -Be 'NULL'
+    }
+}
+
+Describe 'Import-CsvToSqlite header-only CSV' -Tag 'BUG-054' {
+    It 'creates the table from a header-only template file and returns the headers' {
+        $csv = New-TestCsv -Name 'b054.csv' -Lines @('id,name,qty')
+        $db = New-TestDbPath -Name 'b054a'
+        $headers = @(Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't')
+        $headers -join ',' | Should -Be 'id,name,qty'
+        $cols = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        ($cols | ForEach-Object { $_.name }) -join ',' | Should -Be 'id,name,qty'
+        ($cols | Where-Object { $_.name -eq 'name' }).type | Should -Be 'TEXT'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT count(*) FROM t' -Scalar) | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query "SELECT count(*) FROM __tables__ WHERE table_name='t'" -Scalar) | Should -Be 1
+    }
+    It 'lets data be appended later in AppendOnly mode' {
+        $tpl = New-TestCsv -Name 'b054tpl.csv' -Lines @('id,name')
+        $data = New-TestCsv -Name 'b054data.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'b054b'
+        Import-CsvToSqlite -CsvPath $tpl -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $data -Database $db -TableName 't' -SchemaMode AppendOnly | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT count(*) FROM t' -Scalar) | Should -Be 2
+    }
+    It 'reports a zero-byte file with its own message' {
+        $csv = Join-Path $script:workDir 'b054zero.csv'
+        [System.IO.File]::WriteAllBytes($csv, [byte[]]@())
+        $db = New-TestDbPath -Name 'b054c'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Throw '*CSV file is empty*'
+    }
+}
+
+Describe 'Import-CsvToSqlite paths containing square brackets' -Tag 'BUG-071' {
+    BeforeAll {
+        $script:brDir = Join-Path $script:workDir '[br]'
+        New-Item -ItemType Directory -Force -Path $script:brDir | Out-Null
+    }
+    It 'imports a CSV whose path contains [ and ] and records its hash' {
+        $csv = Join-Path $script:brDir 'report[2024].csv'
+        "id,name`r`n1,a`r`n2,b" | Set-Content -LiteralPath $csv -Encoding ASCII
+        $db = New-TestDbPath -Name 'b071a'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT count(*) FROM t' -Scalar) | Should -Be 2
+        $cat = Invoke-DbQuery -Database $db -Query "SELECT source, csv_hash FROM __tables__ WHERE table_name='t'" | Select-Object -First 1
+        $cat.source | Should -Be $csv
+        $cat.csv_hash | Should -Be (Get-FileHash -Algorithm SHA256 -LiteralPath $csv).Hash
+    }
+    It 'writes the log file when LogPath contains [ and ]' {
+        $log = Join-Path $script:brDir 'orm[1].log'
+        try {
+            Set-DbLogging -Level DEBUG -Path $log
+            { Write-DbLog INFO 'bracket log probe' -ErrorAction Stop } | Should -Not -Throw
+            Test-Path -LiteralPath $log | Should -BeTrue
+            (Get-Content -LiteralPath $log -Raw) | Should -Match 'bracket log probe'
+        }
+        finally {
+            Set-DbLogging -Level INFO -Path ''
+        }
+    }
+}
+
+Describe 'Import-CsvToSqlite trims whitespace around header names' -Tag 'BUG-073' {
+    It 'creates columns without surrounding whitespace and keeps cell values intact' {
+        $csv = New-TestCsv -Name 'b073.csv' -Lines @('id, name ,city ', '1, Bob ,X', '2,C,D')
+        $db = New-TestDbPath -Name 'b073a'
+        $headers = @(Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't')
+        $headers -join ',' | Should -Be 'id,name,city'
+        $cols = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        ($cols | ForEach-Object { $_.name }) -join ',' | Should -Be 'id,name,city'
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT id, name, city FROM t ORDER BY id')
+        $rows.Count | Should -Be 2
+        # Import-Csv itself drops leading whitespace of an unquoted cell; the trailing space is kept.
+        $rows[0].name | Should -Be 'Bob '
+        $rows[1].city | Should -Be 'D'
+    }
+    It 'rejects headers that collide once trimmed' {
+        $csv = New-TestCsv -Name 'b073dup.csv' -Lines @('id,name,name ', '1,a,b')
+        $db = New-TestDbPath -Name 'b073b'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Throw '*duplicate column names*'
     }
 }

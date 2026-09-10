@@ -5,23 +5,47 @@ function Import-CsvToSqlite {
         [Parameter(Mandatory)][string]$TableName,
         [string[]]$ForeignKeys = @(),
         [string[]]$NullTokens = @('', 'NULL', 'N/A', 'NaN'),
+        # Null tokens match exactly (case-sensitive) by default so real values such as a
+        # surname 'Null' or a code 'nan' are kept (BUG-052). Set this to restore the old
+        # case-insensitive matching.
+        [switch]$IgnoreNullTokenCase,
         [hashtable]$BoolTokens = @{ true = @('true', '1', 'yes', 'y'); false = @('false', '0', 'no', 'n') },
         [ValidateSet('Strict', 'Relaxed', 'AppendOnly')][string]$SchemaMode = 'Relaxed',
         [int]$BatchSize = 0  # 0 = all
     )
+    # -LiteralPath: '[' and ']' in the file name are not wildcards (BUG-071).
+    if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) { throw "CSV file not found: $CsvPath" }
     # BUG-007: @() so a one-row CSV (a bare PSCustomObject on 5.1, where .Count is $null) is counted
-    $csv = @(Import-Csv -Path $CsvPath)
-    if ($csv.Count -eq 0) { throw "CSV file is empty or invalid." }
+    $csv = @(Import-Csv -LiteralPath $CsvPath)
+    if ($csv.Count -gt 0) {
+        $rawHeaders = @($csv[0].PSObject.Properties.Name)
+    }
+    else {
+        # Import-Csv returns nothing for a header-only file. Read the header line so the table
+        # can still be created from a template CSV (BUG-054); a zero-byte file is an error.
+        $headerLine = Get-Content -LiteralPath $CsvPath -TotalCount 1
+        if ([string]::IsNullOrWhiteSpace("$headerLine")) { throw "CSV file is empty: $CsvPath" }
+        $rawHeaders = @((ConvertFrom-Csv -InputObject @("$headerLine", "$headerLine"))[0].PSObject.Properties.Name)
+    }
+    if ($rawHeaders.Count -eq 0) { throw "No columns in CSV." }
     $total = [math]::Max(1, $csv.Count)
-    
-    $headers = $csv[0].PSObject.Properties.Name
-    if (-not $headers -or $headers.Count -eq 0) { throw "No columns in CSV." }
+
+    # Leading/trailing whitespace in a header is never part of the column name (BUG-073).
+    $headers = @($rawHeaders | ForEach-Object { "$_".Trim() })
+    foreach ($h in $headers) { if ($h -eq '') { throw "CSV header contains an empty column name." } }
+    $dupHeaders = @($headers | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+    if ($dupHeaders.Count -gt 0) { throw "CSV header contains duplicate column names after trimming whitespace: $($dupHeaders -join ', ')" }
+    if ($csv.Count -gt 0 -and (Compare-Object -ReferenceObject $rawHeaders -DifferenceObject $headers -SyncWindow 0 -CaseSensitive)) {
+        # Re-read with the trimmed names as the header (the first line is then a data row to skip).
+        $csv = @(Import-Csv -LiteralPath $CsvPath -Header $headers | Select-Object -Skip 1)
+    }
 
     # Normalize null tokens
     foreach ($row in $csv) {
         foreach ($p in $row.PSObject.Properties.Name) {
             $val = $row.$p
-            if ($NullTokens -contains $val) { $row.$p = $null; continue }
+            if ($IgnoreNullTokenCase) { $isNull = ($NullTokens -contains $val) } else { $isNull = ($NullTokens -ccontains $val) }
+            if ($isNull) { $row.$p = $null; continue }
         }
     }
 
