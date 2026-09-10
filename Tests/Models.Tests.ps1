@@ -564,3 +564,202 @@ Describe 'BUG-035 generated types are captured on load and exposed through New-D
         (New-DynamicRecord -Table 'assets' -Database $script:db035).FindById(2).hostname() | Should -Be 'server02'
     }
 }
+
+Describe 'BASE-05 First() can be called without an argument' -Tag 'BASE-05' {
+    BeforeAll {
+        $script:db005 = New-TestDbPath 'base005'
+        Initialize-AssetsDb $script:db005
+        $script:a005 = New-DynamicRecord -Table 'assets' -Database $script:db005
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'First() returns the row with the lowest id' {
+        $first = $script:a005.First()
+        $first | Should -Not -BeNullOrEmpty
+        $first.Id | Should -Be 1
+        $first.hostname() | Should -Be 'server01'
+    }
+
+    It 'First(OrderBy) still honours an explicit ordering' {
+        $last = $script:a005.First('id DESC')
+        $last.Id | Should -BeGreaterThan 1
+        $last.Id | Should -Be (Get-Count $script:db005 'SELECT MAX(id) AS c FROM assets')
+    }
+
+    It 'First() returns null for an empty table' {
+        $db = New-TestDbPath 'base005b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE empty_t(id INTEGER PRIMARY KEY, val TEXT)' -NonQuery | Out-Null
+        $rec = New-BaseRecord 'empty_t' $db @('id', 'val')
+        $rec.First() | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'BASE-08 columns with spaces or dashes save through the record' -Tag 'BASE-08' {
+    BeforeAll {
+        $script:db008 = New-TestDbPath 'base008'
+        $csv = New-TestCsv 'people_base008.csv' "First Name,Last-Name`nAda,Lovelace"
+        Import-CsvToSqlite -CsvPath $csv -Database $script:db008 -TableName 'people' | Out-Null
+        Export-DynamicModelsFromCatalog -Database $script:db008 | Out-Null
+        Set-DynamicORMClass
+        $script:p008 = New-DynamicRecord -Table 'people' -Database $script:db008
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'the imported table keeps the raw header names as columns' {
+        $cols = @(Invoke-DbQuery -Database $script:db008 -Query 'PRAGMA table_info(people)' | ForEach-Object { $_.name })
+        $cols | Should -Contain 'First Name'
+        $cols | Should -Contain 'Last-Name'
+    }
+
+    It 'Save() inserts a row with spaced and dashed columns and keeps Columns as an array' {
+        $rec = New-DynamicRecord -Table 'people' -Database $script:db008
+        $rec.SetAttribute('First Name', 'Grace'); $rec.SetAttribute('Last-Name', 'Hopper')
+        { $rec.Save() } | Should -Not -Throw
+        $rec.Id | Should -BeGreaterThan 0
+        @($rec.Columns).Count | Should -Be 2
+        @($rec.Columns) | Should -Contain 'First Name'
+        $again = $script:p008.FindById($rec.Id)
+        $again.GetAttribute('First Name') | Should -Be 'Grace'
+        $again.GetAttribute('Last-Name') | Should -Be 'Hopper'
+    }
+
+    It 'Save() updates a row with spaced and dashed columns' {
+        $rec = $script:p008.FindById(1)
+        $rec.SetAttribute('Last-Name', 'Byron'); $rec.Save()
+        (Invoke-DbQuery -Database $script:db008 -Query 'SELECT "Last-Name" AS ln FROM people WHERE rowid = 1' | Select-Object -First 1).ln | Should -Be 'Byron'
+        (Invoke-DbQuery -Database $script:db008 -Query 'SELECT "First Name" AS fn FROM people WHERE rowid = 1' | Select-Object -First 1).fn | Should -Be 'Ada'
+    }
+
+    It 'InsertMany() binds spaced and dashed columns' {
+        { $script:p008.InsertMany(@(@{ 'First Name' = 'Alan'; 'Last-Name' = 'Turing' }, @{ 'First Name' = 'Edsger'; 'Last-Name' = 'Dijkstra' })) } | Should -Not -Throw
+        (Get-Count $script:db008 "SELECT COUNT(*) AS c FROM people WHERE ""First Name"" IN ('Alan', 'Edsger')") | Should -Be 2
+        @($script:p008.Columns).Count | Should -Be 2
+    }
+
+    It 'InsertOnConflict() binds spaced and dashed columns and updates on conflict' {
+        { $script:p008.InsertOnConflict(@{ 'First Name' = 'Alan'; 'Last-Name' = 'Mathison' }, @('First Name'), $null) } | Should -Not -Throw
+        (Get-Count $script:db008 "SELECT COUNT(*) AS c FROM people WHERE ""First Name"" = 'Alan'") | Should -Be 1
+        (Invoke-DbQuery -Database $script:db008 -Query 'SELECT "Last-Name" AS ln FROM people WHERE "First Name" = ''Alan''' | Select-Object -First 1).ln | Should -Be 'Mathison'
+    }
+
+    It 'InsertOnConflict() still accepts an UpdateSet that references @<column>' {
+        $db = New-TestDbPath 'base008b'
+        Initialize-AssetsDb $db
+        $a = New-DynamicRecord -Table 'assets' -Database $db
+        $a.InsertOnConflict(@{ hostname = 'legacy1'; ip = '1.1.1.1' }, @('hostname'), $null)
+        $a.InsertOnConflict(@{ hostname = 'legacy1'; ip = '2.2.2.2' }, @('hostname'), @{ ip = '@ip' })
+        (Invoke-DbQuery -Database $db -Query "SELECT ip FROM assets WHERE hostname = 'legacy1'" | Select-Object -First 1).ip | Should -Be '2.2.2.2'
+    }
+
+    It 'a column named like a positional parameter does not collide' {
+        $db = New-TestDbPath 'base008c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE odd(id INTEGER PRIMARY KEY, p0 TEXT, "p 1" TEXT)' -NonQuery | Out-Null
+        $rec = New-BaseRecord 'odd' $db @('id', 'p0', 'p 1')
+        $rec.SetAttribute('p 1', 'space'); $rec.SetAttribute('p0', 'zero')
+        $rec.Save()
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT p0, "p 1" AS p1 FROM odd WHERE id = 1' | Select-Object -First 1
+        $row.p0 | Should -Be 'zero'
+        $row.p1 | Should -Be 'space'
+    }
+}
+
+Describe 'BUG-037 Save() UPDATE keeps its WHERE key separate from an id attribute' -Tag 'BUG-037' {
+    BeforeAll {
+        $script:db037 = New-TestDbPath 'bug037'
+        Initialize-AssetsDb $script:db037
+        $script:a037 = New-DynamicRecord -Table 'assets' -Database $script:db037
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'an update without an id attribute changes the loaded row' {
+        $rec = $script:a037.FindById(1)
+        $rec.SetAttribute('ip', '5.5.5.5'); $rec.Save()
+        (Invoke-DbQuery -Database $script:db037 -Query 'SELECT ip FROM assets WHERE id = 1' | Select-Object -First 1).ip | Should -Be '5.5.5.5'
+    }
+
+    It 'an id attribute is applied to the loaded row instead of matching nothing' {
+        $rec = $script:a037.FindById(1)
+        $rec.SetAttribute('id', 77); $rec.SetAttribute('ip', '7.7.7.7')
+        $rec.Save()
+        (Get-Count $script:db037 'SELECT COUNT(*) AS c FROM assets WHERE id = 1') | Should -Be 0
+        (Invoke-DbQuery -Database $script:db037 -Query 'SELECT ip FROM assets WHERE id = 77' | Select-Object -First 1).ip | Should -Be '7.7.7.7'
+        $rec.Id | Should -Be 77
+    }
+
+    It 'the record keeps working after the key change' {
+        $rec = $script:a037.FindById(77)
+        $rec.SetAttribute('ip', '8.8.8.8'); $rec.Save()
+        (Invoke-DbQuery -Database $script:db037 -Query 'SELECT ip FROM assets WHERE id = 77' | Select-Object -First 1).ip | Should -Be '8.8.8.8'
+    }
+}
+
+Describe 'BUG-039 Before* callbacks can veto and After* callbacks only run on success' -Tag 'BUG-039' {
+    BeforeAll {
+        $script:db039 = New-TestDbPath 'bug039'
+        Initialize-AssetsDb $script:db039
+        $script:a039 = New-DynamicRecord -Table 'assets' -Database $script:db039
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'a throwing BeforeSave aborts the save and propagates the error' {
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db039
+        $rec.SetAttribute('hostname', 'veto-save'); $rec.SetAttribute('ip', '1.2.3.4')
+        $rec.On('BeforeSave', { throw 'save vetoed' })
+        { $rec.Save() } | Should -Throw '*save vetoed*'
+        $rec.Id | Should -Be 0
+        (Get-Count $script:db039 "SELECT COUNT(*) AS c FROM assets WHERE hostname = 'veto-save'") | Should -Be 0
+    }
+
+    It 'a throwing BeforeDelete aborts the delete and propagates the error' {
+        $rec = $script:a039.FindById(2)
+        $rec.On('BeforeDelete', { throw 'delete vetoed' })
+        { $rec.Delete() } | Should -Throw '*delete vetoed*'
+        $rec.Id | Should -Be 2
+        (Get-Count $script:db039 'SELECT COUNT(*) AS c FROM assets WHERE id = 2') | Should -Be 1
+    }
+
+    It 'AfterSave does not run when the insert fails' {
+        $script:flag039 = ''
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db039
+        $rec.SetAttribute('nosuchcol', 'x')
+        $rec.On('AfterSave', { $script:flag039 = 'AfterSave RAN' })
+        { $rec.Save() } | Should -Throw
+        $rec.Id | Should -Be 0
+        $script:flag039 | Should -Be ''
+    }
+
+    It 'AfterSave runs after a successful save' {
+        $script:flag039 = ''
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db039
+        $rec.SetAttribute('hostname', 'after-ok'); $rec.SetAttribute('ip', '4.4.4.4')
+        $rec.On('AfterSave', { param($r) $script:flag039 = "AfterSave RAN $($r.Id)" })
+        $rec.Save()
+        $script:flag039 | Should -Be "AfterSave RAN $($rec.Id)"
+    }
+
+    It 'a throwing AfterSave is logged, not propagated' {
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db039
+        $rec.SetAttribute('hostname', 'after-throw'); $rec.SetAttribute('ip', '4.4.4.5')
+        $rec.On('AfterSave', { throw 'observer failed' })
+        { $rec.Save() } | Should -Not -Throw
+        $rec.Id | Should -BeGreaterThan 0
+    }
+
+    It 'Delete on an unsaved record fires no callbacks' {
+        $script:flag039 = ''
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db039
+        $rec.On('BeforeDelete', { $script:flag039 += 'Before;' })
+        $rec.On('AfterDelete', { $script:flag039 += 'After;' })
+        $rec.Delete()
+        $script:flag039 | Should -Be ''
+    }
+
+    It 'AfterDelete runs after a successful delete' {
+        $script:flag039 = ''
+        $rec = $script:a039.FindById(3)
+        $rec.On('AfterDelete', { $script:flag039 = 'AfterDelete RAN' })
+        $rec.Delete()
+        $script:flag039 | Should -Be 'AfterDelete RAN'
+        (Get-Count $script:db039 'SELECT COUNT(*) AS c FROM assets WHERE id = 3') | Should -Be 0
+    }
+}

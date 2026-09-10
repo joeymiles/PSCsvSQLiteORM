@@ -137,47 +137,90 @@ class DynamicActiveRecord {
         return $errors
     }
 
+    # Before* callbacks may veto the operation by throwing: the exception propagates to the caller and nothing is
+    # written. After* callbacks are observers, so their errors are logged only (BUG-039).
     hidden [void]InvokeCallback([string]$Name) {
-    $cb = $this.Callbacks[$Name]; if ($cb) { try { & $cb $this } catch { Write-DbLog ERROR "Callback '$Name' threw." $_.Exception } }
+        $cb = $this.Callbacks[$Name]
+        if (-not $cb) { return }
+        if ($Name -like 'Before*') { & $cb $this; return }
+        try { & $cb $this } catch { Write-DbLog ERROR "Callback '$Name' threw." $_.Exception }
+    }
+
+    # Maps column names to unique, SQL-safe parameter names (p0, p1, ...) so that columns containing spaces,
+    # dashes or other characters that are invalid in a parameter name still bind (BASE-08). Returns an ordered
+    # dictionary column -> parameter name (without the leading '@').
+    hidden [System.Collections.Specialized.OrderedDictionary]GetParameterMap([string[]]$ColumnNames) {
+        $map = [ordered]@{}
+        $i = 0
+        foreach ($c in $ColumnNames) { $map[$c] = "p$i"; $i++ }
+        return $map
+    }
+
+    # Rewrites @<column> references (and, when $IncludeExcluded is set, excluded.<column> references) inside a SQL
+    # clause to the positional parameter names from GetParameterMap. Single pass over the clause so that a column
+    # whose name looks like a positional parameter (for example 'p0') cannot be rewritten twice.
+    hidden [string]RewriteParameterReferences([string]$Clause, [System.Collections.Specialized.OrderedDictionary]$Map, [bool]$IncludeExcluded) {
+        if ([string]::IsNullOrEmpty($Clause)) { return $Clause }
+        $pattern = '(?<![A-Za-z0-9_@])@([A-Za-z_][A-Za-z0-9_]*)'
+        if ($IncludeExcluded) { $pattern = '(?i)(?<![A-Za-z0-9_@])(?:@|excluded\.)([A-Za-z_][A-Za-z0-9_]*)' }
+        $found = [regex]::Matches($Clause, $pattern)
+        if ($found.Count -eq 0) { return $Clause }
+        $sb = New-Object System.Text.StringBuilder
+        $pos = 0
+        foreach ($m in $found) {
+            $name = $m.Groups[1].Value
+            [void]$sb.Append($Clause.Substring($pos, $m.Index - $pos))
+            if ($Map.Contains($name)) { [void]$sb.Append('@' + $Map[$name]) } else { [void]$sb.Append($m.Value) }
+            $pos = $m.Index + $m.Length
+        }
+        [void]$sb.Append($Clause.Substring($pos))
+        return $sb.ToString()
     }
 
     [void]Save() {
         $errs = $this.Validate(); if ($errs.Count -gt 0) { throw "Validation failed: $($errs -join '; ')" }
         $this.InvokeCallback('BeforeSave')
         try {
+            $keys = [string[]]@($this.Attributes.Keys)
             if ($this.Id -eq 0) {
-                $keys = $this.Attributes.Keys
-                if (-not $keys -or $keys.Count -eq 0) { throw "No attributes set for insert into $($this.TableName)." }
-            $this.columns = (($keys | ForEach-Object { ConvertTo-Ident $_ })) -join ", "
-                $placeholders = (($keys | ForEach-Object { "@$_" })) -join ", "
-            $query = "INSERT INTO $(ConvertTo-Ident $($this.TableName)) (" + $this.columns + ") VALUES ($placeholders); SELECT last_insert_rowid() AS id;"
-                $params = @{}; foreach ($k in $keys) { $params[$k] = $this.Attributes[$k] }
-                $res = Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params
-                if ($res -and $res[0] -and $res[0].id) { $this.Id = [int]$res[0].id }
+                if ($keys.Count -eq 0) { throw "No attributes set for insert into $($this.TableName)." }
+                $map = $this.GetParameterMap($keys)
+                $columnList = (($keys | ForEach-Object { ConvertTo-Ident $_ })) -join ", "
+                $placeholders = (($keys | ForEach-Object { "@$($map[$_])" })) -join ", "
+                $query = "INSERT INTO $(ConvertTo-Ident $($this.TableName)) ($columnList) VALUES ($placeholders); SELECT last_insert_rowid() AS id;"
+                $params = @{}; foreach ($k in $keys) { $params[$map[$k]] = $this.Attributes[$k] }
+                $res = @(Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params)
+                if ($res.Count -gt 0 -and $res[0] -and $res[0].id) { $this.Id = [int]$res[0].id }
+                else { throw "Insert into $($this.TableName) did not return a row id." }
             }
             else {
-                if (-not $this.Attributes.Keys -or $this.Attributes.Keys.Count -eq 0) { return }
-            $setClause = (($this.Attributes.Keys | ForEach-Object { "$(ConvertTo-Ident $_) = @$_" })) -join ", "
-            $query = "UPDATE $(ConvertTo-Ident $($this.TableName)) SET $setClause WHERE $($this.GetKeyColumn()) = @id"
-                $params = @{ id = $this.Id }; foreach ($k in $this.Attributes.Keys) { $params[$k] = $this.Attributes[$k] }
-                [void](Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params -NonQuery)
+                if ($keys.Count -eq 0) { return }
+                $map = $this.GetParameterMap($keys)
+                $setClause = (($keys | ForEach-Object { "$(ConvertTo-Ident $_) = @$($map[$_])" })) -join ", "
+                # The key is bound under its own parameter name so that an 'id' attribute cannot replace it (BUG-037)
+                $query = "UPDATE $(ConvertTo-Ident $($this.TableName)) SET $setClause WHERE $($this.GetKeyColumn()) = @pk"
+                $params = @{ pk = $this.Id }; foreach ($k in $keys) { $params[$map[$k]] = $this.Attributes[$k] }
+                $affected = Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters $params -NonQuery
+                if ($null -ne $affected -and [int]$affected -eq 0) { Write-DbLog WARN "Save updated no rows in $($this.TableName) for $($this.GetKeyColumn()) = $($this.Id)." }
+                # Keep Id in step with the row when the id column itself was changed
+                if ($this.GetKeyColumn() -eq 'id' -and $this.Attributes.ContainsKey('id') -and $null -ne $this.Attributes['id']) { $this.Id = [int]$this.Attributes['id'] }
             }
         }
         catch { Write-DbLog ERROR "Error saving record" $_.Exception; throw }
-        finally { $this.InvokeCallback('AfterSave') }
+        $this.InvokeCallback('AfterSave')
     }
 
     [void]Delete() {
+        # Nothing to delete for an unsaved record: no callbacks fire (BUG-039)
+        if ($this.Id -eq 0) { return }
         $this.InvokeCallback('BeforeDelete')
         try {
-            if ($this.Id -ne 0) {
-            $query = "DELETE FROM $(ConvertTo-Ident $($this.TableName)) WHERE $($this.GetKeyColumn()) = @id"
-                [void](Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters @{id = $this.Id } -NonQuery)
-                $this.Id = 0
-            }
+            $query = "DELETE FROM $(ConvertTo-Ident $($this.TableName)) WHERE $($this.GetKeyColumn()) = @pk"
+            [void](Invoke-DbQuery -Database $this.Database -Query $query -SqlParameters @{ pk = $this.Id } -NonQuery)
+            $this.Id = 0
         }
         catch { Write-DbLog ERROR "Error deleting record" $_.Exception; throw }
-        finally { $this.InvokeCallback('AfterDelete') }
+        $this.InvokeCallback('AfterDelete')
     }
 
     [object[]]Where([string]$WhereClause, [hashtable]$Params) {
@@ -217,7 +260,10 @@ class DynamicActiveRecord {
         return $objects
     }
 
-    [psobject]First([string]$OrderBy = 'id ASC') {
+    # PowerShell ignores default values on class method parameters, so the no-argument form is an explicit overload (BASE-05)
+    [psobject]First() { return $this.First('id ASC') }
+
+    [psobject]First([string]$OrderBy) {
     $sql = $this.SelectSql() + " ORDER BY $OrderBy LIMIT 1"
         $res = Invoke-DbQuery -Database $this.Database -Query $sql
         if (-not $res -or $res.Count -eq 0) { return $null }
@@ -230,10 +276,14 @@ class DynamicActiveRecord {
         $tx = Start-DbTransaction -Database $this.Database
         try {
             foreach ($row in $Rows) {
-            $keys = $row.Keys; $this.columns = (($keys | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
-                $placeholders = (($keys | ForEach-Object { "@$_" })) -join ', '
-            $sql = "INSERT INTO $(ConvertTo-Ident $($this.TableName)) (" + $($this.columns) + ") VALUES ($placeholders)"
-                [void](Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters $row -NonQuery -Transaction $tx)
+                $keys = [string[]]@($row.Keys)
+                if ($keys.Count -eq 0) { throw "No columns supplied for insert into $($this.TableName)." }
+                $map = $this.GetParameterMap($keys)
+                $columnList = (($keys | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
+                $placeholders = (($keys | ForEach-Object { "@$($map[$_])" })) -join ', '
+                $sql = "INSERT INTO $(ConvertTo-Ident $($this.TableName)) ($columnList) VALUES ($placeholders)"
+                $params = @{}; foreach ($k in $keys) { $params[$map[$k]] = $row[$k] }
+                [void](Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters $params -NonQuery -Transaction $tx)
             }
             Complete-DbTransaction -Database $this.Database -Transaction $tx
         }
@@ -260,29 +310,37 @@ class DynamicActiveRecord {
         if (-not $KeyColumns -or $KeyColumns.Count -eq 0) { throw "KeyColumns are required for upsert into $($this.TableName)." }
         $native = $this.SupportsNativeUpsert()
         Enable-UniqueIndex -Database $this.Database -Table $this.TableName -Columns $KeyColumns | Out-Null
-        $cols = @($Row.Keys)
+        $cols = [string[]]@($Row.Keys)
+        foreach ($k in $KeyColumns) { if ($cols -notcontains $k) { throw "Key column '$k' is missing from the upsert row for $($this.TableName)." } }
+        # Columns bind under positional parameter names (BASE-08); the row values are copied under those names
+        $map = $this.GetParameterMap($cols)
+        $params = @{}; foreach ($c in $cols) { $params[$map[$c]] = $Row[$c] }
         $table = ConvertTo-Ident $this.TableName
         $colList = (($cols | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
-        $placeholders = (($cols | ForEach-Object { "@$_" })) -join ', '
-        if (-not $UpdateSet) { $UpdateSet = @{}; foreach ($c in $cols) { if ($KeyColumns -notcontains $c) { $UpdateSet[$c] = "@$c" } } }
+        $placeholders = (($cols | ForEach-Object { "@$($map[$_])" })) -join ', '
+        $callerSet = ($null -ne $UpdateSet)
+        if (-not $callerSet) { $UpdateSet = @{}; foreach ($c in $cols) { if ($KeyColumns -notcontains $c) { $UpdateSet[$c] = "@$($map[$c])" } } }
         $updateClause = (($UpdateSet.Keys | ForEach-Object { "$(ConvertTo-Ident $_) = $($UpdateSet[$_])" })) -join ', '
         $sql = ''
         if ($native) {
+            # A caller-supplied UpdateSet may reference the proposed value as @<column>; rewrite it to the bound name
+            if ($callerSet) { $updateClause = $this.RewriteParameterReferences($updateClause, $map, $false) }
             $onKeys = (($KeyColumns | ForEach-Object { ConvertTo-Ident $_ })) -join ', '
             $action = 'DO NOTHING'
             if ($updateClause) { $action = "DO UPDATE SET $updateClause" }
             $sql = "INSERT INTO $table ($colList) VALUES ($placeholders) ON CONFLICT($onKeys) $action"
         }
         else {
-            $keyWhere = (($KeyColumns | ForEach-Object { "$(ConvertTo-Ident $_) = @$_" })) -join ' AND '
+            $keyWhere = (($KeyColumns | ForEach-Object { "$(ConvertTo-Ident $_) = @$($map[$_])" })) -join ' AND '
             if ($updateClause) {
-                # excluded.<col> refers to the proposed row in ON CONFLICT syntax; map it to the bound parameter here
-                $emulatedSet = $updateClause -replace '(?i)\bexcluded\.(\w+)', '@$1'
+                # excluded.<col> refers to the proposed row in ON CONFLICT syntax; map it (and @<column>) to the bound parameter
+                $emulatedSet = $updateClause
+                if ($callerSet) { $emulatedSet = $this.RewriteParameterReferences($updateClause, $map, $true) }
                 $sql = "UPDATE $table SET $emulatedSet WHERE $keyWhere; "
             }
             $sql += "INSERT INTO $table ($colList) SELECT $placeholders WHERE NOT EXISTS (SELECT 1 FROM $table WHERE $keyWhere)"
         }
-        $splat = @{ Database = $this.Database; Query = $sql; SqlParameters = $Row; NonQuery = $true }
+        $splat = @{ Database = $this.Database; Query = $sql; SqlParameters = $params; NonQuery = $true }
         if ($Transaction) { $splat['Transaction'] = $Transaction }
         [void](Invoke-DbQuery @splat)
     }

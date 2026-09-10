@@ -117,3 +117,18 @@ $asset.BulkUpsert(@(@{ hostname = 'a'; ip = '1' }, @{ hostname = 'b'; ip = '2' }
 - Tables without an `id` column (for example a CSV imported without an `id` header) use SQLite's `rowid` as the
   record key: `Where()`, `First()` and `FindById()` expose it as `Id`, and `Save()`/`Delete()` update or delete
   that row instead of inserting a duplicate.
+- Column names that are not valid SQL parameter names (for example `First Name` or `Last-Name`) work with
+  `Save()`, `InsertMany()`, `InsertOnConflict()` and `BulkUpsert()`: values are bound under positional parameter
+  names internally.
+- `First()` without an argument orders by `id ASC`; `First('<column> DESC')` orders explicitly.
+
+### 8. Validation and Callbacks
+```powershell
+$asset.AddValidator('hostname', 'Required', $null)
+$asset.On('BeforeSave', { param($record) if ($record.GetAttribute('ip') -eq '0.0.0.0') { throw 'ip not allowed' } })
+$asset.On('AfterSave', { param($record) Write-Host "saved $($record.Id)" })
+```
+- `BeforeSave` and `BeforeDelete` run before any SQL. If they throw, the exception reaches the caller and nothing
+  is written or deleted.
+- `AfterSave` and `AfterDelete` run only after the SQL succeeded; an exception thrown by one of them is logged and
+  not propagated. `Delete()` on a record that was never saved (`Id` is 0) is a no-op and fires no callbacks.
