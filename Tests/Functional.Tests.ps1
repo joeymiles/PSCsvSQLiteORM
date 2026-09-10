@@ -316,3 +316,77 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
         @($script:Saved10).Count | Should -Be 1
     }
 }
+
+Describe 'BASE-01 test scripts run on Windows PowerShell 5.1' -Tag 'BASE-01' {
+    BeforeAll {
+        $script:RepoRoot01 = Split-Path -Parent $PSScriptRoot
+        $script:TestScripts01 = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File)
+
+        # Returns one object per Join-Path call in the file: the line number and the number of positional
+        # arguments (or 99 when -AdditionalChildPath is used). The three-argument form only exists on
+        # PowerShell 6+, so anything above 2 breaks discovery on Windows PowerShell 5.1.
+        function Get-JoinPathUsage01 {
+            param([string]$Path)
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors)
+            @($parseErrors).Count | Should -Be 0 -Because "$Path must parse on this host"
+            $calls = $ast.FindAll({
+                param($node)
+                ($node -is [System.Management.Automation.Language.CommandAst]) -and ($node.GetCommandName() -eq 'Join-Path')
+            }, $true)
+            foreach ($call in $calls) {
+                $positional = 0
+                $expectValue = $false
+                foreach ($element in @($call.CommandElements | Select-Object -Skip 1)) {
+                    if ($expectValue) { $expectValue = $false; continue }
+                    if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+                        if ($element.ParameterName -eq 'AdditionalChildPath') { $positional = 99 }
+                        if (($null -eq $element.Argument) -and ($element.ParameterName -ne 'Resolve')) { $expectValue = $true }
+                        continue
+                    }
+                    $positional++
+                }
+                [pscustomobject]@{ File = (Split-Path -Leaf $Path); Line = $call.Extent.StartLineNumber; Positional = $positional }
+            }
+        }
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'the three-argument Join-Path form is rejected on Windows PowerShell 5.1 and accepted on 7' {
+        # Invoked through the call operator so the AST scan below does not see a literal three-argument call.
+        $joinPath = Get-Command -Name 'Join-Path' -CommandType Cmdlet
+        $probe = { & $joinPath $PSScriptRoot '..' 'output' }
+        if ($PSVersionTable.PSVersion.Major -lt 6) {
+            $probe | Should -Throw -ExpectedMessage '*positional parameter*'
+        } else {
+            $probe | Should -Not -Throw
+        }
+    }
+
+    It 'every script under Tests parses and joins paths two pieces at a time' {
+        $script:TestScripts01.Count | Should -BeGreaterThan 0
+        $offenders = @()
+        foreach ($file in $script:TestScripts01) {
+            $usage = @(Get-JoinPathUsage01 -Path $file.FullName)
+            $usage.Count | Should -BeGreaterThan 0 -Because "$($file.Name) is expected to build at least one path with Join-Path"
+            $offenders += @($usage | Where-Object { $_.Positional -gt 2 })
+        }
+        ($offenders | ForEach-Object { "{0}:{1} ({2} positional arguments)" -f $_.File, $_.Line, $_.Positional }) | Should -BeNullOrEmpty
+    }
+
+    It 'the test files import the module from this repository output folder, not an installed copy' {
+        $expectedRoot = Join-Path (Join-Path $script:RepoRoot01 'output') 'PSCsvSQLiteORM'
+        $command = Get-Command -Name 'Import-CsvToSqlite' -CommandType Function
+        $command.Module | Should -Not -BeNullOrEmpty
+        $command.Module.ModuleBase | Should -BeLike ($expectedRoot + '*')
+    }
+
+    It 'SampleModuleTest.ps1 runs to completion on this host' {
+        $sample = Join-Path $PSScriptRoot 'SampleModuleTest.ps1'
+        Test-Path -LiteralPath $sample | Should -BeTrue
+        { $script:SampleOutput01 = @(& $sample *>&1) } | Should -Not -Throw
+        $errors = @($script:SampleOutput01 | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+        ($errors | ForEach-Object { $_.ToString() }) | Should -BeNullOrEmpty
+    }
+}
