@@ -59,6 +59,11 @@ Set-DynamicORMClass
 - Generated class files are written to a per-session directory under `$env:TEMP` (`PSCsvSQLiteORM_<pid>_<id>`)
   and removed when the module is unloaded. `Set-DynamicORMClass` loads each file once, keeps going past a file that
   is missing or fails to parse, and then throws one error listing every file it could not load.
+- A generated class is only resolvable by name inside the module scope that loaded it, so `New-Object DynamicAssets`
+  or `[DynamicAssets]::new(...)` fails in your script. `Set-DynamicORMClass` captures each `[type]` as it loads the
+  file; use `New-DynamicRecord -Table <table> -Database <db>` to construct instances (it loads the classes first if
+  that has not happened yet). Records reached through `GetHasMany()` / `GetBelongsTo()` are created from the same
+  captured types.
 
 ### 5. Query Your Data
 ```powershell
@@ -75,21 +80,27 @@ $results = $query.Join('users', 'assets.owner_id = users.id').Select(@('assets.*
 
 ### 6. Work with Dynamic Models
 ```powershell
-# Create a new record
-$asset = New-DynamicModel -Type 'Asset' -Properties @{
-    name = 'Server-01'
-    status = 'active'
-    owner_id = 1
-}
-$asset.Save()
+# Get a record object for a table (after Export-DynamicModelsFromCatalog / Set-DynamicORMClass)
+$asset = New-DynamicRecord -Table 'assets' -Database .\myapp.db
 
-# Find and update existing records
-$asset = [Asset]::Find(1)
-$asset.status = 'maintenance'
+# Create a new row: set column values through the generated accessors, then Save()
+$asset.hostname('server04')
+$asset.ip('192.168.1.13')
 $asset.Save()
+$asset.Id            # id assigned by SQLite
 
-# Delete a record
-$asset.Delete()
+# Find and update an existing row
+$found = $asset.FindById(1)
+$found.ip('10.0.0.1')
+$found.Save()
+
+# Query rows and navigate relationships discovered from the catalog
+$rows = $asset.Where('ip LIKE @net', @{ net = '192.168.%' })
+$vulns = $found.GetHasMany('vulns')       # DynamicVulns records
+$owner = $vulns[0].GetBelongsTo('assets')  # back to the DynamicAssets record
+
+# Delete a row
+$found.Delete()
 ```
 
 ### 7. Upserts and Tables Without an `id` Column

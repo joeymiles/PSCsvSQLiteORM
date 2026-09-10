@@ -14,6 +14,11 @@ class DynamicActiveRecord {
     hidden [string]$KeyColumn
     # Upsert mode cache: 0 = unknown, 1 = native ON CONFLICT (SQLite 3.24+), 2 = emulated (UPDATE + conditional INSERT)
     hidden [int]$UpsertMode = 0
+    # Generated model types captured by Set-DynamicORMClass, keyed "<database key>|<table>" (BUG-035). Kept on the
+    # type rather than only in $script: because a re-imported module (Import-Module -Force) reuses this compiled
+    # class and, on Windows PowerShell 5.1, its methods stay bound to the first import's session state where the
+    # $script: registries are empty.
+    static [hashtable]$DynamicModelTypes = @{}
 
     DynamicActiveRecord([string]$tableName, [string]$database, [string[]]$columns) {
         $this.TableName = $tableName; $this.Database = $database; $this.Columns = $columns; $this.Id = 0
@@ -68,7 +73,11 @@ class DynamicActiveRecord {
         $typeObj = $null
         # Prefer the model registered for THIS database (BUG-017); fall back to the table-keyed view
         $dbKey = Get-DynamicDatabaseKey -Database $this.Database
-        if ($script:ModelRegistry -and $script:ModelRegistry.ContainsKey($dbKey) -and $script:ModelRegistry[$dbKey].ContainsKey($table)) {
+        # Types captured on load by Set-DynamicORMClass (BUG-035): the static store works even when this method runs
+        # bound to a stale session state after a module re-import (Windows PowerShell 5.1).
+        $staticKey = $dbKey + '|' + $table
+        if ([DynamicActiveRecord]::DynamicModelTypes.ContainsKey($staticKey)) { $typeObj = [DynamicActiveRecord]::DynamicModelTypes[$staticKey] }
+        if (-not $typeObj -and $script:ModelRegistry -and $script:ModelRegistry.ContainsKey($dbKey) -and $script:ModelRegistry[$dbKey].ContainsKey($table)) {
             $typeObj = $script:ModelRegistry[$dbKey][$table].Type
         }
         if (-not $typeObj -and $script:ModelTypeObjects -and $script:ModelTypeObjects.ContainsKey($table)) { $typeObj = $script:ModelTypeObjects[$table] }

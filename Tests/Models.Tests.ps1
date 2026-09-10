@@ -485,3 +485,82 @@ Describe 'BUG-036 type names are unique per table and never an existing type' -T
         (New-DynamicModel -TableName 'user_assets' -Database $script:db036 -Columns @('id', 'val')) | Should -Be 'DynamicUserAssets'
     }
 }
+
+Describe 'BUG-035 generated types are captured on load and exposed through New-DynamicRecord' -Tag 'BUG-035' {
+    BeforeAll {
+        $script:db035 = New-TestDbPath 'bug035'
+        Initialize-AssetsDb $script:db035
+        $script:t035 = & $script:Orm { param($d) $script:ModelRegistry[(Get-DynamicDatabaseKey -Database $d)]['assets'].TypeName } $script:db035
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'Set-DynamicORMClass records the [type] of every loaded model' {
+        $captured = & $script:Orm { $script:ModelTypeObjects['assets'] }
+        $captured | Should -Not -BeNullOrEmpty
+        $captured.Name | Should -Be $script:t035
+        $captured.BaseType.Name | Should -Be 'DynamicActiveRecord'
+        $entry = Get-ModelEntry 'assets' $script:db035
+        $entry.Type | Should -Not -BeNullOrEmpty
+        $entry.Type.Name | Should -Be $script:t035
+        (Get-ModelEntry 'vulns' $script:db035).Type | Should -Not -BeNullOrEmpty
+    }
+
+    It 'New-DynamicRecord is exported and builds an instance of the generated class from the caller scope' {
+        (Get-Command New-DynamicRecord -Module PSCsvSQLiteORM) | Should -Not -BeNullOrEmpty
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db035
+        $rec | Should -Not -BeNullOrEmpty
+        $rec.GetType().Name | Should -Be $script:t035
+        $rec.TableName | Should -Be 'assets'
+        $rec.Database | Should -Be $script:db035
+        (Get-MethodNames $rec) | Should -Contain 'hostname'
+        $rec.FindById(1).hostname() | Should -Be 'server01'
+    }
+
+    It 'a record from New-DynamicRecord can insert, update and delete rows' {
+        $rec = New-DynamicRecord -Table 'assets' -Database $script:db035
+        $rec.hostname('server-new'); $rec.ip('10.9.9.9')
+        $rec.Save()
+        $rec.Id | Should -BeGreaterThan 0
+        $again = (New-DynamicRecord -Table 'assets' -Database $script:db035).FindById($rec.Id)
+        $again.hostname() | Should -Be 'server-new'
+        $again.ip('10.9.9.10'); $again.Save()
+        (Get-Count $script:db035 ("SELECT COUNT(*) AS c FROM assets WHERE ip = '10.9.9.10' AND id = {0}" -f $rec.Id)) | Should -Be 1
+        $again.Delete()
+        (Get-Count $script:db035 ("SELECT COUNT(*) AS c FROM assets WHERE id = {0}" -f $rec.Id)) | Should -Be 0
+    }
+
+    # This file imports the module twice (-Force): on 5.1 the reused compiled class then runs bound to the first
+    # import's session state, so this also covers the static type store used by NewRelatedInstance.
+    It 'related records are instances of the generated class for their table' {
+        $asset = (New-DynamicRecord -Table 'assets' -Database $script:db035).FindById(1)
+        $children = @($asset.GetHasMany('vulns'))
+        $children.Count | Should -BeGreaterThan 0
+        $children[0].GetType().Name | Should -Be (Get-ModelEntry 'vulns' $script:db035).TypeName
+        (Get-MethodNames $children[0]) | Should -Contain 'severity'
+        $parent = $children[0].GetBelongsTo('assets')
+        $parent.GetType().Name | Should -Be $script:t035
+        $parent.hostname() | Should -Be 'server01'
+    }
+
+    It 'New-DynamicRecord loads the classes itself when Set-DynamicORMClass has not run yet' {
+        $db = New-TestDbPath 'bug035b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO notes(body) VALUES ('hello')" -NonQuery | Out-Null
+        $types = Export-DynamicModelsFromCatalog -Database $db
+        $rec = New-DynamicRecord -Table 'notes' -Database $db
+        $rec.GetType().Name | Should -Be $types['notes']
+        $rec.FindById(1).body() | Should -Be 'hello'
+        (Get-ModelEntry 'notes' $db).Type | Should -Not -BeNullOrEmpty
+    }
+
+    It 'New-DynamicRecord throws for a table with no registered model' {
+        { New-DynamicRecord -Table 'no_such_table' -Database $script:db035 } | Should -Throw '*No dynamic model is registered*'
+    }
+
+    It 'a regenerated model is usable again after Set-DynamicORMClass' {
+        Export-DynamicModelsFromCatalog -Database $script:db035 | Out-Null
+        Set-DynamicORMClass
+        (Get-ModelEntry 'assets' $script:db035).Type | Should -Not -BeNullOrEmpty
+        (New-DynamicRecord -Table 'assets' -Database $script:db035).FindById(2).hostname() | Should -Be 'server02'
+    }
+}

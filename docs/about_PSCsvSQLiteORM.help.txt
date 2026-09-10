@@ -32,10 +32,17 @@ EXAMPLES
         $types = Export-DynamicModelsFromCatalog -Database .\sample.db
         Set-DynamicORMClass
 
+    Work with a generated model (generated classes are not resolvable by name
+    from the caller; use the factory):
+        $asset = New-DynamicRecord -Table assets -Database .\sample.db
+        $asset.FindById(1).hostname()
+
 SEE ALSO
     Import-CsvToSqlite
     Initialize-ORMVars
     Export-DynamicModelsFromCatalog
+    New-DynamicRecord
+    Set-DynamicORMClass
     Invoke-DbQuery
     Update-DbCatalog
 

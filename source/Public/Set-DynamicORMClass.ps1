@@ -20,6 +20,29 @@ Function Set-DynamicORMClass {
         if ($proceed) {
             try {
                 . $path
+                # A dot-sourced class is only resolvable by name inside the scope that loaded it (BUG-035): capture the
+                # [type] here, right after loading, so New-DynamicRecord and related-record navigation can construct
+                # instances from any scope.
+                $typeObj = $null
+                if ($script.PSObject.Properties['TypeName'] -and $script.TypeName) {
+                    $typeObj = ([System.Management.Automation.PSTypeName]([string]$script.TypeName)).Type
+                }
+                if ($typeObj) {
+                    if (-not $script:ModelTypeObjects) { $script:ModelTypeObjects = @{} }
+                    $script:ModelTypeObjects[[string]$script.Table] = $typeObj
+                    if ($script.PSObject.Properties['DatabaseKey'] -and $script.DatabaseKey) {
+                        # Static store on the base class: reachable from class methods even after a module re-import
+                        [DynamicActiveRecord]::DynamicModelTypes[[string]$script.DatabaseKey + '|' + [string]$script.Table] = $typeObj
+                        if ($script:ModelRegistry -and $script:ModelRegistry.ContainsKey($script.DatabaseKey) -and
+                            $script:ModelRegistry[$script.DatabaseKey].ContainsKey([string]$script.Table)) {
+                            $script:ModelRegistry[$script.DatabaseKey][[string]$script.Table].Type = $typeObj
+                        }
+                    }
+                }
+                else {
+                    $failures += "Dynamic model file '$path' loaded but type '$($script.TypeName)' could not be resolved"
+                    Write-DbLog -Level ERROR -Message "Dynamic model type '$($script.TypeName)' not resolvable after loading '$path'"
+                }
             }
             catch {
                 $failures += "Failed to load dynamic model file '$path': $($_.Exception.Message)"
