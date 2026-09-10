@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066)
 
 $moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
 Import-Module $moduleFolder -Force
@@ -712,5 +712,139 @@ Describe 'Confirm-DbForeignKey validates the referenced table and column' -Tag '
         $db = New-FkProbeDb
         { Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To ASSETS -RefColumn ID } | Should -Not -Throw
         (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+    }
+}
+
+Describe 'Find-DbRelationships leaves confirmed relationships alone' -Tag 'BUG-024' {
+    BeforeAll {
+        function Get-FkRow {
+            param([string]$Database, [string]$Table, [string]$Column)
+            return (Invoke-DbQuery -Database $Database -Query "SELECT ref_table, ref_column, confidence, status FROM __fks__ WHERE table_name=@t AND column_name=@c" -SqlParameters @{ t = $Table; c = $Column })[0]
+        }
+    }
+    It 'keeps the confirmed ref_column and reports status confirmed' {
+        $db = New-CoreDbPath -Name 'b024a'
+        Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'assets.csv') -TableName assets -Database $db | Out-Null
+        Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $db | Out-Null
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -RefColumn hostname
+        $sugs = @(Find-DbRelationships -Database $db)
+        $row = Get-FkRow -Database $db -Table vulns -Column asset_id
+        $row.ref_table | Should -Be 'assets'
+        $row.ref_column | Should -Be 'hostname'
+        $row.status | Should -Be 'confirmed'
+        $mine = @($sugs | Where-Object { $_.table_name -eq 'vulns' -and $_.column_name -eq 'asset_id' })
+        $mine.Count | Should -Be 1
+        $mine[0].ref_column | Should -Be 'hostname'
+        $mine[0].status | Should -Be 'confirmed'
+    }
+    It 'keeps a confirmed target table the heuristic could not guess' {
+        $db = New-CoreDbPath -Name 'b024b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE owners(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id INTEGER)' -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $db -From docs -Column owner_id -To users
+        $sugs = @(Find-DbRelationships -Database $db)
+        $row = Get-FkRow -Database $db -Table docs -Column owner_id
+        $row.ref_table | Should -Be 'users'
+        $row.status | Should -Be 'confirmed'
+        $mine = @($sugs | Where-Object { $_.table_name -eq 'docs' })
+        $mine.Count | Should -Be 1
+        $mine[0].ref_table | Should -Be 'users'
+        $mine[0].status | Should -Be 'confirmed'
+    }
+    It 'returns one suggestion per column that matches the single persisted row' {
+        $db = New-CoreDbPath -Name 'b024c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE asset(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE assets(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE vulns(id INTEGER PRIMARY KEY, asset_id INTEGER)' -NonQuery | Out-Null
+        $sugs = @(Find-DbRelationships -Database $db)
+        $sugs.Count | Should -Be 1
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='vulns'" | Should -Be 1
+        $row = Get-FkRow -Database $db -Table vulns -Column asset_id
+        $sugs[0].ref_table | Should -Be $row.ref_table
+        $sugs[0].ref_column | Should -Be $row.ref_column
+        $sugs[0].status | Should -Be 'suggested'
+        $row.status | Should -Be 'suggested'
+    }
+    It 'still refreshes a suggestion that was never confirmed' {
+        $db = New-CoreDbPath -Name 'b024d'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE teams(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE players(id INTEGER PRIMARY KEY, team_id INTEGER)' -NonQuery | Out-Null
+        Find-DbRelationships -Database $db | Out-Null
+        Invoke-DbQuery -Database $db -Query "UPDATE __fks__ SET ref_column='bogus', confidence=0.1 WHERE table_name='players'" -NonQuery | Out-Null
+        Find-DbRelationships -Database $db | Out-Null
+        $row = Get-FkRow -Database $db -Table players -Column team_id
+        $row.ref_column | Should -Be 'id'
+        [double]$row.confidence | Should -Be 1
+        $row.status | Should -Be 'suggested'
+    }
+}
+
+Describe 'Find-DbRelationships only suggests real key columns' -Tag 'BUG-033' {
+    BeforeAll {
+        $script:b033Db = New-CoreDbPath -Name 'b033'
+        $db = $script:b033Db
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE users(name TEXT, email TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE owners(name TEXT, region_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE pets(id INTEGER PRIMARY KEY, owner_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE teams(team_id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE players(id INTEGER PRIMARY KEY, team_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE hosts(host_key TEXT PRIMARY KEY, label TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE scans(id INTEGER PRIMARY KEY, host_id TEXT)' -NonQuery | Out-Null
+        # Refresh the catalog explicitly so these tests do not depend on the BUG-066 fix.
+        Update-DbCatalog -Database $db
+        $script:b033Sugs = @(Find-DbRelationships -Database $db)
+        function Get-B033 {
+            param([string]$Table, [string]$Column)
+            return @($script:b033Sugs | Where-Object { $_.table_name -eq $Table -and $_.column_name -eq $Column })
+        }
+    }
+    It 'does not suggest a non-existent id column' {
+        (Get-B033 -Table orders -Column user_id).Count | Should -Be 0
+        Get-ScalarInt -Database $script:b033Db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='orders'" | Should -Be 0
+    }
+    It 'does not treat a foreign key column of the referenced table as its key' {
+        (Get-B033 -Table pets -Column owner_id).Count | Should -Be 0
+        Get-ScalarInt -Database $script:b033Db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='pets'" | Should -Be 0
+    }
+    It 'prefers the primary key of the referenced table' {
+        $s = @(Get-B033 -Table players -Column team_id)
+        $s.Count | Should -Be 1
+        $s[0].ref_table | Should -Be 'teams'
+        $s[0].ref_column | Should -Be 'team_id'
+        [double]$s[0].confidence | Should -Be 1
+        $s = @(Get-B033 -Table scans -Column host_id)
+        $s.Count | Should -Be 1
+        $s[0].ref_table | Should -Be 'hosts'
+        $s[0].ref_column | Should -Be 'host_key'
+        [double]$s[0].confidence | Should -Be 1
+    }
+    It 'never suggests a column as referencing itself' {
+        (Get-B033 -Table teams -Column team_id).Count | Should -Be 0
+        Get-ScalarInt -Database $script:b033Db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='teams'" | Should -Be 0
+    }
+}
+
+Describe 'Find-DbRelationships refreshes the catalog first' -Tag 'BUG-066' {
+    It 'suggests relationships for tables created with plain SQL' {
+        $db = New-CoreDbPath -Name 'b066'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE teams(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE players(id INTEGER PRIMARY KEY, team_id INTEGER)' -NonQuery | Out-Null
+        $sugs = @(Find-DbRelationships -Database $db)
+        $sugs.Count | Should -Be 1
+        $sugs[0].table_name | Should -Be 'players'
+        $sugs[0].ref_table | Should -Be 'teams'
+        $sugs[0].ref_column | Should -Be 'id'
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __columns__ WHERE table_name='players'" | Should -Be 2
+    }
+    It 'sees a table added by a migration after an earlier run' {
+        $db = New-CoreDbPath -Name 'b066m'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE teams(id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        @(Find-DbRelationships -Database $db).Count | Should -Be 0
+        Add-DbMigration -Database $db -Version 'b066_players' -Up { param($d) Invoke-DbQuery -Database $d -Query 'CREATE TABLE players(id INTEGER PRIMARY KEY, team_id INTEGER)' -NonQuery | Out-Null }
+        $sugs = @(Find-DbRelationships -Database $db)
+        $sugs.Count | Should -Be 1
+        $sugs[0].ref_table | Should -Be 'teams'
     }
 }
