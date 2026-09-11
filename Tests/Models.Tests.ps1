@@ -1017,3 +1017,25 @@ Describe 'BUG-069 record keys are 64-bit' -Tag 'BUG-069' {
         $rec.Id | Should -BeGreaterThan ([long]4000000000)
     }
 }
+
+Describe 'BUG-062 record writes with spaced or dashed columns neither fail nor silently no-op' -Tag 'BUG-062' {
+    BeforeAll {
+        $script:db062 = New-TestDbPath 'bug062'
+        Invoke-DbQuery -Database $script:db062 -Query 'CREATE TABLE people(id INTEGER PRIMARY KEY AUTOINCREMENT, "First Name" TEXT, "Last-Name" TEXT)' -NonQuery | Out-Null
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'Save() on a base record inserts the row, sets the Id and stores the row on either host' {
+        $rec = New-BaseRecord 'people' $script:db062 @('id', 'First Name', 'Last-Name')
+        $rec.SetAttribute('First Name', 'Ann'); $rec.SetAttribute('Last-Name', 'Lee')
+        { $rec.Save() } | Should -Not -Throw
+        $rec.Id | Should -BeGreaterThan 0
+        (Get-Count $script:db062 'SELECT COUNT(*) AS c FROM people WHERE "First Name" = ''Ann'' AND "Last-Name" = ''Lee''') | Should -Be 1
+    }
+
+    It 'InsertMany() on a base record binds spaced and dashed columns without error' {
+        $rec = New-BaseRecord 'people' $script:db062 @('id', 'First Name', 'Last-Name')
+        { $rec.InsertMany(@(@{ 'First Name' = 'Bob'; 'Last-Name' = 'Ray' })) } | Should -Not -Throw
+        (Get-Count $script:db062 'SELECT COUNT(*) AS c FROM people') | Should -Be 2
+    }
+}

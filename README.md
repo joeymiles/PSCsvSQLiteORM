@@ -1,6 +1,6 @@
 # PSCsvSQLiteORM
 
-PowerShell 5.1 ORM for SQLite with CSV import, schema inference, dynamic models, relationships, joins, upserts, and migrations.
+SQLite ORM for Windows PowerShell 5.1 and PowerShell 7 with CSV import, schema inference, dynamic models, relationships, joins, upserts, and migrations. Requires PSSQLite 1.1.0 or later.
 
 ## Quick Start
 

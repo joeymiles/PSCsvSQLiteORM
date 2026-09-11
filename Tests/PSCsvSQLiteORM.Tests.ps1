@@ -197,3 +197,58 @@ Describe 'BUG-048 unloading the module closes pooled connections' -Tag 'BUG-048'
         Close-DbConnections
     }
 }
+
+# Manifest regression tests (TASK A15: BUG-062, BUG-063). Runs on Windows PowerShell 5.1 and PowerShell 7.
+Describe 'module manifest editions, dependencies and release notes' {
+    BeforeAll {
+        $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+        $script:SourceManifest = Join-Path (Join-Path $script:RepoRoot 'source') 'PSCsvSQLiteORM.psd1'
+        $script:SourceData = Import-PowerShellDataFile -Path $script:SourceManifest
+        $builtRoot = Join-Path (Join-Path $script:RepoRoot 'output') 'PSCsvSQLiteORM'
+        $script:BuiltManifest = Get-ChildItem -Path $builtRoot -Recurse -Filter 'PSCsvSQLiteORM.psd1' | Select-Object -First 1 -ExpandProperty FullName
+        $script:BuiltData = Import-PowerShellDataFile -Path $script:BuiltManifest
+        $script:BuiltInfo = Test-ModuleManifest -Path $script:BuiltManifest -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+
+    It 'declares both the Desktop and Core editions in the source and built manifests' -Tag 'BUG-063' {
+        @($script:SourceData.CompatiblePSEditions) | Should -Contain 'Desktop'
+        @($script:SourceData.CompatiblePSEditions) | Should -Contain 'Core'
+        @($script:BuiltInfo.CompatiblePSEditions) | Should -Contain 'Desktop'
+        @($script:BuiltInfo.CompatiblePSEditions) | Should -Contain 'Core'
+    }
+
+    It 'is listed by Get-Module -ListAvailable for the Core edition as well as Desktop' -Tag 'BUG-063' {
+        @(Get-Module -ListAvailable -PSEdition Core $script:BuiltManifest).Count | Should -Be 1
+        @(Get-Module -ListAvailable -PSEdition Desktop $script:BuiltManifest).Count | Should -Be 1
+    }
+
+    It 'pins the PSSQLite dependency to a minimum version' -Tag 'BUG-063' {
+        $req = @($script:BuiltInfo.RequiredModules) | Where-Object { $_.Name -eq 'PSSQLite' } | Select-Object -First 1
+        $req | Should -Not -BeNullOrEmpty
+        [string]$req.Version | Should -Be '1.1.0'
+    }
+
+    It 'describes support for PowerShell 7, not only Windows PowerShell 5.1' -Tag 'BUG-063' {
+        $script:SourceData.Description | Should -Match 'PowerShell 7'
+        $script:SourceData.Description | Should -Match '5\.1'
+    }
+
+    It 'imports on the running host without an edition override' -Tag 'BUG-063' {
+        $m = Import-Module $script:BuiltManifest -Force -PassThru -ErrorAction Stop
+        $m | Should -Not -BeNullOrEmpty
+        $m.Name | Should -Be 'PSCsvSQLiteORM'
+    }
+
+    It 'release notes scope the v3.1.3 parameter fix to Import-CsvToSqlite and keep the per-version history' -Tag 'BUG-062' {
+        $notes = [string]$script:SourceData.PrivateData.PSData.ReleaseNotes
+        $notes | Should -Match 'Unreleased'
+        $notes | Should -Match 'DynamicActiveRecord'
+        $notes | Should -Match 'v3\.1\.3'
+        $notes | Should -Match 'Import-CsvToSqlite'
+        $notes | Should -Match 'v3\.1\.2'
+        $notes | Should -Match 'v3\.1\.1'
+        $notes | Should -Match 'v3\.1\.0'
+        # the same text must survive the build unchanged
+        [string]$script:BuiltData.PrivateData.PSData.ReleaseNotes | Should -Be $notes
+    }
+}

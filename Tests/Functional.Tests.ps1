@@ -412,7 +412,8 @@ Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version f
         # Bump the copied source manifest without touching the script: the build must follow the manifest.
         $script:BumpedVersion59 = '9.9.9'
         $raw = Get-Content -LiteralPath $script:SourceManifest59 -Raw
-        $raw = $raw -replace "ModuleVersion\s*=\s*'[^']+'", ("ModuleVersion = '{0}'" -f $script:BumpedVersion59)
+        # Anchor to the line start: the RequiredModules entry also carries a ModuleVersion key (PSSQLite pin) that must stay untouched
+        $raw = $raw -replace "(?m)^ModuleVersion\s*=\s*'[^']+'", ("ModuleVersion = '{0}'" -f $script:BumpedVersion59)
         Set-Content -LiteralPath $script:SourceManifest59 -Value $raw -NoNewline -Encoding ASCII
 
         # Runs the copied build script in a child process of THIS host from an unrelated directory.
