@@ -16,30 +16,142 @@ LONG DESCRIPTION
     - Upsert helpers and migration tracking
     - Logging and configurable defaults via settings script
 
+    This topic describes version 3.2.0, which exports 29 commands. The commands
+    New-DynamicRecord, Remove-DbForeignKey and Test-DbTransaction were added in
+    3.2.0 and do not exist in earlier versions.
+
     Settings Script
     You can configure defaults by providing a settings script that returns
     a hashtable with keys: DbPath, LogPath, LogLevel.
 
-    Example:
-        @{ DbPath='C:\\data\\app.db'; LogPath='C:\\logs\\db.log'; LogLevel='INFO' }
+    Example (single-quoted strings are literal in PowerShell, so a backslash
+    is written once):
+        @{ DbPath='C:\data\app.db'; LogPath='C:\logs\db.log'; LogLevel='INFO' }
 
     Apply it:
         Initialize-ORMVars -SettingsPath .\orm.settings.ps1
+
+    The script is dot-sourced and the LAST hashtable it emits is used, so it
+    may create its own log directory or write other output first. A script that
+    emits no hashtable throws "Failed to load settings from '<path>': the script
+    did not return a hashtable with keys DbPath, LogPath, LogLevel" and leaves
+    the previous configuration unchanged. The settings object must be a
+    [hashtable]; an [ordered] hashtable is not accepted. Explicit parameters
+    take precedence over the file.
+
+    Initialize-ORMVars with no parameters resets everything it manages to the
+    built-in defaults: the connection pool, any pending transaction, the pragma
+    cache, the log path, the log level, the default database path and every
+    dynamic model registration. After a bare Initialize-ORMVars, New-DynamicRecord
+    throws "No dynamic model is registered for table ..." until the models are
+    exported again. Type names already handed out stay reserved for the life of
+    the session, because a PowerShell class cannot be unloaded.
+
+    Logging
+    Write-DbLog's -Level is optional and defaults to INFO, and an unrecognised
+    value is treated as INFO. A defaulted level is filtered by the configured
+    threshold exactly like an explicit INFO message, so it is suppressed while
+    the threshold is WARN or ERROR. Set-DbLogging applies only the parameters
+    that are supplied: -Path alone redirects the log without changing the level,
+    -Level alone changes the level without clearing the path, -Path '' returns to
+    Write-Verbose, and a call with no parameters does nothing.
 
 EXAMPLES
     Import a CSV and build the schema:
         Import-CsvToSqlite -CsvPath .\assets.csv -Database .\sample.db -TableName assets
 
+    Import-CsvToSqlite returns the trimmed CSV header names, so assign the result
+    or pipe it to Out-Null when you do not want the column names in your output:
+        Import-CsvToSqlite -CsvPath .\assets.csv -Database .\sample.db -TableName assets | Out-Null
+
     -SchemaMode (default Relaxed) controls what an import may do to the table:
-        Relaxed     create the table if missing, add missing columns, insert rows
-        Strict      create the table if missing, never alter it; an unknown CSV
-                    header throws before any row is inserted
+        Relaxed     create the table if missing, add missing columns, insert rows.
+                    It may also change the declared type of an existing column
+                    when the CSV holds values that type cannot hold; that rebuilds
+                    the table, rewrites the values already stored in the column
+                    and writes a warning
+        Strict      the table must already exist; never creates or alters it. A
+                    missing table throws "Strict mode: table '<table>' does not
+                    exist.", and an unknown CSV header, or a column whose declared
+                    type is narrower than the CSV values, throws before any row is
+                    inserted
         AppendOnly  insert rows only; the table must already exist, so use it
                     for the second and later loads of a table
+
+    Values the import rewrites, and how to switch that off:
+        -NullTokens (default '', NULL, N/A, NaN) are replaced with SQL NULL.
+        Matching is case-sensitive, so a surname 'Null' or a code 'nan' is kept;
+        pass -IgnoreNullTokenCase for case-insensitive matching, or
+        -NullTokens @() to disable it.
+        -BoolTokens (default true = true,1,yes,y / false = false,0,no,n)
+        converts a column to INTEGER 1/0, but only when EVERY non-null value in
+        the file is a bool token AND the file contains both a true token and a
+        false token, or the table already declares that column with a numeric
+        type. A column of only 'Y', only 'NO' or only 'true' is kept as text, and
+        a column the table already declares TEXT/CHAR/CLOB/BLOB (or with no
+        declared type) is never re-encoded. Pass -BoolTokens @{} to disable it.
+        -BatchSize (0 = one pass with no Write-Progress; above 0 reports progress
+        every N rows) and -ForeignKeys complete the parameter set.
+
+    Other rules of an import:
+        -WhatIf and -Confirm are supported: -WhatIf validates the CSV, the
+        headers, the table's existence in Strict/AppendOnly mode and the column
+        types, reports the operation, writes nothing (it may still create an empty
+        database file when the path does not exist) and returns the header list.
+        A failed import leaves the schema as it found it: the CREATE TABLE and
+        ALTER TABLE ADD COLUMN of a run are rolled back with its rows. (This holds
+        while the module has a direct System.Data.SQLite connection, the normal
+        case; on the PSSQLite fallback path statements auto-commit.)
+        An 'id' header becomes INTEGER PRIMARY KEY AUTOINCREMENT (or TEXT PRIMARY
+        KEY for a non-integer id) only when the import creates the table. Added to
+        a table that already exists it is a plain column, because ALTER TABLE
+        cannot add a primary key, and the uniqueness is created as a unique index
+        named ux_<table>_id instead; only the create-from-scratch column
+        auto-numbers blank ids. Either way, re-importing ids that are already in
+        the table fails with a UNIQUE constraint error.
+        A CSV with more than 999 columns is refused before anything is created,
+        because SQLite binds at most 999 parameters per statement. A header field
+        that is empty or only whitespace throws "CSV header contains an empty
+        column name." -TableName is trimmed and an all-whitespace name throws
+        "TableName is empty." A cell containing a NUL character (U+0000) aborts
+        the import, naming the column and the 1-based row.
+
+    Identifiers:
+        Table and column names (CSV headers included) may contain any character
+        except control characters. Names are always double-quoted in the generated
+        SQL and an embedded double quote is doubled, so 'Cost (USD)', '50%', 'A/B',
+        "O'Brien" and 'Weight [kg]' are all valid column names. A name containing
+        a control character (U+0000 in particular, which SQLite treats as the end
+        of the identifier) is refused with "Invalid identifier: '<name>' contains
+        control characters".
 
     Confirm a relationship (drives 'Auto' joins and GetHasMany/GetBelongsTo):
         Find-DbRelationships -Database .\sample.db
         Confirm-DbForeignKey -Database .\sample.db -From vulns -Column asset_id -To assets
+
+        Confirm-DbForeignKey fails when rows in the child table already violate
+        the relationship: "Confirm-DbForeignKey: <n> row(s) in '<From>' have a
+        '<Column>' value that is not in <To>.<RefColumn>. Fix the data, or pass
+        -Force to enforce the relationship for future writes only." -Force records
+        and enforces it anyway, warning instead of failing and leaving the
+        offending rows in place, because the triggers only police future writes. A
+        NULL foreign key value is never a violation.
+        -RefColumn (default id) names the referenced column on the parent table and
+        is honoured by GetHasMany/GetBelongsTo.
+        The triggers are named trg_fk_<From>_<Column>_check, _check_upd and
+        _ondelete unless those names already belong to another (table, column)
+        pair, in which case a hashed name is used; use Remove-DbForeignKey rather
+        than a hand-built name. Update-DbCatalog drops the triggers of a
+        relationship whose child or referenced table no longer exists.
+
+    Remove a relationship before dropping a table that takes part in it:
+        Remove-DbForeignKey -Database .\sample.db -From vulns -Column asset_id
+
+        It drops the relationship's triggers (including the ON DELETE trigger on
+        the parent table), deletes its catalog row and returns the trigger names.
+        SQLite drops a trigger only with the table it is defined on, so without
+        this the parent's trigger survives its child table. Removing a
+        relationship that is not there is not an error.
 
     Generate models and set dynamic class:
         $types = Export-DynamicModelsFromCatalog -Database .\sample.db
@@ -50,6 +162,60 @@ EXAMPLES
         $asset = New-DynamicRecord -Table assets -Database .\sample.db
         $asset.FindById(1).hostname()
 
+        All() returns records, the same type as Where(), First() and FindById(),
+        so every row can navigate relationships and be saved. AllRows() returns
+        every row as a plain PSCustomObject carrying the table's columns, with no
+        record API; that was what All() returned before 3.2.0.
+        HasMany() and BelongsTo() take an optional third argument, the column the
+        foreign key references on the parent table:
+            $rec.HasMany('branch', 'corp_code', 'code')
+            $rec.BelongsTo('corp', 'corp_code', 'code')
+        Omitting it means 'id'. Generated models carry the referenced column of
+        every catalogued relationship.
+
+    Build a query:
+        $q = New-DbQuery -Database .\sample.db -From 'vulns'
+        $rows = $q.Join('assets', 'Auto', 'Inner', 'asset_id').Select(@('vulns.title', 'assets.hostname')).Run()
+
+        Run() always returns an array, empty when nothing matches.
+        Join() has four overloads: Join(<table>), Join(<table>, <on>),
+        Join(<table>, <on>, <type>) and Join(<table>, <on>, <type>, <foreign key>).
+        The fourth argument names the foreign-key column an 'Auto' join must use
+        and is valid only when the ON argument is the literal 'Auto'. An 'Auto'
+        join throws when the catalog holds more than one relationship of equal
+        rank between the same pair of tables; the message names the candidates.
+        A Full join identifies unmatched rows through the rowid of the From table,
+        so a view or a WITHOUT ROWID table is rejected: "A Full join requires a
+        rowid table as its From source; '<name>' is a view." Without a Select(), a
+        Right or Full join projects <From>.*, <join table>.* - the From table's
+        columns first - and a duplicate column name arrives as 'id1'.
+
+    Run SQL directly:
+        Invoke-DbQuery -Database .\sample.db -Query 'SELECT COUNT(*) AS c FROM assets' -Scalar
+
+        -Scalar returns $null both when the result set is empty and when the
+        selected cell is SQL NULL; it does not return [System.DBNull]::Value, so
+        '$null -eq $result' is the right guard. A string passed through
+        -SqlParameters must not contain a NUL character (U+0000): SQLite marshals
+        text parameters as NUL-terminated UTF-8, so the value would be stored
+        truncated, and the call throws instead, naming the parameter and the index
+        of the NUL. Pass a [byte[]] to store bytes that may contain zeros.
+
+    Transactions:
+        $tx = Start-DbTransaction -Database .\sample.db
+        Test-DbTransaction -Database .\sample.db
+        Complete-DbTransaction -Database .\sample.db -Transaction $tx
+
+        Every statement for one database goes through one pooled connection, so an
+        open transaction takes in every later write until it is completed.
+        Test-DbTransaction reports whether that connection is inside a transaction
+        and returns $false when none is pooled, without opening one.
+        Complete-DbTransaction and Undo-DbTransaction also accept -Database alone,
+        which is the supported way to finish a transaction whose handle has been
+        lost. Close-DbConnections and Initialize-ORMVars roll back an uncommitted
+        transaction explicitly and warn instead of discarding its writes in
+        silence; the same warning appears on Remove-Module and Import-Module -Force.
+
 SEE ALSO
     Import-CsvToSqlite
     Initialize-ORMVars
@@ -58,6 +224,10 @@ SEE ALSO
     Set-DynamicORMClass
     Invoke-DbQuery
     Update-DbCatalog
+    Confirm-DbForeignKey
+    Remove-DbForeignKey
+    Test-DbTransaction
+    Write-DbLog
 
 LINK
     https://github.com/joeymiles/PSCsvSQLiteORM

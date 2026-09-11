@@ -11,7 +11,7 @@
 RootModule = 'PSCsvSQLiteORM.psm1'
 
 # Version number of this module.
-ModuleVersion = '3.1.3'
+ModuleVersion = '3.2.0'
 
 # Supported PSEditions
 CompatiblePSEditions = @('Desktop', 'Core')
@@ -107,16 +107,60 @@ PrivateData = @{
 
         # ReleaseNotes of this module
         ReleaseNotes = @'
-Unreleased (since v3.1.3)
+v3.2.0
+New commands (29 exported, up from 26 in v3.1.3)
+- New-DynamicRecord constructs a record of a generated model. A generated class is only resolvable by name
+  inside the module scope that loaded it, so this is the supported way to reach one from a script
+- Remove-DbForeignKey drops the triggers and the catalog row of a relationship created by Confirm-DbForeignKey
+- Test-DbTransaction reports whether the pooled connection for a database is inside a transaction
+
+Records and relationships
+- All() returns records, the same type as Where(), First() and FindById(), so every row can navigate
+  relationships and be saved. The previous plain-object projection is now AllRows()
+- HasMany(), BelongsTo() and the generated model files carry the referenced column of a relationship, so
+  Confirm-DbForeignKey -RefColumn navigates through a column other than id
+- Confirm-DbForeignKey refuses to record a relationship that the child table's rows already violate; -Force
+  records it and enforces it for future writes only. Its triggers carry an ownership marker and take a
+  hashed name when the derived one is already taken, and Update-DbCatalog drops the triggers of a
+  relationship whose child or referenced table is gone
+
+Query builder
+- Join(<table>, <on>, <type>, <foreign key>) picks the foreign key of an 'Auto' join; an 'Auto' join throws
+  when the catalog holds more than one relationship of equal rank between the two tables
+- A Full join whose From source is a view or a WITHOUT ROWID table throws instead of returning a different
+  wrong answer per SQLite version; Right and Full joins without Select() project the From table's columns first
+- Run() always returns an array, empty when nothing matches
+
+CSV import
+- Supports -WhatIf and -Confirm, and rolls back the CREATE TABLE and ALTER TABLE ADD COLUMN of a failed run
+  together with its rows
+- Refuses a CSV wider than 999 columns, or with an empty header name, before anything is created, and trims
+  -TableName the way headers were already trimmed
+- Relaxed warns when it changes the declared type of an existing column, and no longer rewrites a numeric
+  column to TEXT when the CSV only spells its numbers differently ('10.0' in a REAL column)
+- A widening rebuild runs in one transaction and restores the table's indexes and triggers, including
+  triggers on other tables, or leaves the database untouched
+
+Queries, identifiers and logging
+- Table and column names (CSV headers included) may contain any character except control characters
+- Invoke-DbQuery -Scalar returns $null for a SQL NULL cell instead of [System.DBNull]::Value, and a string
+  parameter containing a NUL character (U+0000) is rejected instead of being stored truncated
+- Write-DbLog -Level is optional and defaults to INFO; Set-DbLogging applies only the parameters supplied
+- Initialize-ORMVars takes the settings hashtable out of everything the settings script emits and throws
+  when it emits none; a bare call also resets the default database path and every model registration
+- Close-DbConnections and Initialize-ORMVars roll back an uncommitted transaction with a warning instead of
+  discarding its writes in silence; Complete-DbTransaction and Undo-DbTransaction accept -Database alone
 - DynamicActiveRecord Save, InsertMany, InsertOnConflict and BulkUpsert bind every column value under a
   positional parameter name (@p0..@pN), so record writes work for columns with spaces, dashes or other
   special characters; a failed insert now throws on Windows PowerShell 5.1 as well as on PowerShell 7
 - Manifest declares both the Desktop and Core editions and pins PSSQLite 1.1.0 or later
+- build-module.ps1 fails the build when docs\ and source\Examples\ do not reach the built module, which now
+  also ships en-US\about_PSCsvSQLiteORM.help.txt
 
 v3.1.3
 - Import-CsvToSqlite sanitizes SQL parameter names (alphanumeric characters and underscores only), so CSV
   files with spaces or special characters in their headers import without binding errors
-- Note: this release did not change the DynamicActiveRecord write paths; see Unreleased above
+- Note: this release did not change the DynamicActiveRecord write paths; see v3.2.0 above
 
 v3.1.2
 - Fixed SQLite version compatibility by replacing ON CONFLICT (UPSERT) syntax with traditional INSERT/UPDATE

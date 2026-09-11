@@ -228,7 +228,7 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
         $blocks.Count | Should -BeGreaterThan 5
         $called = @()
         foreach ($b in $blocks) {
-            foreach ($m in [regex]::Matches($b.Groups[1].Value, '(?m)^\s*(?:\$\w+\s*=\s*)?((?:Import|Initialize|Export|Set|New|Find|Confirm|Invoke|Close|Update|Start|Complete|Undo|Get|Add|Enable|Test|Write)-\w+)')) {
+            foreach ($m in [regex]::Matches($b.Groups[1].Value, '(?m)^\s*(?:\$\w+\s*=\s*)?((?:Import|Initialize|Export|Set|New|Find|Confirm|Invoke|Close|Update|Start|Complete|Undo|Get|Add|Enable|Test|Write|Remove)-\w+)')) {
                 $called += $m.Groups[1].Value
             }
         }
@@ -238,7 +238,8 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
     }
 
     It 'the README Quick Start blocks 3-8 run line by line without an error on this host' {
-        $script:Blocks10.Count | Should -Be 8
+        # Blocks 1-8 are the Quick Start; later blocks (section 9) are executed by the DOCS-320 container.
+        $script:Blocks10.Count | Should -BeGreaterOrEqual 8
         $failures = @()
         $executed = 0
         foreach ($blockNumber in 3..8) {
@@ -872,5 +873,245 @@ Describe 'Write-DbLog defaults to INFO when -Level is omitted' -Tag 'E2E1-028' {
         Set-DbLogging -Level DEBUG -Path $null
         $verbose = @(Write-DbLog -Message 'verbose without level' -Verbose 4>&1 | ForEach-Object { [string]$_ })
         ($verbose -join ' ') | Should -Match '\[INFO\] verbose without level'
+    }
+}
+
+# The 3.2.0 documentation pass: every statement the README and the about topic make about this build is
+# executed here, and the README's own section 9 block is run line by line the way BASE-10 runs blocks 3-8.
+Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-320' {
+    BeforeAll {
+        # Functions dot-sourced at container level are not in scope inside BeforeAll on either host.
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:RepoRoot320 = Split-Path -Parent $PSScriptRoot
+        $script:Readme320 = Get-Content -LiteralPath (Join-Path $script:RepoRoot320 'README.md') -Raw
+        $script:HelpPath320 = Join-Path (Join-Path $script:RepoRoot320 'docs') 'about_PSCsvSQLiteORM.help.txt'
+        $script:Help320 = Get-Content -LiteralPath $script:HelpPath320 -Raw
+        $script:SamplePath320 = Join-Path (Join-Path (Join-Path $script:RepoRoot320 'source') 'Examples') 'orm.settings.ps1'
+        $script:Manifest320 = Import-PowerShellDataFile -Path (Join-Path (Join-Path $script:RepoRoot320 'source') 'PSCsvSQLiteORM.psd1')
+        $script:Blocks320 = @([regex]::Matches($script:Readme320, '(?s)```powershell\r?\n(.*?)```') | ForEach-Object { $_.Groups[1].Value })
+
+        $script:Root320 = Join-Path $env:TEMP ("orm_docs320_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Root320 -Force | Out-Null
+        Initialize-ORMVars -LogLevel ERROR
+        $script:Assets320 = Join-Path $PSScriptRoot 'assets.csv'
+        $script:Vulns320 = Join-Path $PSScriptRoot 'vulns.csv'
+        # The database README section 9 is written against: the Quick Start's two tables and its relationship.
+        $script:Db320 = Join-Path $script:Root320 'myapp.db'
+        Import-CsvToSqlite -CsvPath $script:Assets320 -Database $script:Db320 -TableName assets | Out-Null
+        Import-CsvToSqlite -CsvPath $script:Vulns320 -Database $script:Db320 -TableName vulns | Out-Null
+        Confirm-DbForeignKey -Database $script:Db320 -From vulns -Column asset_id -To assets | Out-Null
+
+        function New-Csv320([string]$Name, [string]$Content) {
+            $f = Join-Path $script:Root320 $Name
+            Set-Content -LiteralPath $f -Value $Content -Encoding ASCII
+            return $f
+        }
+    }
+    AfterAll {
+        Close-DbConnections
+        if ($script:Root320 -and (Test-Path -LiteralPath $script:Root320)) {
+            Remove-Item -LiteralPath $script:Root320 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'E2E1-010: the manifest and the README name the version that exports the new commands' {
+        $script:Manifest320.ModuleVersion | Should -Be '3.2.0'
+        $notes = [string]$script:Manifest320.PrivateData.PSData.ReleaseNotes
+        $notes | Should -Match '(?m)^v3\.2\.0\s*$'
+        $notes | Should -Not -Match 'Unreleased'
+        $script:Readme320 | Should -Match 'RequiredVersion 3\.2\.0'
+        $script:Readme320 | Should -Not -Match 'RequiredVersion 3\.1\.3'
+        $script:Help320 | Should -Match '3\.2\.0'
+        foreach ($c in @('New-DynamicRecord', 'Remove-DbForeignKey', 'Test-DbTransaction')) {
+            (Get-Command -Name $c -Module PSCsvSQLiteORM -ErrorAction SilentlyContinue) | Should -Not -BeNullOrEmpty
+            $script:Readme320 | Should -Match ([regex]::Escape($c))
+            $script:Help320 | Should -Match ([regex]::Escape($c))
+        }
+    }
+
+    It 'E2E1-024: the help topic describes Strict the way the code behaves' {
+        $script:Help320 | Should -Not -Match 'Strict\s+create the table if missing'
+        $script:Help320 | Should -Match 'Strict\s+the table must already exist'
+        $db = Join-Path $script:Root320 'strict320.db'
+        { Import-CsvToSqlite -CsvPath $script:Assets320 -Database $db -TableName assets -SchemaMode Strict } |
+            Should -Throw -ExpectedMessage "*Strict mode: table 'assets' does not exist.*"
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='assets'").Count |
+            Should -Be 0
+    }
+
+    It 'E2E1-025: Import-CsvToSqlite returns the trimmed headers, as both documents now say' {
+        $script:Readme320 | Should -Match 'returns the trimmed CSV header names'
+        $script:Help320 | Should -Match 'returns the trimmed CSV header names'
+        $db = Join-Path $script:Root320 'ret320.db'
+        $csv = New-Csv320 'ret320.csv' "id, hostname ,ip`r`n1,server01,10.0.0.1"
+        $ret = Import-CsvToSqlite -CsvPath $csv -Database $db -TableName t
+        @($ret) | Should -Be @('id', 'hostname', 'ip')
+    }
+
+    It 'E2E1-030: the sample settings script and the help example configure real paths' {
+        $raw = Get-Content -LiteralPath $script:SamplePath320 -Raw
+        $raw | Should -Not -Match '\\\\'
+        $cfg = @(@(. $script:SamplePath320) | Where-Object { $_ -is [hashtable] } | Select-Object -Last 1)[0]
+        $cfg | Should -Not -BeNullOrEmpty
+        $cfg.DbPath | Should -Be 'C:\data\app.db'
+        $cfg.LogPath | Should -Be 'C:\logs\db.log'
+        $cfg.LogLevel | Should -Be 'INFO'
+        (Split-Path -Parent $cfg.DbPath) | Should -Be 'C:\data'
+        $script:Help320 | Should -Match ([regex]::Escape("DbPath='C:\data\app.db'"))
+        $script:Help320 | Should -Not -Match '\\\\data'
+    }
+
+    It 'the README section 9 block runs line by line without an error on this host' {
+        $script:Blocks320.Count | Should -BeGreaterOrEqual 9
+        $lines = @()
+        foreach ($raw in ($script:Blocks320[8] -split "\r?\n")) {
+            $line = $raw.Trim()
+            if (-not $line -or $line.StartsWith('#')) { continue }
+            $lines += $line
+        }
+        $lines.Count | Should -BeGreaterThan 5
+        $failures = @()
+        foreach ($line in $lines) {
+            # Replacement strings are literal apart from '$', so the path is quoted and any '$' is doubled.
+            $cmd = [regex]::Replace($line, [regex]::Escape('.\myapp.db'), ("'" + ($script:Db320 -replace '\$', '$$$$') + "'"))
+            $global:Error.Clear()
+            try {
+                Invoke-Expression $cmd | Out-Null
+                $errs = @($global:Error | Where-Object { -not ($_ -is [System.Management.Automation.ErrorRecord] -and $_.InvocationInfo -and $_.InvocationInfo.MyCommand -and $_.InvocationInfo.MyCommand.Name -eq 'Add-Type') })
+                if ($errs.Count -gt 0) { $failures += ("{0} :: {1}" -f $line, $errs[0]) }
+            }
+            catch {
+                $failures += ("{0} :: {1}" -f $line, $_.Exception.Message)
+            }
+        }
+        $global:Error.Clear()
+        $failures | Should -BeNullOrEmpty
+        # The block leaves no transaction open, and the relationship it removes is really gone.
+        Test-DbTransaction -Database $script:Db320 | Should -BeFalse
+        @(Invoke-DbQuery -Database $script:Db320 -Query "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_fk_vulns_asset_id%'").Count | Should -Be 0
+        @(Invoke-DbQuery -Database $script:Db320 -Query "SELECT table_name FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'").Count | Should -Be 0
+    }
+
+    It 'the documented Join overloads, Auto ambiguity, Full join source and Run() shape behave as described' {
+        $db = Join-Path $script:Root320 'join320.db'
+        Import-CsvToSqlite -CsvPath (New-Csv320 'users320.csv' "id,name`r`n1,ann`r`n2,bob") -Database $db -TableName users | Out-Null
+        Import-CsvToSqlite -CsvPath (New-Csv320 'tickets320.csv' "id,created_by,assigned_to,title`r`n1,1,2,first") -Database $db -TableName tickets | Out-Null
+        Confirm-DbForeignKey -Database $db -From tickets -Column created_by -To users | Out-Null
+        Confirm-DbForeignKey -Database $db -From tickets -Column assigned_to -To users | Out-Null
+
+        $q1 = New-DbQuery -Database $db -From 'tickets'
+        { $q1.Join('users') } | Should -Throw -ExpectedMessage '*is ambiguous*'
+        $q2 = New-DbQuery -Database $db -From 'tickets'
+        $rows = @($q2.Join('users', 'Auto', 'Inner', 'created_by').Select(@('tickets.id', 'users.name')).Run())
+        $rows.Count | Should -Be 1
+        $rows[0].name | Should -Be 'ann'
+        $q3 = New-DbQuery -Database $db -From 'tickets'
+        { $q3.Join('users', 'users.id = tickets.created_by', 'Inner', 'created_by') } |
+            Should -Throw -ExpectedMessage "*applies to an 'Auto' join only*"
+        $q4 = New-DbQuery -Database $db -From 'tickets'
+        @($q4.Where('id = @i', @{ i = 999 }).Run()).Count | Should -Be 0
+        $q5 = New-DbQuery -Database $db -From 'tickets'
+        $right = @($q5.Join('users', 'users.id = tickets.created_by', 'Right').Run())
+        @($right[0].PSObject.Properties.Name) | Should -Be @('id', 'created_by', 'assigned_to', 'title', 'id1', 'name')
+        Invoke-DbQuery -Database $db -Query 'CREATE VIEW IF NOT EXISTS v_tickets AS SELECT * FROM tickets' -NonQuery | Out-Null
+        $q6 = New-DbQuery -Database $db -From 'v_tickets'
+        { $q6.Join('users', 'users.id = v_tickets.created_by', 'Full').Run() } |
+            Should -Throw -ExpectedMessage '*requires a rowid table as its From source*'
+    }
+
+    It 'All() returns records, AllRows() returns plain rows, and a relationship through another column navigates' {
+        $db = Join-Path $script:Root320 'rec320.db'
+        Import-CsvToSqlite -CsvPath (New-Csv320 'corp320.csv' "id,code,name`r`n1,ACME,Acme Inc") -Database $db -TableName corp | Out-Null
+        Import-CsvToSqlite -CsvPath (New-Csv320 'branch320.csv' "id,corp_code,city`r`n1,ACME,Paris`r`n2,ACME,Rome") -Database $db -TableName branch | Out-Null
+        Confirm-DbForeignKey -Database $db -From branch -Column corp_code -To corp -RefColumn code | Out-Null
+        Export-DynamicModelsFromCatalog -Database $db | Out-Null
+        Set-DynamicORMClass
+        $rec = New-DynamicRecord -Table 'corp' -Database $db
+
+        $all = @($rec.All())
+        $all.Count | Should -Be 1
+        $all[0].GetType().Name | Should -Match '^DynamicCorp(_[0-9a-f]{8})?$'
+        $all[0].Id | Should -Be 1
+        $all[0].GetAttribute('name') | Should -Be 'Acme Inc'
+        $plain = @($rec.AllRows())
+        $plain[0].GetType().Name | Should -Be 'PSCustomObject'
+        $plain[0].name | Should -Be 'Acme Inc'
+
+        $parent = $rec.FindById(1)
+        $kids = @($parent.GetHasMany('branch'))
+        $kids.Count | Should -Be 2
+        @($kids | ForEach-Object { $_.GetAttribute('city') }) | Should -Be @('Paris', 'Rome')
+        $kids[0].GetBelongsTo('corp').GetAttribute('code') | Should -Be 'ACME'
+    }
+
+    It 'the documented import rules hold: -WhatIf, the id unique index, punctuation in names and -Scalar' {
+        $wdb = Join-Path $script:Root320 'whatif320.db'
+        $ret = Import-CsvToSqlite -CsvPath $script:Assets320 -Database $wdb -TableName assets -WhatIf
+        @($ret) | Should -Be @('id', 'hostname', 'ip')
+        @(Invoke-DbQuery -Database $wdb -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='assets'").Count | Should -Be 0
+
+        $idb = Join-Path $script:Root320 'idcol320.db'
+        Import-CsvToSqlite -CsvPath (New-Csv320 'noid320.csv' "hostname,ip`r`nserver01,10.0.0.1") -Database $idb -TableName t | Out-Null
+        $withId = New-Csv320 'withid320.csv' "id,hostname,ip`r`n5,server05,10.0.0.5"
+        Import-CsvToSqlite -CsvPath $withId -Database $idb -TableName t | Out-Null
+        $idInfo = @(Invoke-DbQuery -Database $idb -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'id' }
+        [int]$idInfo.pk | Should -Be 0
+        @(Invoke-DbQuery -Database $idb -Query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='t'" | ForEach-Object { [string]$_.name }) |
+            Should -Contain 'ux_t_id'
+        { Import-CsvToSqlite -CsvPath $withId -Database $idb -TableName t } | Should -Throw -ExpectedMessage '*UNIQUE constraint failed*'
+
+        $pdb = Join-Path $script:Root320 'punct320.db'
+        Import-CsvToSqlite -CsvPath (New-Csv320 'punct320.csv' "Cost (USD),50%,A/B`r`n10,20,30") -Database $pdb -TableName punct | Out-Null
+        @(Invoke-DbQuery -Database $pdb -Query 'PRAGMA table_info(punct)' | ForEach-Object { [string]$_.name }) |
+            Should -Be @('Cost (USD)', '50%', 'A/B')
+        { ConvertTo-Ident ('bad' + [char]0 + 'name') } | Should -Throw -ExpectedMessage '*contains control characters*'
+
+        ($null -eq (Invoke-DbQuery -Database $pdb -Query 'SELECT NULL AS x' -Scalar)) | Should -BeTrue
+        ($null -eq (Invoke-DbQuery -Database $pdb -Query "SELECT [50%] FROM punct WHERE [50%] = -1" -Scalar)) | Should -BeTrue
+    }
+
+    It 'Confirm-DbForeignKey refuses dirty data, -Force records it and Remove-DbForeignKey cleans up' {
+        $db = Join-Path $script:Root320 'fk320.db'
+        Import-CsvToSqlite -CsvPath (New-Csv320 'p320.csv' "id,name`r`n1,one") -Database $db -TableName p | Out-Null
+        Import-CsvToSqlite -CsvPath (New-Csv320 'c320.csv' "id,p_id`r`n1,1`r`n2,99") -Database $db -TableName ch | Out-Null
+        { Confirm-DbForeignKey -Database $db -From ch -Column p_id -To p } |
+            Should -Throw -ExpectedMessage '*value that is not in p.id*'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='trigger'").Count | Should -Be 0
+        Confirm-DbForeignKey -Database $db -From ch -Column p_id -To p -Force -WarningAction SilentlyContinue | Out-Null
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='trigger'").Count | Should -Be 3
+        $dropped = @(Remove-DbForeignKey -Database $db -From ch -Column p_id)
+        $dropped.Count | Should -Be 3
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='trigger'").Count | Should -Be 0
+        @(Remove-DbForeignKey -Database $db -From ch -Column p_id).Count | Should -Be 0
+    }
+
+    It 'Test-DbTransaction reports the state of the pooled connection' {
+        $db = Join-Path $script:Root320 'tx320.db'
+        Import-CsvToSqlite -CsvPath $script:Assets320 -Database $db -TableName assets | Out-Null
+        Test-DbTransaction -Database $db | Should -BeFalse
+        $tx = Start-DbTransaction -Database $db
+        if ($tx) {
+            Test-DbTransaction -Database $db | Should -BeTrue
+            Complete-DbTransaction -Database $db
+        }
+        Test-DbTransaction -Database $db | Should -BeFalse
+    }
+
+    It 'both documents describe the behaviour this build has' {
+        foreach ($doc in @($script:Readme320, $script:Help320)) {
+            $doc | Should -Match 'AllRows'
+            $doc | Should -Match 'Remove-DbForeignKey'
+            $doc | Should -Match 'Test-DbTransaction'
+            $doc | Should -Match 'NullTokens'
+            $doc | Should -Match 'BoolTokens'
+            $doc | Should -Match '999'
+            $doc | Should -Match ([regex]::Escape('ux_<table>_id'))
+            $doc | Should -Match 'control characters'
+            $doc | Should -Match 'defaults to INFO'
+            $doc | Should -Match '-Force'
+            $doc | Should -Match ([regex]::Escape('-WhatIf'))
+        }
+        $script:Readme320 | Should -Match ([regex]::Escape('Join(<table>, <on>, <type>, <foreign key column>)'))
+        $script:Help320 | Should -Match ([regex]::Escape('Join(<table>, <on>, <type>, <foreign key>)'))
     }
 }
