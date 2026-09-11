@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001; round 2 TASK B5: E2E1-011, E2E1-020, E2E1-026, E2E1-027; round 2 TASK B6: E2E1-013; round 2 TASK B7: E2E1-021)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -410,5 +410,515 @@ Describe 'Import-CsvToSqlite Strict mode requires an existing table' -Tag 'BUG-0
         Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'fresh' -SchemaMode Relaxed | Out-Null
         $count = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM fresh' | Select-Object -First 1
         [int]$count.c | Should -Be 1
+    }
+}
+
+Describe 'Relaxed import that rebuilds a table to widen a column' -Tag 'E2E1-001' {
+    It 'widens a table that a Confirm-DbForeignKey ON DELETE trigger on the parent refers to' {
+        $db = New-TestDbPath -Name 'e2e1001a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE parent (id INTEGER PRIMARY KEY, t TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE prices (id INTEGER PRIMARY KEY, parent_id INTEGER, amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO parent(id,t) VALUES(1,'p')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,parent_id,amount) VALUES(1,1,1.5)' -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $db -From 'prices' -Column 'parent_id' -To 'parent' -OnDelete 'CASCADE'
+
+        # 'unpriced' is inferred TEXT, so Relaxed widens the declared REAL column and rebuilds the
+        # table. The ON DELETE trigger lives on 'parent' and names 'prices', so before the fix the
+        # rename inside the rebuild failed on SQLite 3.25+ after 'prices' had already been dropped.
+        # (E2E1-011: a value such as '10.0' no longer widens a declared REAL column - it is only a
+        # different spelling of a number - so this case needs genuinely textual data.)
+        $csv = New-TestCsv -Name 'e2e1001a.csv' -Lines @('id,parent_id,amount', '3,1,unpriced')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode Relaxed } | Should -Not -Throw
+
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)')
+        ($info | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'TEXT'
+        $rows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM prices' | Select-Object -First 1
+        [int]$rows.c | Should -Be 2
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%__widen_tmp'").Count | Should -Be 0
+
+        # every foreign key trigger survived the rebuild, including the one on the parent table
+        $triggers = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name" | ForEach-Object { [string]$_.name })
+        $triggers | Should -Contain 'trg_fk_prices_parent_id_check'
+        $triggers | Should -Contain 'trg_fk_prices_parent_id_check_upd'
+        $triggers | Should -Contain 'trg_fk_prices_parent_id_ondelete'
+
+        # and they still enforce the relationship
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,parent_id,amount) VALUES(9,777,1)' -NonQuery } | Should -Throw
+        Invoke-DbQuery -Database $db -Query 'DELETE FROM parent WHERE id=1' -NonQuery | Out-Null
+        $afterCascade = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM prices' | Select-Object -First 1
+        [int]$afterCascade.c | Should -Be 0
+    }
+
+    It 'rolls a failed rebuild back instead of leaving the connection inside an aborted transaction' {
+        $db = New-TestDbPath -Name 'e2e1001b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
+        # an index already holding the name the rebuild needs for its temporary table makes the
+        # CREATE TABLE inside the rebuild fail, after the batch has opened its savepoint
+        Invoke-DbQuery -Database $db -Query 'CREATE INDEX "t__widen_tmp" ON t(v)' -NonQuery | Out-Null
+
+        $csv = New-TestCsv -Name 'e2e1001b.csv' -Lines @('id,v', '2,abc')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Throw
+
+        # the original table is untouched
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'v' }).type | Should -Be 'REAL'
+        $kept = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$kept.c | Should -Be 1
+
+        # the pooled connection is no longer inside the transaction the failed batch opened
+        $txError = $null
+        $tx = $null
+        try { $tx = Start-DbTransaction -Database $db } catch { $txError = $_ }
+        $txError | Should -BeNullOrEmpty
+        if ($tx) { Undo-DbTransaction -Database $db -Transaction $tx }
+
+        # a write made after the failure is committed instead of being discarded on close
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE later (x INTEGER)' -NonQuery | Out-Null
+        Close-DbConnections
+        $later = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='later'" | Select-Object -First 1
+        [int]$later.c | Should -Be 1
+    }
+
+    It 'widens a table inside a transaction the caller already opened' {
+        $db = New-TestDbPath -Name 'e2e1001c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
+
+        $tx = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE userwork (x INTEGER)' -NonQuery -Transaction $tx | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO userwork(x) VALUES(42)' -NonQuery -Transaction $tx | Out-Null
+
+        # the rebuild must nest inside the caller's transaction (SAVEPOINT), not try to BEGIN a
+        # second one, and it must never roll the caller's transaction back
+        $csv = New-TestCsv -Name 'e2e1001c.csv' -Lines @('id,v', '2,abc')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Not -Throw
+
+        Complete-DbTransaction -Database $db -Transaction $tx
+        Close-DbConnections
+
+        $survived = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='userwork'" | Select-Object -First 1
+        [int]$survived.c | Should -Be 1
+        $rows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM userwork' | Select-Object -First 1
+        [int]$rows.c | Should -Be 1
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'v' }).type | Should -Be 'TEXT'
+        $tRows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$tRows.c | Should -Be 2
+    }
+
+    It 'keeps the caller transaction usable when the rebuild itself fails' {
+        $db = New-TestDbPath -Name 'e2e1001d'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE INDEX "t__widen_tmp" ON t(v)' -NonQuery | Out-Null
+
+        $tx = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE userwork (x INTEGER)' -NonQuery -Transaction $tx | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO userwork(x) VALUES(42)' -NonQuery -Transaction $tx | Out-Null
+
+        $csv = New-TestCsv -Name 'e2e1001d.csv' -Lines @('id,v', '2,abc')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Throw
+
+        # the cleanup rolls back to the rebuild's own savepoint only, so the caller can still commit
+        { Complete-DbTransaction -Database $db -Transaction $tx } | Should -Not -Throw
+        Close-DbConnections
+
+        $survived = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='userwork'" | Select-Object -First 1
+        [int]$survived.c | Should -Be 1
+        $rows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM userwork' | Select-Object -First 1
+        [int]$rows.c | Should -Be 1
+        # and the failed rebuild left the table exactly as it was
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'v' }).type | Should -Be 'REAL'
+        $tRows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$tRows.c | Should -Be 1
+        # foreign key enforcement was restored on the pooled connection
+        $fk = Invoke-DbQuery -Database $db -Query 'PRAGMA foreign_keys' | Select-Object -First 1
+        "$($fk.foreign_keys)" | Should -Be '1'
+    }
+}
+
+Describe 'Import-CsvToSqlite bool token normalisation needs evidence' -Tag 'E2E1-002' {
+    It 'keeps a single bool token as ordinary text instead of rewriting the column to 1/0' {
+        $csv = New-TestCsv -Name 'e2e1002a.csv' -Lines @('id,initial,code', '1,Y,NO')
+        $db = New-TestDbPath -Name 'e2e1002a'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT initial, code FROM t' | Select-Object -First 1
+        $row.initial | Should -Be 'Y'
+        $row.code | Should -Be 'NO'
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        ($info | Where-Object { $_.name -eq 'initial' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'code' }).type | Should -Be 'TEXT'
+    }
+    It 'does not re-encode an append into a column the table already declares TEXT' {
+        $csv1 = New-TestCsv -Name 'e2e1002b1.csv' -Lines @('answer,name', 'yes,a', 'maybe,b')
+        $csv2 = New-TestCsv -Name 'e2e1002b2.csv' -Lines @('answer,name', 'no,c')
+        $db = New-TestDbPath -Name 'e2e1002b'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode Strict | Out-Null
+        $answers = @(Invoke-DbQuery -Database $db -Query 'SELECT answer FROM t ORDER BY name' | ForEach-Object { "$($_.answer)" })
+        $answers -join ',' | Should -Be 'yes,maybe,no'
+    }
+    It 'still converts a column that shows both a true and a false token' {
+        $csv = New-TestCsv -Name 'e2e1002c.csv' -Lines @('id,flag', '1,yes', '2,no')
+        $db = New-TestDbPath -Name 'e2e1002c'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $flags = @(Invoke-DbQuery -Database $db -Query 'SELECT flag FROM t ORDER BY id' | ForEach-Object { "$($_.flag)" })
+        $flags -join ',' | Should -Be '1,0'
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'flag' }).type | Should -Be 'INTEGER'
+    }
+    It 'still converts a one-sided append into a column the table already declares INTEGER' {
+        $csv1 = New-TestCsv -Name 'e2e1002d1.csv' -Lines @('id,flag', '1,yes', '2,no')
+        $csv2 = New-TestCsv -Name 'e2e1002d2.csv' -Lines @('id,flag', '3,yes')
+        $db = New-TestDbPath -Name 'e2e1002d'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode Strict | Out-Null
+        # the column keeps its INTEGER type - the append is not widened back to TEXT
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'flag' }).type | Should -Be 'INTEGER'
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT flag, typeof(flag) AS tf FROM t WHERE id=3' | Select-Object -First 1
+        [int]$row.flag | Should -Be 1
+        $row.tf | Should -Be 'integer'
+    }
+}
+
+Describe 'Import-CsvToSqlite honours -WhatIf' -Tag 'E2E1-004' {
+    It 'declares -WhatIf of its own' {
+        (Get-Command Import-CsvToSqlite).Parameters.ContainsKey('WhatIf') | Should -BeTrue
+    }
+    It 'writes no rows, no table and no catalog with -WhatIf' {
+        $csv = New-TestCsv -Name 'e2e1004a.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'e2e1004a'
+        $headers = @(Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WhatIf)
+        $headers -join ',' | Should -Be 'id,name'
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table'" | ForEach-Object { [string]$_.name })
+        $tables | Should -Not -Contain 't'
+        $tables | Should -Not -Contain '__tables__'
+    }
+    It 'writes no rows when $WhatIfPreference is set globally' {
+        $csv = New-TestCsv -Name 'e2e1004b.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'e2e1004b'
+        $previous = $global:WhatIfPreference
+        $global:WhatIfPreference = $true
+        try { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null }
+        finally { $global:WhatIfPreference = $previous }
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table'" | ForEach-Object { [string]$_.name })
+        $tables | Should -Not -Contain 't'
+        $tables | Should -Not -Contain '__tables__'
+    }
+    It 'still imports and catalogs normally without -WhatIf' {
+        $csv = New-TestCsv -Name 'e2e1004c.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'e2e1004c'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 2
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) FROM __tables__ WHERE table_name='t'" -Scalar) | Should -Be 1
+    }
+}
+
+Describe 'Import-CsvToSqlite keeps ids unique when the id column arrives later' -Tag 'E2E1-009' {
+    It 'refuses a re-import of the same ids after the id column was added by ALTER TABLE' {
+        $csv1 = New-TestCsv -Name 'e2e1009a1.csv' -Lines @('hostname,ip', 'first,1.1.1.1')
+        $csv2 = New-TestCsv -Name 'e2e1009a2.csv' -Lines @('id,hostname,ip', '1,a,2.2.2.2', '2,b,3.3.3.3')
+        $db = New-TestDbPath -Name 'e2e1009a'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' } | Should -Throw
+        $ids = @(Invoke-DbQuery -Database $db -Query 'SELECT id FROM t' | ForEach-Object { "$($_.id)" })
+        $ids -join ',' | Should -Be ',1,2'
+        # the column is still a plain INTEGER (ALTER TABLE cannot add a primary key); the
+        # uniqueness lives in an index instead
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'id' }).type | Should -Be 'INTEGER'
+        $unique = @(Invoke-DbQuery -Database $db -Query 'PRAGMA index_list(t)' | Where-Object { [int]$_.unique -eq 1 })
+        $unique.Count | Should -BeGreaterThan 0
+    }
+    It 'rejects duplicate ids inside the very file that adds the id column' {
+        $csv1 = New-TestCsv -Name 'e2e1009b1.csv' -Lines @('hostname', 'first')
+        $csv2 = New-TestCsv -Name 'e2e1009b2.csv' -Lines @('id,hostname', '1,a', '1,b')
+        $db = New-TestDbPath -Name 'e2e1009b'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' } | Should -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 1
+    }
+    It 'still lets rows that predate the id column keep a null id' {
+        $csv1 = New-TestCsv -Name 'e2e1009c1.csv' -Lines @('name,qty', 'x,1', 'y,2')
+        $csv2 = New-TestCsv -Name 'e2e1009c2.csv' -Lines @('id,name,qty', '7,z,9')
+        $db = New-TestDbPath -Name 'e2e1009c'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'n' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'n' } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM n' -Scalar) | Should -Be 3
+    }
+}
+
+Describe 'Import-CsvToSqlite undoes its schema changes when the import fails' -Tag 'E2E1-012' {
+    It 'leaves no added column behind when the inserts fail' {
+        $csv1 = New-TestCsv -Name 'e2e1012a1.csv' -Lines @('id,name', '1,a')
+        $csv2 = New-TestCsv -Name 'e2e1012a2.csv' -Lines @('id,name,extra', '1,dup,zzz')
+        $db = New-TestDbPath -Name 'e2e1012a'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        $before = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' } | Should -Throw
+        $after = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        $after | Should -Be $before
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 1
+        # the failed import must not have made the column exist for a later AppendOnly run
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode AppendOnly } | Should -Throw '*AppendOnly mode: column extra does not exist*'
+    }
+    It 'leaves no table behind when the first import into a new table fails' {
+        $csv = New-TestCsv -Name 'e2e1012b.csv' -Lines @('id,name', '1,a', '1,b')
+        $db = New-TestDbPath -Name 'e2e1012b'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'newt' } | Should -Throw
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='newt'")
+        $tables.Count | Should -Be 0
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'newt' -SchemaMode Strict } | Should -Throw "*Strict mode: table 'newt' does not exist*"
+    }
+    It 'still commits the schema change when the import succeeds' {
+        $csv1 = New-TestCsv -Name 'e2e1012c1.csv' -Lines @('id,name', '1,a')
+        $csv2 = New-TestCsv -Name 'e2e1012c2.csv' -Lines @('id,name,extra', '2,b,zzz')
+        $db = New-TestDbPath -Name 'e2e1012c'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' | Out-Null
+        $cols = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        $cols | Should -Be 'id|name|extra'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 2
+    }
+}
+
+Describe 'Import-CsvToSqlite keeps a declared numeric column numeric when decimals are spelled with a trailing zero' -Tag 'E2E1-011' {
+    It 'does not rewrite a declared REAL column to TEXT in Relaxed mode' {
+        $db = New-TestDbPath -Name 'e2e1011a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE prices (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,amount) VALUES(1,1.5),(2,2.25)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011a.csv' -Lines @('amount', '10.0', '20.0')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode Relaxed | Out-Null
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)')
+        ($info | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'REAL'
+        # the value that was already stored is still a number, not the string '1.5'
+        $old = Invoke-DbQuery -Database $db -Query 'SELECT amount, typeof(amount) AS ta FROM prices WHERE id=1' | Select-Object -First 1
+        $old.ta | Should -Be 'real'
+        [double]$old.amount | Should -Be 1.5
+        # and the imported rows are stored as numbers too, so SUM and ORDER BY keep working
+        $sum = Invoke-DbQuery -Database $db -Query 'SELECT SUM(amount) AS s FROM prices' | Select-Object -First 1
+        [double]$sum.s | Should -Be 33.75
+    }
+    It 'appends such a file in AppendOnly mode instead of refusing it' {
+        $db = New-TestDbPath -Name 'e2e1011b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE prices (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,amount) VALUES(1,1.5)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011b.csv' -Lines @('amount', '10.0', '20.0')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode AppendOnly } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM prices' -Scalar) | Should -Be 3
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)') | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'REAL'
+    }
+    It 'still widens a declared REAL column when the CSV really contains text, and warns about it' {
+        $db = New-TestDbPath -Name 'e2e1011c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO p(amount) VALUES(1.5)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011c.csv' -Lines @('amount', 'unpriced')
+        $warnings = @()
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'p' -SchemaMode Relaxed -WarningVariable warnings -WarningAction SilentlyContinue | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(p)') | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'TEXT'
+        ($warnings -join ' ') | Should -BeLike "*column 'amount'*REAL to TEXT*"
+    }
+    It 'still refuses genuinely textual values for a declared REAL column in AppendOnly mode' {
+        $db = New-TestDbPath -Name 'e2e1011d'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (amount REAL)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011d.csv' -Lines @('amount', 'unpriced')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'p' -SchemaMode AppendOnly } | Should -Throw '*declared REAL but the CSV contains TEXT*'
+    }
+    It 'widens a declared INTEGER column only as far as REAL for decimal values' {
+        $db = New-TestDbPath -Name 'e2e1011e'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (n INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO p(n) VALUES(7)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011e.csv' -Lines @('n', '10.0')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'p' -SchemaMode Relaxed -WarningAction SilentlyContinue | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(p)') | Where-Object { $_.name -eq 'n' }).type | Should -Be 'REAL'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM p' -Scalar) | Should -Be 2
+    }
+    It 'still stores a trailing-zero decimal as TEXT in a column the table does not have yet' {
+        $db = New-TestDbPath -Name 'e2e1011f'
+        $csv = New-TestCsv -Name 'e2e1011f.csv' -Lines @('id,version', '1,1.10', '2,1.0')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'v' | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(v)') | Where-Object { $_.name -eq 'version' }).type | Should -Be 'TEXT'
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT version FROM v ORDER BY id' | ForEach-Object { "$($_.version)" })
+        $rows -join ',' | Should -Be '1.10,1.0'
+    }
+}
+
+Describe 'Import-CsvToSqlite refuses a CSV wider than the SQLite parameter limit' -Tag 'E2E1-020' {
+    It 'names the real cause and creates nothing when the CSV has more than 999 columns' {
+        $db = New-TestDbPath -Name 'e2e1020a'
+        $cols = ((1..1000) | ForEach-Object { "c$_" }) -join ','
+        $vals = ((1..1000) | ForEach-Object { "v$_" }) -join ','
+        $csv = New-TestCsv -Name 'e2e1020a.csv' -Lines @($cols, $vals)
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'wide' } | Should -Throw '*1000 columns*at most 999 parameters*'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='wide'").Count | Should -Be 0
+    }
+    It 'still imports a CSV with exactly 999 columns' {
+        $db = New-TestDbPath -Name 'e2e1020b'
+        $cols = ((1..999) | ForEach-Object { "c$_" }) -join ','
+        $vals = ((1..999) | ForEach-Object { "v$_" }) -join ','
+        $csv = New-TestCsv -Name 'e2e1020b.csv' -Lines @($cols, $vals)
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'wide9' } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM wide9' -Scalar) | Should -Be 1
+    }
+}
+
+Describe 'Import-CsvToSqlite rejects a header with a nameless column' -Tag 'E2E1-026' {
+    It 'throws instead of importing the column as H1' {
+        $db = New-TestDbPath -Name 'e2e1026a'
+        $csv = New-TestCsv -Name 'e2e1026a.csv' -Lines @(',b', 'val1,val2')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WarningAction SilentlyContinue } |
+            Should -Throw '*empty column name*'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='t'").Count | Should -Be 0
+    }
+    It 'throws for a header field that is only whitespace' {
+        $db = New-TestDbPath -Name 'e2e1026b'
+        $csv = New-TestCsv -Name 'e2e1026b.csv' -Lines @('   ,b', 'val1,val2')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WarningAction SilentlyContinue } |
+            Should -Throw '*empty column name*'
+    }
+    It 'throws for a nameless column in a header-only CSV' {
+        $db = New-TestDbPath -Name 'e2e1026c'
+        $csv = New-TestCsv -Name 'e2e1026c.csv' -Lines @('a,,c')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WarningAction SilentlyContinue } |
+            Should -Throw '*empty column name*'
+    }
+    It 'still imports a header whose names are quoted or padded' {
+        $db = New-TestDbPath -Name 'e2e1026d'
+        $csv = New-TestCsv -Name 'e2e1026d.csv' -Lines @('"first name",  second  ', 'a,b')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Not -Throw
+        $cols = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        $cols | Should -Be 'first name|second'
+    }
+}
+
+Describe 'Import-CsvToSqlite trims the table name' -Tag 'E2E1-027' {
+    It 'does not create a second table for a name that differs only by surrounding whitespace' {
+        $db = New-TestDbPath -Name 'e2e1027a'
+        $csv1 = New-TestCsv -Name 'e2e1027a1.csv' -Lines @('a', '1')
+        $csv2 = New-TestCsv -Name 'e2e1027a2.csv' -Lines @('a', '2')
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'spaced ' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'spaced' | Out-Null
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'spaced%'" | ForEach-Object { [string]$_.name })
+        $tables.Count | Should -Be 1
+        $tables[0] | Should -Be 'spaced'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM spaced' -Scalar) | Should -Be 2
+    }
+    It 'records the trimmed name in the catalog' {
+        $db = New-TestDbPath -Name 'e2e1027b'
+        $csv = New-TestCsv -Name 'e2e1027b.csv' -Lines @('a', '1')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName ' padded ' | Out-Null
+        $cat = @(Invoke-DbQuery -Database $db -Query "SELECT table_name FROM __tables__ WHERE table_name LIKE '%padded%'" | ForEach-Object { [string]$_.table_name })
+        $cat.Count | Should -Be 1
+        $cat[0] | Should -Be 'padded'
+    }
+    It 'throws when the table name is only whitespace' {
+        $db = New-TestDbPath -Name 'e2e1027c'
+        $csv = New-TestCsv -Name 'e2e1027c.csv' -Lines @('a', '1')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName '   ' } | Should -Throw '*TableName is empty*'
+    }
+}
+
+Describe 'Import-CsvToSqlite refuses a cell containing a NUL character' -Tag 'E2E1-013' {
+    It 'names the column and row instead of storing the value truncated at the NUL' {
+        $db = New-TestDbPath -Name 'e2e1013imp'
+        $csv = New-TestCsv -Name 'e2e1013imp.csv' -Lines @('id,note', ('1,a' + [char]0 + 'b'))
+        # sanity: the CSV reader keeps the NUL, so the loss used to happen at bind time
+        $cell = [string](@(Import-Csv -LiteralPath $csv)[0].note)
+        $cell.Length | Should -Be 3
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'nulrows' } |
+            Should -Throw "*column 'note' in row 1*NUL character*"
+        # the aborted import must not leave a partial (truncated) row behind
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='nulrows'")
+        if ($tables.Count -gt 0) {
+            [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM nulrows' -Scalar) | Should -Be 0
+        }
+        Close-DbConnections
+    }
+
+    It 'imports the same CSV normally once the NUL is removed' {
+        $db = New-TestDbPath -Name 'e2e1013imp2'
+        $csv = New-TestCsv -Name 'e2e1013imp2.csv' -Lines @('id,note', '1,ab')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'nulrows2' | Out-Null
+        (Invoke-DbQuery -Database $db -Query 'SELECT note FROM nulrows2' -Scalar) | Should -Be 'ab'
+        Close-DbConnections
+    }
+}
+
+Describe 'Import-CsvToSqlite accepts ordinary punctuation in CSV headers' -Tag 'E2E1-021' {
+    BeforeAll {
+        # Parentheses, brackets, percent, slash, plus, question mark, dollar and an apostrophe:
+        # every one of these used to abort the whole import with "contains illegal characters".
+        $script:e2e1021Lines = @(
+            'id,Cost (USD),50%,A/B,O''Brien,Weight [kg],Done?,name+alias,price$',
+            '1,1.50,2,x,y,7,yes,al,9',
+            '2,2.50,3,z,w,8,no,bo,10')
+        $script:e2e1021Csv = New-TestCsv -Name 'e2e1021.csv' -Lines $script:e2e1021Lines
+        $script:e2e1021Db = New-TestDbPath -Name 'e2e1021'
+    }
+    It 'creates the table and stores every value under its real column name' {
+        $headers = @(Import-CsvToSqlite -CsvPath $script:e2e1021Csv -Database $script:e2e1021Db -TableName 'costs')
+        $headers | Should -Contain 'Cost (USD)'
+        $headers | Should -Contain "O'Brien"
+        $row = Invoke-DbQuery -Database $script:e2e1021Db -Query 'SELECT * FROM costs WHERE id = 1' | Select-Object -First 1
+        [double]$row.'Cost (USD)' | Should -Be 1.5
+        [int]$row.'50%' | Should -Be 2
+        [string]$row.'A/B' | Should -Be 'x'
+        [string]$row."O'Brien" | Should -Be 'y'
+        [int]$row.'Weight [kg]' | Should -Be 7
+        [string]$row.'name+alias' | Should -Be 'al'
+        [int]$row.'price$' | Should -Be 9
+    }
+    It 'catalogs the punctuated columns under their real names' {
+        $cols = @(Invoke-DbQuery -Database $script:e2e1021Db -Query "SELECT column_name FROM __columns__ WHERE table_name='costs'" | ForEach-Object { [string]$_.column_name })
+        $cols | Should -Contain 'Cost (USD)'
+        $cols | Should -Contain "O'Brien"
+        $cols | Should -Contain 'A/B'
+        $cols | Should -Contain '50%'
+    }
+    It 'a Strict re-import matches the punctuated columns and appends' {
+        $csv2 = New-TestCsv -Name 'e2e1021b.csv' -Lines @($script:e2e1021Lines[0], '3,3.50,4,q,r,9,yes,co,11')
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $script:e2e1021Db -TableName 'costs' -SchemaMode Strict | Out-Null } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $script:e2e1021Db -Query 'SELECT COUNT(*) AS c FROM costs')[0].c | Should -Be 3
+        [string](Invoke-DbQuery -Database $script:e2e1021Db -Query 'SELECT "A/B" FROM costs WHERE id = 3' -Scalar) | Should -Be 'q'
+        Close-DbConnections
+    }
+    It 'a header carrying a control character is still refused, and nothing is created' {
+        $db = New-TestDbPath -Name 'e2e1021ctl'
+        $csv = New-TestCsv -Name 'e2e1021ctl.csv' -Lines @(('id,bad' + [char]1 + 'name'), '1,v')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'ctltbl' } | Should -Throw '*control characters*'
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='ctltbl'")[0].c | Should -Be 0
+        Close-DbConnections
+    }
+}
+
+Describe 'punctuated names survive the paths an import feeds' -Tag 'E2E1-021' {
+    It 'Find-DbRelationships still works after importing a table whose name contains a bracket' {
+        # Two ordinary imports were enough to break Find-DbRelationships for the whole database:
+        # the table name became a PowerShell -like pattern, and '[' made that pattern invalid.
+        $db = New-TestDbPath -Name 'e2e1021rel'
+        $parentCsv = New-TestCsv -Name 'e2e1021rel_p.csv' -Lines @('id,name', '1,HQ')
+        $childCsv = New-TestCsv -Name 'e2e1021rel_c.csv' -Lines @('id,Dept [HQ_id', '1,1')
+        Import-CsvToSqlite -CsvPath $parentCsv -Database $db -TableName 'Dept [HQ' | Out-Null
+        Import-CsvToSqlite -CsvPath $childCsv -Database $db -TableName 'orders' | Out-Null
+        { Find-DbRelationships -Database $db | Out-Null } | Should -Not -Throw
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 1
+        $found[0].table_name | Should -Be 'orders'
+        $found[0].ref_table | Should -Be 'Dept [HQ'
+        $found[0].ref_column | Should -Be 'id'
+        Close-DbConnections
+    }
+    It 'a Relaxed re-import widens a column whose name contains a double quote' {
+        # The stored CREATE TABLE text doubles an embedded quote ("co""l"), so the rebuild's
+        # column-definition regex has to look for the doubled form; it used to look for the raw
+        # name and fail with "column definition not recognised".
+        $db = New-TestDbPath -Name 'e2e1021quote'
+        $first = New-TestCsv -Name 'e2e1021quote_a.csv' -Lines @('id,"co""l"', '1,5')
+        $second = New-TestCsv -Name 'e2e1021quote_b.csv' -Lines @('id,"co""l"', '2,text-value')
+        Import-CsvToSqlite -CsvPath $first -Database $db -TableName 'q5' | Out-Null
+        (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info("q5")' | Where-Object { $_.name -eq 'co"l' })[0].type) | Should -Be 'INTEGER'
+        { Import-CsvToSqlite -CsvPath $second -Database $db -TableName 'q5' -SchemaMode Relaxed -WarningAction SilentlyContinue | Out-Null } | Should -Not -Throw
+        (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info("q5")' | Where-Object { $_.name -eq 'co"l' })[0].type) | Should -Be 'TEXT'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM q5')[0].c | Should -Be 2
+        [string](Invoke-DbQuery -Database $db -Query 'SELECT "co""l" FROM q5 WHERE id = 2' -Scalar) | Should -Be 'text-value'
+        Close-DbConnections
     }
 }

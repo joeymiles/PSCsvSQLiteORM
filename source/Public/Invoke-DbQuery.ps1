@@ -17,6 +17,22 @@ function Invoke-DbQuery {
         Write-DbLog DEBUG "SQL: $Query | ParamNames: $paramNames"
     }
 
+    # BUG-E2E1-013: both the System.Data.SQLite path and the PSSQLite fallback marshal a string
+    # parameter as a NUL-terminated UTF-8 buffer, so a value containing U+0000 is stored truncated
+    # at the NUL with no error or warning. Fail loudly rather than write a corrupted row.
+    if ($SqlParameters) {
+        foreach ($k in @($SqlParameters.Keys)) {
+            $pv = $SqlParameters[$k]
+            if ($pv -is [char]) { $pv = [string]$pv }
+            if ($pv -is [string]) {
+                $nulAt = $pv.IndexOf([char]0)
+                if ($nulAt -ge 0) {
+                    throw "Invoke-DbQuery: parameter '$k' contains a NUL character (U+0000) at index $nulAt. SQLite text parameters cannot carry an embedded NUL - the value would be stored silently truncated. Remove the NUL, or pass the value as a byte array to store it as a BLOB."
+                }
+            }
+        }
+    }
+
     $conn = Get-DbConnection -Database $Database
     if ($conn -and $conn.State -eq 'Open') {
         $cmd = $conn.CreateCommand(); $cmd.CommandText = $Query
@@ -27,7 +43,15 @@ function Invoke-DbQuery {
             }
         }
         try {
-            if ($Scalar) { return $cmd.ExecuteScalar() }
+            if ($Scalar) {
+                # BUG-E2E1-019: ExecuteScalar returns [System.DBNull]::Value when the selected cell
+                # is SQL NULL and $null only when there are no rows at all. Map DBNull to $null so
+                # -Scalar has a single representation of "nothing" and matches the row path
+                # (ConvertFrom-DbDataTable) and the PSSQLite fallback.
+                $scalarValue = $cmd.ExecuteScalar()
+                if ($scalarValue -is [System.DBNull]) { return $null }
+                return $scalarValue
+            }
             elseif ($NonQuery) { return $cmd.ExecuteNonQuery() }
             else {
                 $dt = New-Object System.Data.DataTable
@@ -59,7 +83,13 @@ function Invoke-DbQuery {
                 $q = @(Invoke-SqliteQuery -DataSource $Database -Query ($fkPrefix + $Query) -SqlParameters $SqlParameters -ErrorAction Stop)
                 if ($q.Count -gt 0) {
                     $firstProp = $q[0].PSObject.Properties | Select-Object -First 1
-                    if ($firstProp) { return $firstProp.Value } else { return $null }
+                    # BUG-E2E1-019: normalise DBNull to $null here too, so both paths agree.
+                    if ($firstProp) {
+                        $scalarValue = $firstProp.Value
+                        if ($scalarValue -is [System.DBNull]) { return $null }
+                        return $scalarValue
+                    }
+                    else { return $null }
                 }
                 else { return $null }
             }

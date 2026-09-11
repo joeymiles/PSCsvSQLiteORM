@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014; TASK B6 round 2: E2E1-013, E2E1-019; TASK B7 round 2: E2E1-021; TASK B8 round 2: E2E1-022)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -600,12 +600,18 @@ Describe 'Update-DbCatalog skips tables whose names ConvertTo-Ident rejects' -Ta
     BeforeAll {
         $script:b043Db = New-CoreDbPath -Name 'b043'
         Invoke-DbQuery -Database $script:b043Db -Query 'CREATE TABLE "t$1"(id INTEGER PRIMARY KEY, x TEXT)' -NonQuery | Out-Null
+        # E2E1-021: '$' is quotable, so that table is cataloged now. A name ConvertTo-Ident still
+        # refuses needs a control character in it.
+        $script:b043Ctl = 'ctl' + [char]1 + 'x'
+        Invoke-DbQuery -Database $script:b043Db -Query ('CREATE TABLE "' + $script:b043Ctl + '"(id INTEGER PRIMARY KEY, x TEXT)') -NonQuery | Out-Null
     }
     It 'Import-CsvToSqlite succeeds and catalogs the new table' {
         { Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $script:b043Db | Out-Null } | Should -Not -Throw
         [int](Invoke-DbQuery -Database $script:b043Db -Query 'SELECT COUNT(*) AS c FROM vulns')[0].c | Should -Be 4
         [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='vulns'")[0].c | Should -Be 1
-        [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='t`$1'")[0].c | Should -Be 0
+        # The unquotable table is skipped; the merely punctuated one is cataloged (E2E1-021).
+        [int](Invoke-DbQuery -Database $script:b043Db -Query 'SELECT COUNT(*) AS c FROM __tables__ WHERE table_name=@t' -SqlParameters @{ t = $script:b043Ctl })[0].c | Should -Be 0
+        [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='t`$1'")[0].c | Should -Be 1
     }
     It 'Export-DynamicModelsFromCatalog does not throw for the whole database' {
         { Export-DynamicModelsFromCatalog -Database $script:b043Db | Out-Null } | Should -Not -Throw
@@ -653,7 +659,9 @@ Describe 'Confirm-DbForeignKey replaces stale triggers when a column is re-confi
     It 're-confirming against another table enforces only the new target' {
         $db = New-FkProbeDb
         Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete CASCADE
-        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To hosts -OnDelete 'NO ACTION'
+        # the existing vulns rows point at assets, not hosts, so -Force is needed to re-target the
+        # relationship over data that already violates it (E2E1-014)
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To hosts -OnDelete 'NO ACTION' -Force -WarningAction SilentlyContinue
         $names = Get-FkTriggerNames -Database $db
         $names | Should -Be @('trg_fk_vulns_asset_id_check', 'trg_fk_vulns_asset_id_check_upd', 'trg_fk_vulns_asset_id_ondelete')
         $checkSql = (Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE name='trg_fk_vulns_asset_id_check'")[0].sql
@@ -720,6 +728,174 @@ Describe 'Confirm-DbForeignKey validates the referenced table and column' -Tag '
     }
 }
 
+Describe 'Confirm-DbForeignKey never reuses the trigger names of another relationship' -Tag 'E2E1-007' {
+    BeforeAll {
+        # 'ab' + 'c_id' and 'ab_c' + 'id' both derive trg_fk_ab_c_id_check by plain concatenation.
+        function New-CollisionDb {
+            $db = New-CoreDbPath -Name 'e2e1007'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE ab (id INTEGER PRIMARY KEY, c_id INTEGER)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE ab_c (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO p(id) VALUES(1)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    It 'keeps the first relationship enforced after a colliding second one is confirmed' {
+        $db = New-CollisionDb
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab(id,c_id) VALUES(1,555)' -NonQuery | Out-Null } | Should -Throw
+
+        Confirm-DbForeignKey -Database $db -From ab_c -Column id -To p
+        # before the fix the second confirm dropped the ab triggers and this INSERT was accepted
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab(id,c_id) VALUES(2,555)' -NonQuery | Out-Null } | Should -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM ab WHERE c_id NOT IN (SELECT id FROM p)' | Should -Be 0
+    }
+
+    It 'enforces the second relationship as well, under six distinct trigger names' {
+        $db = New-CollisionDb
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p
+        Confirm-DbForeignKey -Database $db -From ab_c -Column id -To p
+        $names = Get-FkTriggerNames -Database $db
+        $names.Count | Should -Be 6
+        @($names | Sort-Object -Unique).Count | Should -Be 6
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab_c(id) VALUES(777)' -NonQuery | Out-Null } | Should -Throw
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab_c(id) VALUES(1)' -NonQuery | Out-Null } | Should -Not -Throw
+    }
+
+    It 're-confirming the same pair still replaces its own triggers in place' {
+        $db = New-CollisionDb
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p -OnDelete CASCADE
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+    }
+
+    It 'adopts the unmarked triggers an older build left for the same pair' {
+        $db = New-CoreDbPath -Name 'e2e1007legacy'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE lp (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE lq (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE lc (id INTEGER PRIMARY KEY, lp_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO lp(id) VALUES(1)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO lq(id) VALUES(2)' -NonQuery | Out-Null
+        # exactly what an earlier version of the module wrote: no ownership marker anywhere
+        Invoke-DbQuery -Database $db -Query "CREATE TRIGGER trg_fk_lc_lp_id_check BEFORE INSERT ON lc FOR EACH ROW BEGIN SELECT RAISE(ABORT,'old') WHERE NEW.lp_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM lp WHERE lp.id = NEW.lp_id); END;" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "CREATE TRIGGER trg_fk_lc_lp_id_check_upd BEFORE UPDATE OF lp_id ON lc FOR EACH ROW BEGIN SELECT RAISE(ABORT,'old') WHERE NEW.lp_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM lp WHERE lp.id = NEW.lp_id); END;" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TRIGGER trg_fk_lc_lp_id_ondelete BEFORE DELETE ON lp FOR EACH ROW BEGIN SELECT RAISE(ABORT,''old'') WHERE EXISTS (SELECT 1 FROM lc WHERE "lc"."lp_id" = OLD.id); END;' -NonQuery | Out-Null
+
+        Confirm-DbForeignKey -Database $db -From lc -Column lp_id -To lq
+        # the legacy set was replaced, not duplicated, and the new target is the one enforced
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO lc(id,lp_id) VALUES(1,2)' -NonQuery | Out-Null } | Should -Not -Throw
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO lc(id,lp_id) VALUES(2,1)' -NonQuery | Out-Null } | Should -Throw
+    }
+}
+
+Describe 'Foreign key triggers are removed when a relationship or one of its tables goes away' -Tag 'E2E1-008' {
+    BeforeAll {
+        function New-ParentChildDb {
+            $db = New-CoreDbPath -Name 'e2e1008'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE par (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE kid (id INTEGER PRIMARY KEY, par_id INTEGER)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO par(id) VALUES(1),(2)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    It 'Update-DbCatalog drops the parent-side trigger left behind by dropping the child table' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par -OnDelete CASCADE
+        Invoke-DbQuery -Database $db -Query 'DROP TABLE kid' -NonQuery | Out-Null
+        Update-DbCatalog -Database $db -Confirm:$false
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        # before the fix this threw "no such table: main.kid" for the rest of the database's life
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM par WHERE id=1' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM par' | Should -Be 1
+    }
+
+    It 'Update-DbCatalog drops the child-side triggers left behind by dropping the parent table' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par
+        Invoke-DbQuery -Database $db -Query 'DROP TABLE par' -NonQuery | Out-Null
+        Update-DbCatalog -Database $db -Confirm:$false
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO kid(id,par_id) VALUES(1,NULL)' -NonQuery | Out-Null } | Should -Not -Throw
+    }
+
+    It 'Update-DbCatalog leaves a healthy relationship alone' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par -OnDelete CASCADE
+        Update-DbCatalog -Database $db -Confirm:$false
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO kid(id,par_id) VALUES(1,99)' -NonQuery | Out-Null } | Should -Throw
+    }
+
+    It 'Remove-DbForeignKey drops the whole trigger set and the catalog row' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par -OnDelete CASCADE
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        $dropped = @(Remove-DbForeignKey -Database $db -From kid -Column par_id -Confirm:$false)
+        $dropped.Count | Should -Be 3
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='kid'" | Should -Be 0
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM par WHERE id=1' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM kid' | Should -Be 0
+    }
+
+    It 'Remove-DbForeignKey is idempotent and touches no other relationship' {
+        $db = New-ParentChildDb
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE other (id INTEGER PRIMARY KEY, par_id INTEGER)' -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par
+        Confirm-DbForeignKey -Database $db -From other -Column par_id -To par
+        { Remove-DbForeignKey -Database $db -From kid -Column par_id -Confirm:$false | Out-Null } | Should -Not -Throw
+        { Remove-DbForeignKey -Database $db -From kid -Column par_id -Confirm:$false | Out-Null } | Should -Not -Throw
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO other(id,par_id) VALUES(1,99)' -NonQuery | Out-Null } | Should -Throw
+    }
+}
+
+Describe 'Confirm-DbForeignKey refuses data that already violates the relationship' -Tag 'E2E1-014' {
+    BeforeAll {
+        function New-OrphanDb {
+            $db = New-CoreDbPath -Name 'e2e1014'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE dp (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE dc (id INTEGER PRIMARY KEY, dp_id INTEGER)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO dp(id) VALUES(1)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO dc(id,dp_id) VALUES(1,1),(2,4242)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    It 'throws and leaves no trigger and no catalog row behind' {
+        $db = New-OrphanDb
+        { Confirm-DbForeignKey -Database $db -From dc -Column dp_id -To dp -OnDelete CASCADE } | Should -Throw -ExpectedMessage '*1 row(s)*'
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='dc'" | Should -Be 0
+    }
+
+    It '-Force confirms the relationship, warns, and keeps the existing rows' {
+        $db = New-OrphanDb
+        $warnings = @()
+        Confirm-DbForeignKey -Database $db -From dc -Column dp_id -To dp -OnDelete CASCADE -Force -WarningVariable warnings -WarningAction SilentlyContinue
+        $warnings.Count | Should -BeGreaterThan 0
+        ($warnings -join ' ') | Should -BeLike '*not in dp.id*'
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM dc' | Should -Be 2
+        # future writes are enforced from now on
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO dc(id,dp_id) VALUES(3,4243)' -NonQuery | Out-Null } | Should -Throw
+    }
+
+    It 'ignores NULL foreign key values and accepts clean data without -Force' {
+        $db = New-OrphanDb
+        Invoke-DbQuery -Database $db -Query 'DELETE FROM dc WHERE id=2' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO dc(id,dp_id) VALUES(3,NULL)' -NonQuery | Out-Null
+        $warnings = @()
+        # called directly, not inside a scriptblock, so -WarningVariable lands in this scope
+        Confirm-DbForeignKey -Database $db -From dc -Column dp_id -To dp -WarningVariable warnings
+        $warnings.Count | Should -Be 0
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+    }
+}
+
 Describe 'Find-DbRelationships leaves confirmed relationships alone' -Tag 'BUG-024' {
     BeforeAll {
         function Get-FkRow {
@@ -731,7 +907,9 @@ Describe 'Find-DbRelationships leaves confirmed relationships alone' -Tag 'BUG-0
         $db = New-CoreDbPath -Name 'b024a'
         Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'assets.csv') -TableName assets -Database $db | Out-Null
         Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $db | Out-Null
-        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -RefColumn hostname
+        # asset_id holds numbers while assets.hostname holds names, so every row violates the
+        # relationship; -Force records it anyway (E2E1-014)
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -RefColumn hostname -Force -WarningAction SilentlyContinue
         $sugs = @(Find-DbRelationships -Database $db)
         $row = Get-FkRow -Database $db -Table vulns -Column asset_id
         $row.ref_table | Should -Be 'assets'
@@ -1006,5 +1184,501 @@ Describe 'Invoke-DbQuery -AsDataTable returns a DataTable on both paths' -Tag 'B
             $dt0.GetType().FullName | Should -Be 'System.Data.DataTable'
             $dt0.Rows.Count | Should -Be 0
         }
+    }
+}
+
+# E2E1-003: every statement for one database goes through the same pooled connection, so a transaction that
+# is started and never completed takes in every later write and loses all of it when the connection is
+# closed, re-initialised or the module is unloaded. The module now records the pending transaction: it can
+# be reported (Test-DbTransaction), finished without the handle (Complete-/Undo-DbTransaction -Database),
+# and the rollback that closing performs is announced instead of happening silently.
+Describe 'A pending transaction on the pooled connection is visible and recoverable' -Tag 'E2E1-003' {
+    It 'warns instead of silently discarding the writes when Close-DbConnections rolls an abandoned transaction back' {
+        $db = New-CoreDbPath -Name 'e2e1003a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)' -NonQuery | Out-Null
+        # the handle is dropped: the transaction is never committed or rolled back by the caller
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('x')" -NonQuery | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM a' | Select-Object -First 1).c | Should -Be 1
+
+        $closeWarnings = @()
+        Close-DbConnections -WarningVariable closeWarnings -WarningAction SilentlyContinue
+        $closeWarnings.Count | Should -BeGreaterThan 0
+        ($closeWarnings -join ' ') | Should -BeLike '*uncommitted transaction*'
+        ($closeWarnings -join ' ') | Should -BeLike "*$([System.IO.Path]::GetFileName($db))*"
+        # the write is still lost - that part is what a rollback means - but it is no longer lost in silence
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM a' | Select-Object -First 1).c | Should -Be 0
+        Close-DbConnections
+    }
+
+    It 'commits a transaction whose handle the script no longer has' {
+        $db = New-CoreDbPath -Name 'e2e1003b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)' -NonQuery | Out-Null
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('keep')" -NonQuery | Out-Null
+
+        Complete-DbTransaction -Database $db
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+
+        $closeWarnings = @()
+        Close-DbConnections -WarningVariable closeWarnings -WarningAction SilentlyContinue
+        $closeWarnings.Count | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM a' | Select-Object -First 1).c | Should -Be 1
+        Close-DbConnections
+    }
+
+    It 'clears an abandoned transaction with Undo-DbTransaction so later writes are committed' {
+        $db = New-CoreDbPath -Name 'e2e1003c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)' -NonQuery | Out-Null
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('lost')" -NonQuery | Out-Null
+
+        # rolling back without the handle is how a script recovers; it asked for it, so it gets no warning
+        $undoWarnings = @()
+        Undo-DbTransaction -Database $db -WarningVariable undoWarnings -WarningAction SilentlyContinue
+        $undoWarnings.Count | Should -Be 0
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('after')" -NonQuery | Out-Null
+        Close-DbConnections
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT v FROM a')
+        $rows.Count | Should -Be 1
+        $rows[0].v | Should -Be 'after'
+        Close-DbConnections
+    }
+
+    It 'reports whether a database is inside a transaction and never opens a connection to answer' {
+        $db = New-CoreDbPath -Name 'e2e1003d'
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+        $db | Should -Not -Exist
+
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+        $tx = Start-DbTransaction -Database $db
+        (Test-DbTransaction -Database $db) | Should -BeTrue
+        Complete-DbTransaction -Database $db -Transaction $tx
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+        Close-DbConnections
+    }
+
+    It 'still allows a nested transaction and reports the outer one as pending until it is committed' {
+        $db = New-CoreDbPath -Name 'e2e1003e'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        $outer = Start-DbTransaction -Database $db
+        # Import-CsvToSqlite starts its own transaction even when the caller already holds one
+        $inner = Start-DbTransaction -Database $db
+        $inner | Should -Not -BeNullOrEmpty
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(1)' -NonQuery -Transaction $inner | Out-Null
+        Complete-DbTransaction -Database $db -Transaction $inner
+        (Test-DbTransaction -Database $db) | Should -BeTrue
+        Complete-DbTransaction -Database $db -Transaction $outer
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+
+        $closeWarnings = @()
+        Close-DbConnections -WarningVariable closeWarnings -WarningAction SilentlyContinue
+        $closeWarnings.Count | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1).c | Should -Be 1
+        Close-DbConnections
+    }
+
+    It 'warns before Initialize-ORMVars discards an open transaction' {
+        $db = New-CoreDbPath -Name 'e2e1003f'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(7)' -NonQuery | Out-Null
+
+        # Initialize-ORMVars is not an advanced function, so the warning stream is captured by redirection
+        $records = @(Initialize-ORMVars 3>&1)
+        $warnings = @($records | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+        $warnings.Count | Should -BeGreaterThan 0
+        ($warnings -join ' ') | Should -BeLike '*uncommitted transaction*'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1).c | Should -Be 0
+        Close-DbConnections
+    }
+}
+
+Describe 'Invoke-DbQuery rejects a NUL character in a bound string parameter' -Tag 'E2E1-013' {
+    It 'throws instead of storing the value truncated at the NUL' {
+        $db = New-CoreDbPath -Name 'e2e1013a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(v TEXT)' -NonQuery | Out-Null
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO t(v) VALUES(@p0)' -SqlParameters @{ p0 = ('a' + [char]0 + 'b') } -NonQuery } |
+            Should -Throw "*parameter 'p0' contains a NUL character*"
+        # before the fix the row was inserted holding only 'a' (length 1 instead of 3)
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 0
+        Close-DbConnections
+    }
+
+    It 'still accepts text whose only control characters are tab, CR and LF' {
+        $db = New-CoreDbPath -Name 'e2e1013b'
+        $text = "a`tb`r`nc"
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(v TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(v) VALUES(@p0)' -SqlParameters @{ p0 = $text } -NonQuery | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT length(v) FROM t' -Scalar) | Should -Be $text.Length
+        (Invoke-DbQuery -Database $db -Query 'SELECT v FROM t' -Scalar) | Should -Be $text
+        Close-DbConnections
+    }
+
+    Context 'on the PSSQLite fallback path' {
+        BeforeAll { Disable-DirectConnection }
+        AfterAll { Restore-DirectConnection }
+        It 'throws there as well' {
+            $db = New-CoreDbPath -Name 'e2e1013c'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(v TEXT)' -NonQuery | Out-Null
+            { Invoke-DbQuery -Database $db -Query 'INSERT INTO t(v) VALUES(@p0)' -SqlParameters @{ p0 = ('x' + [char]0 + 'y') } -NonQuery } |
+                Should -Throw '*NUL character*'
+            [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 0
+        }
+    }
+}
+
+Describe 'Invoke-DbQuery -Scalar maps a SQL NULL cell to $null' -Tag 'E2E1-019' {
+    It 'returns $null rather than System.DBNull for a NULL cell' {
+        $db = New-CoreDbPath -Name 'e2e1019a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(NULL)' -NonQuery | Out-Null
+        $v = Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar
+        # before the fix $v was [System.DBNull]::Value, so '$null -eq $v' was False
+        $null -eq $v | Should -BeTrue
+        $v -is [System.DBNull] | Should -BeFalse
+        # the row path already mapped DBNull to $null; both shapes must agree
+        $row = @(Invoke-DbQuery -Database $db -Query 'SELECT x FROM t')[0]
+        $null -eq $row.x | Should -BeTrue
+        Close-DbConnections
+    }
+
+    It 'still returns the value of a non-NULL cell and $null for an empty result' {
+        $db = New-CoreDbPath -Name 'e2e1019b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO t(x) VALUES('keep')" -NonQuery | Out-Null
+        (Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar) | Should -Be 'keep'
+        $null -eq (Invoke-DbQuery -Database $db -Query "SELECT x FROM t WHERE x='none'" -Scalar) | Should -BeTrue
+        Close-DbConnections
+    }
+
+    Context 'on the PSSQLite fallback path' {
+        BeforeAll { Disable-DirectConnection }
+        AfterAll { Restore-DirectConnection }
+        It 'returns $null for a NULL cell there as well' {
+            $db = New-CoreDbPath -Name 'e2e1019c'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x TEXT)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(NULL)' -NonQuery | Out-Null
+            $v = Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar
+            $null -eq $v | Should -BeTrue
+            $v -is [System.DBNull] | Should -BeFalse
+        }
+    }
+}
+
+Describe 'ConvertTo-Ident quotes ordinary punctuation instead of refusing it' -Tag 'E2E1-021' {
+    It 'accepts the punctuation real CSV headers carry' {
+        ConvertTo-Ident 'Cost (USD)' | Should -Be '"Cost (USD)"'
+        ConvertTo-Ident '50%' | Should -Be '"50%"'
+        ConvertTo-Ident 'A/B' | Should -Be '"A/B"'
+        ConvertTo-Ident 'Weight [kg]' | Should -Be '"Weight [kg]"'
+        ConvertTo-Ident 'Done?' | Should -Be '"Done?"'
+        ConvertTo-Ident 'name+alias' | Should -Be '"name+alias"'
+        ConvertTo-Ident 'price$' | Should -Be '"price$"'
+        ConvertTo-Ident "O'Brien" | Should -Be '"O''Brien"'
+        # the characters the old whitelist did allow are unchanged
+        ConvertTo-Ident 'a b-c_d.e' | Should -Be '"a b-c_d.e"'
+    }
+    It 'doubles an embedded double quote so the identifier cannot be broken out of' {
+        ConvertTo-Ident 'a"b' | Should -Be '"a""b"'
+        ConvertTo-Ident 'x"; DROP TABLE t; --' | Should -Be '"x""; DROP TABLE t; --"'
+    }
+    It 'still refuses a NUL, another control character and an empty name' {
+        { ConvertTo-Ident ('a' + [char]0 + 'b') } | Should -Throw '*control characters*'
+        { ConvertTo-Ident ('a' + [char]1 + 'b') } | Should -Throw '*control characters*'
+        { ConvertTo-Ident ('a' + [char]27 + 'b') } | Should -Throw '*control characters*'
+        { ConvertTo-Ident '' } | Should -Throw '*null or empty*'
+        # the message must not carry the control character itself
+        $msg = ''
+        try { ConvertTo-Ident ('a' + [char]0 + 'b') } catch { $msg = $_.Exception.Message }
+        $msg.IndexOf([char]0) | Should -Be -1
+    }
+    It 'the quoted form really works as an identifier in SQLite' {
+        $db = New-CoreDbPath -Name 'e2e1021id'
+        $t = ConvertTo-Ident 'odd table (1)'
+        $c = ConvertTo-Ident "O'Brien %"
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $t (id INTEGER PRIMARY KEY, $c TEXT)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO $t (id, $c) VALUES (1, 'v')" -NonQuery | Out-Null
+        (Invoke-DbQuery -Database $db -Query "SELECT $c FROM $t" -Scalar) | Should -Be 'v'
+        Close-DbConnections
+    }
+    It 'a name that tries to escape the quoting cannot reach the parser' {
+        $db = New-CoreDbPath -Name 'e2e1021inj'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE keepme(id INTEGER)' -NonQuery | Out-Null
+        $evil = ConvertTo-Ident 'x"); DROP TABLE keepme; --'
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $evil (id INTEGER)" -NonQuery | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='keepme'")[0].c | Should -Be 1
+        Close-DbConnections
+    }
+}
+
+Describe 'Confirm-DbForeignKey handles punctuated table and column names' -Tag 'E2E1-021' {
+    It 'enforces a relationship whose names carry an apostrophe and a comment marker' {
+        $db = New-CoreDbPath -Name 'e2e1021fk'
+        $parent = "O'Brien"
+        $child = 'kid*/x'
+        $col = "p'id"
+        $qParent = ConvertTo-Ident $parent
+        $qChild = ConvertTo-Ident $child
+        $qCol = ConvertTo-Ident $col
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $qParent (id INTEGER PRIMARY KEY)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $qChild (id INTEGER PRIMARY KEY, $qCol INTEGER)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO $qParent (id) VALUES (1)" -NonQuery | Out-Null
+
+        { Confirm-DbForeignKey -Database $db -From $child -Column $col -To $parent -RefColumn id -OnDelete RESTRICT } | Should -Not -Throw
+        # Re-confirming must recognise the triggers it already owns through the marker comment.
+        { Confirm-DbForeignKey -Database $db -From $child -Column $col -To $parent -RefColumn id -OnDelete RESTRICT } | Should -Not -Throw
+
+        # The '*/' in the child table name is percent-encoded, so the marker comment is not closed early.
+        $trigSql = @(Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE type='trigger' ORDER BY name" | ForEach-Object { [string]$_.sql })
+        $trigSql.Count | Should -Be 3
+        ($trigSql[0].Contains('table=kid%2A%2Fx')) | Should -BeTrue
+
+        Invoke-DbQuery -Database $db -Query "INSERT INTO $qChild (id, $qCol) VALUES (1, 1)" -NonQuery | Out-Null
+        { Invoke-DbQuery -Database $db -Query "INSERT INTO $qChild (id, $qCol) VALUES (2, 99)" -NonQuery | Out-Null } | Should -Throw
+        { Invoke-DbQuery -Database $db -Query "DELETE FROM $qParent WHERE id = 1" -NonQuery | Out-Null } | Should -Throw
+
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" | ForEach-Object { [string]$_.name })
+        $tables | Should -Contain $parent
+        $tables | Should -Contain $child
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM $qChild")[0].c | Should -Be 1
+        Close-DbConnections
+    }
+}
+
+Describe 'Find-DbRelationships treats names as literals, not as wildcard patterns' -Tag 'E2E1-021' {
+    # E2E1-021: relaxing ConvertTo-Ident let PowerShell wildcard metacharacters into table and
+    # column names. The prefix heuristic built a -like PATTERN out of such a name, so an
+    # unbalanced '[' made the pattern invalid and the whole call threw, and '*' or '?' quietly
+    # turned the prefix test into a wildcard match.
+    It 'does not throw when a table name contains an unbalanced bracket' {
+        $db = New-CoreDbPath -Name 'e2e1021wild'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE "a[b" (id INTEGER PRIMARY KEY, nm TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE kids (kid INTEGER PRIMARY KEY, "a[b_id" INTEGER)' -NonQuery | Out-Null
+        { Find-DbRelationships -Database $db | Out-Null } | Should -Not -Throw
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 1
+        $found[0].table_name | Should -Be 'kids'
+        $found[0].column_name | Should -Be 'a[b_id'
+        $found[0].ref_table | Should -Be 'a[b'
+        $found[0].ref_column | Should -Be 'id'
+        Close-DbConnections
+    }
+    It 'does not let an asterisk in a name match an unrelated column' {
+        # Parent "a*" has no key-looking column at all, so nothing may be suggested. With -like the
+        # pattern 'a**' matched the unrelated column 'abc' and a bogus relationship was stored.
+        $db = New-CoreDbPath -Name 'e2e1021star'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE "a*" (zz TEXT, abc TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE kids (kid INTEGER PRIMARY KEY, "a*_id" TEXT)' -NonQuery | Out-Null
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__")[0].c | Should -Be 0
+        Close-DbConnections
+    }
+    It 'still makes the prefix suggestion it always made' {
+        $db = New-CoreDbPath -Name 'e2e1021pref'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE dept (deptcode TEXT, other TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE kids (kid INTEGER PRIMARY KEY, dept_id TEXT)' -NonQuery | Out-Null
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 1
+        $found[0].ref_table | Should -Be 'dept'
+        $found[0].ref_column | Should -Be 'deptcode'
+        [double]$found[0].confidence | Should -Be 0.75
+        Close-DbConnections
+    }
+}
+
+Describe 'Set-DbLogging applies only the parameters the caller supplied' -Tag 'E2E1-022' {
+    BeforeEach { Initialize-ORMVars }
+    AfterAll { Initialize-ORMVars }
+    It 'keeps the current level when only -Path is given' {
+        # Before the fix $Level was assigned unconditionally, so changing only the log
+        # file silently reset an existing DEBUG threshold back to the 'INFO' default.
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_a.log'
+        $logB = Join-Path $script:coreWorkDir 'e2e1022_b.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        Set-DbLogging -Path $logB -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logB
+    }
+    It 'keeps DEBUG diagnostics flowing to the new file after a -Path only change' {
+        $db = New-CoreDbPath -Name 'e2e1022'
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_flow_a.log'
+        $logB = Join-Path $script:coreWorkDir 'e2e1022_flow_b.log'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(id INTEGER)' -NonQuery | Out-Null
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Path $logB -Confirm:$false
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id) VALUES (1)' -NonQuery | Out-Null
+        Set-DbLogging -Level INFO -Path '' -Confirm:$false
+        Close-DbConnections
+        $logB | Should -Exist
+        (Get-Content -LiteralPath $logB -Raw) | Should -Match 'INSERT INTO t'
+    }
+    It 'keeps the current path when only -Level is given' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_keep.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Level ERROR -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'ERROR'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+    }
+    It 'applies both when both are given and clears the path with an empty -Path' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_both.log'
+        Set-DbLogging -Level WARN -Path $logA -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+        Set-DbLogging -Level INFO -Path '' -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'INFO'
+        (& $m { $script:DbLogPath }) | Should -BeNullOrEmpty
+    }
+    It 'changes nothing when called with no parameters at all' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_noargs.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+    }
+    It 'changes nothing under -WhatIf' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_whatif.log'
+        $logB = Join-Path $script:coreWorkDir 'e2e1022_whatif_b.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Level ERROR -Path $logB -WhatIf
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+    }
+}
+
+Describe 'Initialize-ORMVars takes the hashtable out of everything a settings script emits' -Tag 'E2E1-023' {
+    BeforeAll {
+        function New-SettingsFile023 {
+            param([string]$Name, [string[]]$Lines)
+            $p = Join-Path $script:coreWorkDir $Name
+            Set-Content -LiteralPath $p -Value $Lines -Encoding ASCII
+            return $p
+        }
+    }
+    AfterAll { Initialize-ORMVars }
+
+    It 'applies the settings when the script writes other output before returning the hashtable' {
+        # Before the fix the dot-source captured an Object[] (the New-Item output plus the hashtable),
+        # the '$cfg -is [hashtable]' guard was false and every configured key was dropped in silence.
+        $logDir = Join-Path $script:coreWorkDir 'e2e1023_logs'
+        $logFile = Join-Path $logDir 'app.log'
+        $dbPath = Join-Path $script:coreWorkDir 'e2e1023_cfg.db'
+        $settings = New-SettingsFile023 -Name 'e2e1023_noisy.ps1' -Lines @(
+            ("New-Item -ItemType Directory -Path '{0}' -Force" -f $logDir),
+            "Write-Output 'stray output'",
+            ("@{{ LogLevel = 'DEBUG'; LogPath = '{0}'; DbPath = '{1}' }}" -f $logFile, $dbPath)
+        )
+        Initialize-ORMVars -SettingsPath $settings
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logFile
+        (& $m { $script:DbDefaultPath }) | Should -Be $dbPath
+        Write-DbLog -Level DEBUG -Message 'e2e1023 noisy settings applied'
+        $logFile | Should -Exist
+        (Get-Content -LiteralPath $logFile -Raw) | Should -Match 'e2e1023 noisy settings applied'
+    }
+
+    It 'uses the last hashtable when the script emits more than one' {
+        $settings = New-SettingsFile023 -Name 'e2e1023_two.ps1' -Lines @(
+            "@{ LogLevel = 'DEBUG' }",
+            "@{ LogLevel = 'WARN' }"
+        )
+        Initialize-ORMVars -SettingsPath $settings
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+    }
+
+    It 'throws and keeps the previous configuration when the script returns something else' {
+        $log = Join-Path $script:coreWorkDir 'e2e1023_keep.log'
+        Initialize-ORMVars -LogLevel WARN -LogPath $log -DbPath 'e2e1023_keep.db'
+        $settings = New-SettingsFile023 -Name 'e2e1023_string.ps1' -Lines @("'just a string'")
+        { Initialize-ORMVars -SettingsPath $settings } | Should -Throw '*did not return a hashtable*'
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+        (& $m { $script:DbLogPath }) | Should -Be $log
+        (& $m { $script:DbDefaultPath }) | Should -Be 'e2e1023_keep.db'
+    }
+
+    It 'throws when the settings script emits nothing at all' {
+        $log = Join-Path $script:coreWorkDir 'e2e1023_empty.log'
+        Initialize-ORMVars -LogLevel ERROR -LogPath $log
+        $settings = New-SettingsFile023 -Name 'e2e1023_empty.ps1' -Lines @('$null = 1')
+        { Initialize-ORMVars -SettingsPath $settings } | Should -Throw '*did not return a hashtable*'
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'ERROR'
+        (& $m { $script:DbLogPath }) | Should -Be $log
+    }
+}
+
+Describe 'Initialize-ORMVars resets every piece of state it owns' -Tag 'E2E1-029' {
+    AfterAll { Initialize-ORMVars; Close-DbConnections }
+
+    It 'clears the default database path like it clears the logging configuration' {
+        # Before the fix DbDefaultPath was only ever assigned, so a bare re-init wiped the log
+        # level and log path but left the previous default database path behind.
+        $m = (Get-Command Initialize-ORMVars).Module
+        $log = Join-Path $script:coreWorkDir 'e2e1029.log'
+        Initialize-ORMVars -DbPath 'e2e1029_first.db' -LogLevel DEBUG -LogPath $log
+        (& $m { $script:DbDefaultPath }) | Should -Be 'e2e1029_first.db'
+        Initialize-ORMVars
+        (& $m { $script:DbLogLevel }) | Should -Be 'INFO'
+        (& $m { $script:DbLogPath }) | Should -BeNullOrEmpty
+        (& $m { $script:DbDefaultPath }) | Should -BeNullOrEmpty
+    }
+
+    It 'clears the model registry together with the generated class scripts' {
+        $db = New-CoreDbPath -Name 'e2e1029models'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE assets (id INTEGER PRIMARY KEY, hostname TEXT)' -NonQuery | Out-Null
+        $typeName = New-DynamicModel -TableName 'assets' -Database $db -Columns @('id', 'hostname') -Confirm:$false
+        Set-DynamicORMClass -Confirm:$false
+        (New-DynamicRecord -Table 'assets' -Database $db) | Should -Not -BeNullOrEmpty
+
+        Initialize-ORMVars
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { @($script:DynamicClassScripts).Count }) | Should -Be 0
+        (& $m { @($script:ModelRegistry.Keys).Count }) | Should -Be 0
+        (& $m { @($script:ModelTypes.Keys).Count }) | Should -Be 0
+        (& $m { @($script:ModelTypeObjects.Keys).Count }) | Should -Be 0
+        # Before the fix the stale registry still answered here while Set-DynamicORMClass had
+        # nothing left to load, so the two halves of the dynamic model state disagreed.
+        { New-DynamicRecord -Table 'assets' -Database $db } | Should -Throw '*No dynamic model is registered*'
+
+        # A type name handed out in this session stays reserved, so re-registering the same table
+        # gets its original readable name back instead of a hash suffixed one.
+        $again = New-DynamicModel -TableName 'assets' -Database $db -Columns @('id', 'hostname') -Confirm:$false
+        $again | Should -Be $typeName
+        Set-DynamicORMClass -Confirm:$false
+        (New-DynamicRecord -Table 'assets' -Database $db) | Should -Not -BeNullOrEmpty
+        Close-DbConnections
+    }
+
+    It 'clears the warn-once markers of a log path that can never be written' {
+        # The parent of the log path is an existing file, so every write to it fails and is
+        # warned about once. After a re-init the marker must be gone and the next failure for
+        # the same path must warn again; before the fix DbLogFailedPaths survived and it did not.
+        $blocker = Join-Path $script:coreWorkDir 'e2e1029_blocker.txt'
+        Set-Content -LiteralPath $blocker -Value 'x' -Encoding ASCII
+        $logFile = Join-Path $blocker 'db.log'
+        $m = (Get-Command Initialize-ORMVars).Module
+
+        $first = @(Initialize-ORMVars -LogLevel INFO -LogPath $logFile 3>&1)
+        @($first | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count | Should -Be 1
+        (& $m { @($script:DbLogFailedPaths.Keys).Count }) | Should -BeGreaterThan 0
+
+        Initialize-ORMVars
+        (& $m { @($script:DbLogFailedPaths.Keys).Count }) | Should -Be 0
+
+        $second = @(Initialize-ORMVars -LogLevel INFO -LogPath $logFile 3>&1)
+        @($second | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count | Should -Be 1
     }
 }

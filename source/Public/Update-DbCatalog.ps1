@@ -102,6 +102,33 @@ VALUES(@t,@c,@rt,@rc,1.0,'confirmed',@od,@ou)
         }
     }
 
+    # E2E1-008: SQLite drops a trigger only together with the table the trigger is defined ON, and
+    # Confirm-DbForeignKey puts its ON DELETE trigger on the PARENT table with the child table
+    # named in the body. Dropping the child therefore left that trigger behind and every later
+    # DELETE on the surviving parent failed with "no such table"; dropping the parent left the two
+    # check triggers on the child and broke every INSERT into it. Take the trigger set away as soon
+    # as either end of a recorded relationship is gone - before the catalog rows below are deleted,
+    # because those rows are what names the pair.
+    $fkRows = @(Invoke-DbQuery -Database $Database -Query "SELECT table_name, column_name, ref_table FROM __fks__")
+    foreach ($fkRow in $fkRows) {
+        $fkTable = [string]$fkRow.table_name
+        $fkColumn = [string]$fkRow.column_name
+        $fkRef = [string]$fkRow.ref_table
+        if ([string]::IsNullOrEmpty($fkTable) -or [string]::IsNullOrEmpty($fkColumn)) { continue }
+        $childGone = ($userTables -notcontains $fkTable)
+        $parentGone = (-not [string]::IsNullOrEmpty($fkRef)) -and ($userTables -notcontains $fkRef)
+        if (-not $childGone -and -not $parentGone) { continue }
+        try {
+            $dropped = @(Remove-DbFkTrigger -Database $Database -From $fkTable -Column $fkColumn)
+            if ($dropped.Count -gt 0) {
+                Write-DbLog WARN "Update-DbCatalog: dropped stale foreign key trigger(s) for $fkTable.$fkColumn -> $fkRef ($($dropped -join ', '))"
+            }
+        }
+        catch {
+            Write-DbLog WARN "Update-DbCatalog: could not clean up foreign key triggers for '$fkTable'.'$fkColumn' ($($_.Exception.Message))"
+        }
+    }
+
     # Remove catalog rows for tables that were dropped, and any rows a previous version
     # recorded for the bookkeeping tables themselves (BUG-031, BUG-032).
     $cataloged = @(Invoke-DbQuery -Database $Database -Query "SELECT table_name FROM __tables__ UNION SELECT table_name FROM __columns__ UNION SELECT table_name FROM __fks__")
