@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -653,7 +653,9 @@ Describe 'Confirm-DbForeignKey replaces stale triggers when a column is re-confi
     It 're-confirming against another table enforces only the new target' {
         $db = New-FkProbeDb
         Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -OnDelete CASCADE
-        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To hosts -OnDelete 'NO ACTION'
+        # the existing vulns rows point at assets, not hosts, so -Force is needed to re-target the
+        # relationship over data that already violates it (E2E1-014)
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To hosts -OnDelete 'NO ACTION' -Force -WarningAction SilentlyContinue
         $names = Get-FkTriggerNames -Database $db
         $names | Should -Be @('trg_fk_vulns_asset_id_check', 'trg_fk_vulns_asset_id_check_upd', 'trg_fk_vulns_asset_id_ondelete')
         $checkSql = (Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE name='trg_fk_vulns_asset_id_check'")[0].sql
@@ -720,6 +722,174 @@ Describe 'Confirm-DbForeignKey validates the referenced table and column' -Tag '
     }
 }
 
+Describe 'Confirm-DbForeignKey never reuses the trigger names of another relationship' -Tag 'E2E1-007' {
+    BeforeAll {
+        # 'ab' + 'c_id' and 'ab_c' + 'id' both derive trg_fk_ab_c_id_check by plain concatenation.
+        function New-CollisionDb {
+            $db = New-CoreDbPath -Name 'e2e1007'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE ab (id INTEGER PRIMARY KEY, c_id INTEGER)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE ab_c (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO p(id) VALUES(1)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    It 'keeps the first relationship enforced after a colliding second one is confirmed' {
+        $db = New-CollisionDb
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab(id,c_id) VALUES(1,555)' -NonQuery | Out-Null } | Should -Throw
+
+        Confirm-DbForeignKey -Database $db -From ab_c -Column id -To p
+        # before the fix the second confirm dropped the ab triggers and this INSERT was accepted
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab(id,c_id) VALUES(2,555)' -NonQuery | Out-Null } | Should -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM ab WHERE c_id NOT IN (SELECT id FROM p)' | Should -Be 0
+    }
+
+    It 'enforces the second relationship as well, under six distinct trigger names' {
+        $db = New-CollisionDb
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p
+        Confirm-DbForeignKey -Database $db -From ab_c -Column id -To p
+        $names = Get-FkTriggerNames -Database $db
+        $names.Count | Should -Be 6
+        @($names | Sort-Object -Unique).Count | Should -Be 6
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab_c(id) VALUES(777)' -NonQuery | Out-Null } | Should -Throw
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO ab_c(id) VALUES(1)' -NonQuery | Out-Null } | Should -Not -Throw
+    }
+
+    It 're-confirming the same pair still replaces its own triggers in place' {
+        $db = New-CollisionDb
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p
+        Confirm-DbForeignKey -Database $db -From ab -Column c_id -To p -OnDelete CASCADE
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+    }
+
+    It 'adopts the unmarked triggers an older build left for the same pair' {
+        $db = New-CoreDbPath -Name 'e2e1007legacy'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE lp (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE lq (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE lc (id INTEGER PRIMARY KEY, lp_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO lp(id) VALUES(1)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO lq(id) VALUES(2)' -NonQuery | Out-Null
+        # exactly what an earlier version of the module wrote: no ownership marker anywhere
+        Invoke-DbQuery -Database $db -Query "CREATE TRIGGER trg_fk_lc_lp_id_check BEFORE INSERT ON lc FOR EACH ROW BEGIN SELECT RAISE(ABORT,'old') WHERE NEW.lp_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM lp WHERE lp.id = NEW.lp_id); END;" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "CREATE TRIGGER trg_fk_lc_lp_id_check_upd BEFORE UPDATE OF lp_id ON lc FOR EACH ROW BEGIN SELECT RAISE(ABORT,'old') WHERE NEW.lp_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM lp WHERE lp.id = NEW.lp_id); END;" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TRIGGER trg_fk_lc_lp_id_ondelete BEFORE DELETE ON lp FOR EACH ROW BEGIN SELECT RAISE(ABORT,''old'') WHERE EXISTS (SELECT 1 FROM lc WHERE "lc"."lp_id" = OLD.id); END;' -NonQuery | Out-Null
+
+        Confirm-DbForeignKey -Database $db -From lc -Column lp_id -To lq
+        # the legacy set was replaced, not duplicated, and the new target is the one enforced
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO lc(id,lp_id) VALUES(1,2)' -NonQuery | Out-Null } | Should -Not -Throw
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO lc(id,lp_id) VALUES(2,1)' -NonQuery | Out-Null } | Should -Throw
+    }
+}
+
+Describe 'Foreign key triggers are removed when a relationship or one of its tables goes away' -Tag 'E2E1-008' {
+    BeforeAll {
+        function New-ParentChildDb {
+            $db = New-CoreDbPath -Name 'e2e1008'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE par (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE kid (id INTEGER PRIMARY KEY, par_id INTEGER)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO par(id) VALUES(1),(2)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    It 'Update-DbCatalog drops the parent-side trigger left behind by dropping the child table' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par -OnDelete CASCADE
+        Invoke-DbQuery -Database $db -Query 'DROP TABLE kid' -NonQuery | Out-Null
+        Update-DbCatalog -Database $db -Confirm:$false
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        # before the fix this threw "no such table: main.kid" for the rest of the database's life
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM par WHERE id=1' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM par' | Should -Be 1
+    }
+
+    It 'Update-DbCatalog drops the child-side triggers left behind by dropping the parent table' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par
+        Invoke-DbQuery -Database $db -Query 'DROP TABLE par' -NonQuery | Out-Null
+        Update-DbCatalog -Database $db -Confirm:$false
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO kid(id,par_id) VALUES(1,NULL)' -NonQuery | Out-Null } | Should -Not -Throw
+    }
+
+    It 'Update-DbCatalog leaves a healthy relationship alone' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par -OnDelete CASCADE
+        Update-DbCatalog -Database $db -Confirm:$false
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO kid(id,par_id) VALUES(1,99)' -NonQuery | Out-Null } | Should -Throw
+    }
+
+    It 'Remove-DbForeignKey drops the whole trigger set and the catalog row' {
+        $db = New-ParentChildDb
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par -OnDelete CASCADE
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        $dropped = @(Remove-DbForeignKey -Database $db -From kid -Column par_id -Confirm:$false)
+        $dropped.Count | Should -Be 3
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='kid'" | Should -Be 0
+        { Invoke-DbQuery -Database $db -Query 'DELETE FROM par WHERE id=1' -NonQuery | Out-Null } | Should -Not -Throw
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM kid' | Should -Be 0
+    }
+
+    It 'Remove-DbForeignKey is idempotent and touches no other relationship' {
+        $db = New-ParentChildDb
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE other (id INTEGER PRIMARY KEY, par_id INTEGER)' -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $db -From kid -Column par_id -To par
+        Confirm-DbForeignKey -Database $db -From other -Column par_id -To par
+        { Remove-DbForeignKey -Database $db -From kid -Column par_id -Confirm:$false | Out-Null } | Should -Not -Throw
+        { Remove-DbForeignKey -Database $db -From kid -Column par_id -Confirm:$false | Out-Null } | Should -Not -Throw
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO other(id,par_id) VALUES(1,99)' -NonQuery | Out-Null } | Should -Throw
+    }
+}
+
+Describe 'Confirm-DbForeignKey refuses data that already violates the relationship' -Tag 'E2E1-014' {
+    BeforeAll {
+        function New-OrphanDb {
+            $db = New-CoreDbPath -Name 'e2e1014'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE dp (id INTEGER PRIMARY KEY)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE dc (id INTEGER PRIMARY KEY, dp_id INTEGER)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO dp(id) VALUES(1)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO dc(id,dp_id) VALUES(1,1),(2,4242)' -NonQuery | Out-Null
+            return $db
+        }
+    }
+
+    It 'throws and leaves no trigger and no catalog row behind' {
+        $db = New-OrphanDb
+        { Confirm-DbForeignKey -Database $db -From dc -Column dp_id -To dp -OnDelete CASCADE } | Should -Throw -ExpectedMessage '*1 row(s)*'
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 0
+        Get-ScalarInt -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__ WHERE table_name='dc'" | Should -Be 0
+    }
+
+    It '-Force confirms the relationship, warns, and keeps the existing rows' {
+        $db = New-OrphanDb
+        $warnings = @()
+        Confirm-DbForeignKey -Database $db -From dc -Column dp_id -To dp -OnDelete CASCADE -Force -WarningVariable warnings -WarningAction SilentlyContinue
+        $warnings.Count | Should -BeGreaterThan 0
+        ($warnings -join ' ') | Should -BeLike '*not in dp.id*'
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+        Get-ScalarInt -Database $db -Query 'SELECT COUNT(*) AS c FROM dc' | Should -Be 2
+        # future writes are enforced from now on
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO dc(id,dp_id) VALUES(3,4243)' -NonQuery | Out-Null } | Should -Throw
+    }
+
+    It 'ignores NULL foreign key values and accepts clean data without -Force' {
+        $db = New-OrphanDb
+        Invoke-DbQuery -Database $db -Query 'DELETE FROM dc WHERE id=2' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO dc(id,dp_id) VALUES(3,NULL)' -NonQuery | Out-Null
+        $warnings = @()
+        # called directly, not inside a scriptblock, so -WarningVariable lands in this scope
+        Confirm-DbForeignKey -Database $db -From dc -Column dp_id -To dp -WarningVariable warnings
+        $warnings.Count | Should -Be 0
+        (Get-FkTriggerNames -Database $db).Count | Should -Be 3
+    }
+}
+
 Describe 'Find-DbRelationships leaves confirmed relationships alone' -Tag 'BUG-024' {
     BeforeAll {
         function Get-FkRow {
@@ -731,7 +901,9 @@ Describe 'Find-DbRelationships leaves confirmed relationships alone' -Tag 'BUG-0
         $db = New-CoreDbPath -Name 'b024a'
         Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'assets.csv') -TableName assets -Database $db | Out-Null
         Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $db | Out-Null
-        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -RefColumn hostname
+        # asset_id holds numbers while assets.hostname holds names, so every row violates the
+        # relationship; -Force records it anyway (E2E1-014)
+        Confirm-DbForeignKey -Database $db -From vulns -Column asset_id -To assets -RefColumn hostname -Force -WarningAction SilentlyContinue
         $sugs = @(Find-DbRelationships -Database $db)
         $row = Get-FkRow -Database $db -Table vulns -Column asset_id
         $row.ref_table | Should -Be 'assets'

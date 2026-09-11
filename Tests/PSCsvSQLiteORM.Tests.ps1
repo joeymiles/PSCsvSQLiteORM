@@ -28,6 +28,7 @@ Describe 'PSCsvSQLiteORM Exported Functions' {
         'New-DbQuery',
         'New-DynamicModel',
         'ConvertTo-Ident',
+        'Remove-DbForeignKey',
         'Undo-DbTransaction',
         'Set-DbLogging',
         'Set-DynamicORMClass',
