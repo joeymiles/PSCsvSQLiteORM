@@ -1,12 +1,14 @@
 # Regression tests for DynamicActiveRecord (dynamic models).
 # Runs on Windows PowerShell 5.1 and PowerShell 7. Databases are created under a unique directory inside $env:TEMP.
 
-# Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
-$script:ModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+$script:ModuleFolder = Get-OrmBuiltManifestPath
 Import-Module $script:ModuleFolder -Force
 
 BeforeAll {
-    $script:ModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+    $script:ModuleFolder = Get-OrmBuiltManifestPath
     Import-Module $script:ModuleFolder -Force
     $script:Orm = Get-Module PSCsvSQLiteORM | Where-Object { $_.ModuleBase -like ((Split-Path -Parent $PSScriptRoot) + '*') } | Select-Object -First 1
     if (-not $script:Orm) { $script:Orm = Get-Module PSCsvSQLiteORM | Select-Object -First 1 }

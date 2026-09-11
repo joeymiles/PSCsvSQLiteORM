@@ -1,11 +1,13 @@
 # Regression tests for the DbQuery fluent query builder.
 # Runs on Windows PowerShell 5.1 and PowerShell 7. Databases are created under a unique directory inside $env:TEMP.
 
-# Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
-Import-Module (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM') -Force
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Import-Module (Get-OrmBuiltManifestPath) -Force
 
 BeforeAll {
-    Import-Module (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM') -Force
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+    Import-Module (Get-OrmBuiltManifestPath) -Force
     $script:TestRoot = Join-Path $env:TEMP ("orm_query_{0}" -f ([guid]::NewGuid().ToString('N')))
     New-Item -ItemType Directory -Path $script:TestRoot -Force | Out-Null
     Initialize-ORMVars -LogLevel ERROR

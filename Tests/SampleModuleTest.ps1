@@ -1,8 +1,9 @@
 # Sample test script for PSCsvSQLiteORM module
 # Imports sample CSVs, creates tables, and runs basic queries
 
-# Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
-Import-Module (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM') -Force
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Import-Module (Get-OrmBuiltManifestPath) -Force
 Initialize-ORMVars -LogLevel INFO
 
 $tmpDir = Join-Path $PSScriptRoot 'tmp'

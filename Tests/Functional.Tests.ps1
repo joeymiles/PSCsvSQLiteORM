@@ -1,7 +1,8 @@
 # Functional tests for PSCsvSQLiteORM
 
-# Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
-Import-Module (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM') -Force
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Import-Module (Get-OrmBuiltManifestPath) -Force
 
 Describe 'Initialize-ORMVars settings script' {
     It 'Applies settings from a SettingsPath file' {
@@ -393,7 +394,7 @@ Describe 'BASE-01 test scripts run on Windows PowerShell 5.1' -Tag 'BASE-01' {
     }
 }
 
-Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version from any directory' -Tag 'BUG-059', 'BUG-060', 'BUG-076' {
+Describe 'BUG-059 BUG-060 BUG-076 BUG-077 build-module.ps1 builds the manifest version from any directory' -Tag 'BUG-059', 'BUG-060', 'BUG-076', 'BUG-077' {
     BeforeAll {
         $script:RepoRoot59 = Split-Path -Parent $PSScriptRoot
         $script:Root59 = Join-Path $env:TEMP ("orm_build_{0}" -f ([guid]::NewGuid().ToString('N')))
@@ -514,6 +515,21 @@ Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version f
         } finally {
             Remove-Item -LiteralPath $stub -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    It 'BUG-077: a build removes stale version folders so output holds only the version just built' -Tag 'BUG-077' {
+        # A leftover folder with a HIGHER version than the build: Import-Module on the unversioned output
+        # folder would pick it over the build just made, so the build script must clear it.
+        $stale = Join-Path $script:BuiltBase59 '99.0.0'
+        New-Item -ItemType Directory -Path $stale -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $stale 'PSCsvSQLiteORM.psd1') -Value "@{ ModuleVersion = '99.0.0' }" -Encoding ASCII
+        @(Get-ChildItem -LiteralPath $script:BuiltBase59 -Directory).Count | Should -BeGreaterThan 1
+        $run = Invoke-Build59 -ScriptArgs @('-Version', '3.3.3')
+        $run.ExitCode | Should -Be 0
+        @($run.Lines | Where-Object { $_.Trim() -eq 'Module imported successfully. Version: 3.3.3' }).Count | Should -Be 1
+        $folders = @(Get-ChildItem -LiteralPath $script:BuiltBase59 -Directory | ForEach-Object { $_.Name })
+        $folders | Should -Be @('3.3.3')
+        Test-Path -LiteralPath $stale | Should -BeFalse
     }
 }
 

@@ -2,9 +2,10 @@
 # This file checks that all exported functions exist and can be called
 
 
-# Import the module from the repo's output directory (version-agnostic)
-$moduleFolder = Join-Path (Split-Path -Parent $PSScriptRoot) 'output\PSCsvSQLiteORM'
-Import-Module $moduleFolder -Force
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1, not whatever version folder
+# happens to sort highest under output\PSCsvSQLiteORM (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Import-Module (Get-OrmBuiltManifestPath) -Force
 
 Describe 'PSCsvSQLiteORM Exported Functions' {
     $functions = @(
@@ -46,8 +47,9 @@ Describe 'PSCsvSQLiteORM Exported Functions' {
 # Regression tests for Write-DbLog (TASK A11: BUG-046, BUG-070). Runs on Windows PowerShell 5.1 and PowerShell 7.
 Describe 'Write-DbLog file output' {
     BeforeAll {
-        # Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
-        $script:LogModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+        # The manifest of the build for the version declared in the source manifest (BUG-077)
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:LogModuleFolder = Get-OrmBuiltManifestPath
         Import-Module $script:LogModuleFolder -Force
         $script:LogRoot = Join-Path $env:TEMP ("orm_log_{0}" -f ([guid]::NewGuid().ToString('N')))
         New-Item -ItemType Directory -Path $script:LogRoot -Force | Out-Null
@@ -139,7 +141,8 @@ Describe 'Write-DbLog file output' {
 # the file assertions still hold there, the state assertions are guarded.
 Describe 'BUG-048 unloading the module closes pooled connections' -Tag 'BUG-048' {
     BeforeAll {
-        $script:B48ModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:B48ModuleFolder = Get-OrmBuiltManifestPath
         $script:B48Root = Join-Path $env:TEMP ("orm_b048_{0}" -f ([guid]::NewGuid().ToString('N')))
         New-Item -ItemType Directory -Path $script:B48Root -Force | Out-Null
 
@@ -204,8 +207,9 @@ Describe 'module manifest editions, dependencies and release notes' {
         $script:RepoRoot = Split-Path -Parent $PSScriptRoot
         $script:SourceManifest = Join-Path (Join-Path $script:RepoRoot 'source') 'PSCsvSQLiteORM.psd1'
         $script:SourceData = Import-PowerShellDataFile -Path $script:SourceManifest
-        $builtRoot = Join-Path (Join-Path $script:RepoRoot 'output') 'PSCsvSQLiteORM'
-        $script:BuiltManifest = Get-ChildItem -Path $builtRoot -Recurse -Filter 'PSCsvSQLiteORM.psd1' | Select-Object -First 1 -ExpandProperty FullName
+        # The built manifest of the declared version, not the first psd1 found under output (BUG-077)
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:BuiltManifest = Get-OrmBuiltManifestPath
         $script:BuiltData = Import-PowerShellDataFile -Path $script:BuiltManifest
         $script:BuiltInfo = Test-ModuleManifest -Path $script:BuiltManifest -ErrorAction Stop -WarningAction SilentlyContinue
     }
@@ -250,5 +254,95 @@ Describe 'module manifest editions, dependencies and release notes' {
         $notes | Should -Match 'v3\.1\.0'
         # the same text must survive the build unchanged
         [string]$script:BuiltData.PrivateData.PSData.ReleaseNotes | Should -Be $notes
+    }
+}
+
+# BUG-077: the suite must exercise the build of the version declared in source\PSCsvSQLiteORM.psd1 even when
+# output\PSCsvSQLiteORM also holds folders of other versions (Import-Module on the unversioned folder picks
+# the highest version present). Runs on Windows PowerShell 5.1 and PowerShell 7.
+Describe 'BUG-077 tests import the build of the declared version' -Tag 'BUG-077' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:RepoRoot77 = Split-Path -Parent $PSScriptRoot
+        $script:SourceVersion77 = [string](Import-PowerShellDataFile -Path (Join-Path (Join-Path $script:RepoRoot77 'source') 'PSCsvSQLiteORM.psd1')).ModuleVersion
+        $script:BuiltFolder77 = Join-Path (Join-Path (Join-Path $script:RepoRoot77 'output') 'PSCsvSQLiteORM') $script:SourceVersion77
+        $script:Root77 = Join-Path $env:TEMP ("orm_077_{0}" -f ([guid]::NewGuid().ToString('N')))
+        $script:HostExe77 = (Get-Process -Id $PID).Path
+
+        # A fake checkout: the real source manifest plus two builds under output, the declared version and a
+        # decoy with a higher version number (a stale folder left behind by an earlier build).
+        $script:Fake77 = Join-Path $script:Root77 'repo'
+        $fakeSource = Join-Path $script:Fake77 'source'
+        New-Item -ItemType Directory -Path $fakeSource -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path (Join-Path $script:RepoRoot77 'source') 'PSCsvSQLiteORM.psd1') -Destination (Join-Path $fakeSource 'PSCsvSQLiteORM.psd1')
+        $script:FakeModuleRoot77 = Join-Path (Join-Path $script:Fake77 'output') 'PSCsvSQLiteORM'
+        $script:DecoyVersion77 = '9.9.9'
+        foreach ($v in @($script:SourceVersion77, $script:DecoyVersion77)) {
+            $dest = Join-Path $script:FakeModuleRoot77 $v
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Copy-Item -Path (Join-Path $script:BuiltFolder77 '*') -Destination $dest -Recurse -Force
+        }
+        $decoyManifest = Join-Path (Join-Path $script:FakeModuleRoot77 $script:DecoyVersion77) 'PSCsvSQLiteORM.psd1'
+        $raw = Get-Content -LiteralPath $decoyManifest -Raw
+        # Anchor to the line start: the RequiredModules entry also carries a ModuleVersion key (PSSQLite pin)
+        $raw = $raw -replace "(?m)^ModuleVersion\s*=\s*'[^']+'", ("ModuleVersion = '{0}'" -f $script:DecoyVersion77)
+        Set-Content -LiteralPath $decoyManifest -Value $raw -NoNewline -Encoding ASCII
+
+        # Imports a path in a child process of THIS host and returns the version it resolved to, so the module
+        # loaded in this session is never replaced by the decoy.
+        function Get-ImportedVersion77([string]$Path) {
+            $cmd = "`$m = Import-Module '$Path' -Force -PassThru; [string]`$m.Version"
+            $callArgs = @('-NoProfile')
+            if ($PSVersionTable.PSVersion.Major -lt 6) { $callArgs += @('-ExecutionPolicy', 'Bypass') }
+            $callArgs += @('-Command', $cmd)
+            # Stderr from the child host arrives as error records; they are child output here, not test errors.
+            $lines = @(& { $ErrorActionPreference = 'Continue'; & $script:HostExe77 @callArgs 2>&1 } | ForEach-Object { [string]$_ })
+            return ($lines | Where-Object { $_.Trim() -match '^\d+\.\d+\.\d+$' } | ForEach-Object { $_.Trim() } | Select-Object -Last 1)
+        }
+    }
+    AfterAll {
+        Close-DbConnections
+        if ($script:Root77 -and (Test-Path -LiteralPath $script:Root77)) {
+            Remove-Item -LiteralPath $script:Root77 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'the module loaded by this test session is the build of the declared version' {
+        $loaded = @(Get-Module PSCsvSQLiteORM | Where-Object { $_.ModuleBase -like ($script:RepoRoot77.TrimEnd('\') + '\*') })
+        $loaded.Count | Should -BeGreaterThan 0
+        $expectedBase = (Resolve-Path -LiteralPath $script:BuiltFolder77).ProviderPath.TrimEnd('\')
+        foreach ($m in $loaded) {
+            [string]$m.Version | Should -Be $script:SourceVersion77
+            $m.ModuleBase.TrimEnd('\') | Should -Be $expectedBase
+        }
+    }
+
+    It 'Get-OrmBuiltManifestPath returns the declared version although a higher version folder exists' {
+        @(Get-ChildItem -LiteralPath $script:FakeModuleRoot77 -Directory | ForEach-Object { $_.Name }) | Should -Contain $script:DecoyVersion77
+        $manifest = Get-OrmBuiltManifestPath -RepoRoot $script:Fake77
+        $manifest | Should -Be (Join-Path (Join-Path $script:FakeModuleRoot77 $script:SourceVersion77) 'PSCsvSQLiteORM.psd1')
+        Get-ImportedVersion77 $manifest | Should -Be $script:SourceVersion77
+    }
+
+    It 'the unversioned output folder resolves to the stale higher version, which is why the tests must not import it' {
+        Get-ImportedVersion77 $script:FakeModuleRoot77 | Should -Be $script:DecoyVersion77
+    }
+
+    It 'fails loudly when the declared version has not been built' {
+        $unbuilt = Join-Path $script:Root77 'unbuilt'
+        New-Item -ItemType Directory -Path (Join-Path $unbuilt 'source') -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path (Join-Path $script:RepoRoot77 'source') 'PSCsvSQLiteORM.psd1') -Destination (Join-Path (Join-Path $unbuilt 'source') 'PSCsvSQLiteORM.psd1')
+        { Get-OrmBuiltManifestPath -RepoRoot $unbuilt } | Should -Throw -ExpectedMessage '*not found*'
+    }
+
+    It 'every test script imports the module through Get-OrmBuiltManifestPath, not the unversioned output folder' {
+        $files = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File | Where-Object { $_.Name -ne 'TestSupport.ps1' })
+        $files.Count | Should -BeGreaterThan 0
+        foreach ($f in $files) {
+            $raw = Get-Content -LiteralPath $f.FullName -Raw
+            $raw | Should -Match 'TestSupport\.ps1' -Because ($f.Name + ' imports the module')
+            $raw | Should -Not -Match '''output\\PSCsvSQLiteORM''' -Because ($f.Name + ' must not import the unversioned output folder')
+            $raw | Should -Not -Match 'Join-Path\s+\(Join-Path\s+\(Split-Path\s+-Parent\s+\$PSScriptRoot\)\s+''output''\)\s+''PSCsvSQLiteORM''\)' -Because ($f.Name + ' must not import the unversioned output folder')
+        }
     }
 }

@@ -36,12 +36,20 @@ try {
     }
     Import-Module ModuleBuilder -ErrorAction Stop
 
+    # Remove every earlier build first. ModuleBuilder only clears output\<Module>\<Version>, so folders of
+    # other versions would pile up, and Import-Module on the unversioned output\<Module> folder picks the
+    # highest version present rather than the build just made (BUG-077).
+    $builtBase = Join-Path $OutputPath $ModuleName
+    if (Test-Path -LiteralPath $builtBase) {
+        Write-Host "Removing earlier builds from $builtBase" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $builtBase -Recurse -Force -ErrorAction Stop
+    }
+
     # Pass the manifest path, not the source folder: with a folder ModuleBuilder resolves the
     # manifest relative to the current location, which fails from any other directory.
     Build-Module -SourcePath $ManifestPath -OutputDirectory $OutputPath -Version $Version -Verbose
 
     # Copy docs and examples
-    $builtBase = Join-Path $OutputPath $ModuleName
     $builtVersionPath = Join-Path $builtBase $Version
 
     $docsSrc = Join-Path $PSScriptRoot 'docs'
