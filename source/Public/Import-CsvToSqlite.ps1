@@ -1,4 +1,10 @@
 function Import-CsvToSqlite {
+    # E2E1-004: the import declares -WhatIf itself. Without it the helpers it calls that do declare
+    # ShouldProcess (Start-DbTransaction, Update-DbCatalog) skipped themselves under an inherited
+    # $WhatIfPreference while every row was still written, so -WhatIf produced an untransacted,
+    # uncataloged import instead of a preview. ConfirmImpact is Medium so the default
+    # $ConfirmPreference never prompts.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
     param (
         [Parameter(Mandatory)][string]$CsvPath,
         [Parameter(Mandatory)][string]$Database,
@@ -49,6 +55,15 @@ function Import-CsvToSqlite {
         }
     }
 
+    # E2E1-002: the bool decision needs the types the table already declares, so the schema is read
+    # before the rows are rewritten (it used to be read only after the table had been created).
+    # Reading it here also serves the schema-mode checks and the type reconciliation below.
+    $quotedTableIdent = ConvertTo-Ident $TableName
+    $existing = @(Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($quotedTableIdent)")
+    $existingNames = @($existing | ForEach-Object { [string]$_.name })
+    $declaredTypes = @{}
+    foreach ($ci in $existing) { $declaredTypes[[string]$ci.name] = "$($ci.type)".ToUpperInvariant() }
+
     # Normalize bool tokens per column: a column is boolean only when every
     # non-null value is a bool token (and there is at least one such value).
     # Applying tokens per cell rewrote ordinary text such as 'NO', 'Y' or 'N'.
@@ -59,16 +74,30 @@ function Import-CsvToSqlite {
     }
     if ($trueTokens.Count -gt 0 -or $falseTokens.Count -gt 0) {
         foreach ($p in $headers) {
-            $isBoolColumn = $true; $seen = $false
+            # E2E1-002: a column the table already stores as text (or as a typeless/BLOB column) is
+            # never re-encoded. An append used to rewrite 'no' to 0 in a TEXT column that already
+            # held 'yes' and 'maybe', leaving one column with two representations.
+            $declaredType = $null
+            if ($declaredTypes.ContainsKey($p)) { $declaredType = [string]$declaredTypes[$p] }
+            if ($null -ne $declaredType -and ($declaredType -eq '' -or $declaredType -match 'CHAR|CLOB|TEXT|BLOB')) { continue }
+            $isBoolColumn = $true; $seenTrue = $false; $seenFalse = $false
             foreach ($row in $csv) {
                 $val = $row.$p
                 if ($null -eq $val) { continue }
                 if ($val -isnot [string]) { $isBoolColumn = $false; break }
                 $lc = $val.ToLowerInvariant()
-                if ($trueTokens -contains $lc -or $falseTokens -contains $lc) { $seen = $true }
+                if ($trueTokens -contains $lc) { $seenTrue = $true }
+                elseif ($falseTokens -contains $lc) { $seenFalse = $true }
                 else { $isBoolColumn = $false; break }
             }
-            if (-not ($isBoolColumn -and $seen)) { continue }
+            if (-not $isBoolColumn) { continue }
+            if (-not ($seenTrue -or $seenFalse)) { continue }
+            # E2E1-002: one token is no evidence of a boolean column - 'Y', 'NO' and 'true' are
+            # ordinary text in a file that never shows the opposite token, and a one-row CSV or a
+            # small append batch used to be enough to rewrite the whole column to 1/0. Convert only
+            # when this file shows both spellings, or when the table already declares the column
+            # with a numeric type (so an append into an established boolean column keeps 1/0).
+            if (-not ($seenTrue -and $seenFalse) -and $null -eq $declaredType) { continue }
             foreach ($row in $csv) {
                 $val = $row.$p
                 if ($null -eq $val) { continue }
@@ -82,56 +111,28 @@ function Import-CsvToSqlite {
     foreach ($h in $headers) { if (-not $columnTypes[$h]) { $columnTypes[$h] = 'TEXT' } }
 
     $quotedCols = ($headers | ForEach-Object { "$(ConvertTo-Ident $_) $($columnTypes[$_])" }) -join ", "
-    # Handle schema creation based on SchemaMode. Only Relaxed creates the table; Strict and
-    # AppendOnly require it to exist so a misspelled -TableName fails instead of quietly
-    # creating a second table (BUG-074).
-    if ($SchemaMode -eq 'Relaxed') {
-        if (-not [string]::IsNullOrWhiteSpace($quotedCols)) {
-            $createQuery = "CREATE TABLE IF NOT EXISTS $(ConvertTo-Ident $TableName) ($quotedCols)"
-            Write-DbLog DEBUG "Creating table with query: $createQuery"
-            Invoke-DbQuery -Database $Database -Query $createQuery -NonQuery | Out-Null
-        }
-    } else {
-        # Strict / AppendOnly: ensure table exists; do not create
+
+    # Validate the schema mode against the table as it stands. Only Relaxed creates the table;
+    # Strict and AppendOnly require it to exist so a misspelled -TableName fails instead of quietly
+    # creating a second table (BUG-074). These checks read the database and never write to it, so
+    # they also run under -WhatIf (E2E1-004).
+    if ($SchemaMode -ne 'Relaxed') {
         $exists = @(Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name=@t" -SqlParameters @{ t = $TableName })
         if ($exists.Count -eq 0) { throw "$SchemaMode mode: table '$TableName' does not exist." }
-    }
-
-    # Evolve schema
-    $existing = Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($(ConvertTo-Ident $TableName))"
-    $existingNames = $existing | ForEach-Object { $_.name }
-    if ($SchemaMode -in @('Relaxed')) {
-        $added = $false
-        foreach ($h in $headers) {
-            if ($existingNames -notcontains $h) {
-                # ALTER TABLE ADD COLUMN cannot add PRIMARY KEY / AUTOINCREMENT / UNIQUE columns;
-                # add the bare storage type instead (e.g. 'id' becomes plain INTEGER).
-                $addType = $columnTypes[$h] -replace '(?i)\s+(PRIMARY\s+KEY|AUTOINCREMENT|UNIQUE)\b.*$', ''
-                if ([string]::IsNullOrWhiteSpace($addType)) { $addType = 'TEXT' }
-                $sql = "ALTER TABLE $(ConvertTo-Ident $TableName) ADD COLUMN $(ConvertTo-Ident $h) $addType"
-                Invoke-DbQuery -Database $Database -Query $sql -NonQuery | Out-Null
-                $added = $true
-            }
+        if ($SchemaMode -eq 'Strict') {
+            foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "Strict mode: missing column $h in $TableName" } }
         }
-        if ($added) {
-            # Verify the columns really exist before inserting (on Windows PowerShell 5.1 the
-            # PSSQLite fallback reports SQL errors non-terminatingly).
-            $existing = Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($(ConvertTo-Ident $TableName))"
-            $existingNames = $existing | ForEach-Object { $_.name }
-            foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "Relaxed mode: failed to add column $h to $TableName" } }
+        else {
+            # AppendOnly: no schema changes allowed; every CSV column must already exist in the table
+            foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "AppendOnly mode: column $h does not exist in table $TableName" } }
         }
-    }
-    elseif ($SchemaMode -eq 'Strict') {
-        foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "Strict mode: missing column $h in $TableName" } }
-    }
-    elseif ($SchemaMode -eq 'AppendOnly') {
-        # No schema changes allowed; every CSV column must already exist in the table
-        foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "AppendOnly mode: column $h does not exist in table $TableName" } }
     }
 
     # Reconcile inferred types with the declared column types. SQLite stores text in an INTEGER
     # column happily, but System.Data.SQLite reads that column back by its declared type and
     # returns 0 for the text, so a narrower declared type must be widened (Relaxed) or refused.
+    # Only a column the table already has can need this: a column added below is created with
+    # exactly the storage type that was inferred for it.
     $rank = @{ INTEGER = 1; REAL = 2; TEXT = 3 }
     $widen = @{}
     foreach ($h in $headers) {
@@ -152,36 +153,85 @@ function Import-CsvToSqlite {
             else { throw "$SchemaMode mode: column '$h' in table '$TableName' is declared $($info.type) but the CSV contains $inferred values; use -SchemaMode Relaxed to widen the column" }
         }
     }
+
+    # E2E1-004: one ShouldProcess gate for the whole import. Everything above only reads, so -WhatIf
+    # (or an inherited $WhatIfPreference) now previews the import - including the schema-mode and
+    # column-type checks - instead of writing every row while the helpers skipped themselves.
+    if ($PSCmdlet -and -not $PSCmdlet.ShouldProcess($Database, "Import '$CsvPath' into table '$TableName'")) { return $headers }
+
+    # The widening rebuild stays outside the import's own transaction: it manages its own SAVEPOINT,
+    # and when the caller already holds a transaction a failure inside it must leave that
+    # transaction intact (E2E1-001). It only ever touches columns that already exist.
     if ($widen.Count -gt 0) {
         Update-DbColumnType -Database $Database -Table $TableName -ColumnTypes $widen
-        $existing = Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($(ConvertTo-Ident $TableName))"
     }
 
-    # Blank ids in an INTEGER PRIMARY KEY column would be auto-numbered from the current maximum
-    # and collide with explicit ids later in the same file; number them past every known id first.
-    $idHeader = $headers | Where-Object { $_ -eq 'id' } | Select-Object -First 1
-    if ($idHeader) {
-        $idInfo = $existing | Where-Object { $_.name -eq $idHeader } | Select-Object -First 1
-        if ($idInfo -and [int]$idInfo.pk -eq 1 -and "$($idInfo.type)" -match '(?i)INT') {
-            $blankRows = @($csv | Where-Object { $null -eq $_.$idHeader })
-            $explicitIds = @($csv | Where-Object { $null -ne $_.$idHeader } | ForEach-Object { [long]$_.$idHeader })
-            if ($blankRows.Count -gt 0 -and $explicitIds.Count -gt 0) {
-                $next = ($explicitIds | Measure-Object -Maximum).Maximum
-                $maxRow = Invoke-DbQuery -Database $Database -Query "SELECT MAX($(ConvertTo-Ident $idHeader)) AS m FROM $(ConvertTo-Ident $TableName)" | Select-Object -First 1
-                if ($maxRow -and $null -ne $maxRow.m -and $maxRow.m -isnot [System.DBNull] -and [long]$maxRow.m -gt $next) { $next = [long]$maxRow.m }
-                $hasSeq = Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
-                if ($hasSeq) {
-                    $seqRow = Invoke-DbQuery -Database $Database -Query "SELECT seq FROM sqlite_sequence WHERE name=@t" -SqlParameters @{ t = $TableName } | Select-Object -First 1
-                    if ($seqRow -and $null -ne $seqRow.seq -and $seqRow.seq -isnot [System.DBNull] -and [long]$seqRow.seq -gt $next) { $next = [long]$seqRow.seq }
+    # E2E1-012: CREATE TABLE and ALTER TABLE ADD COLUMN now run inside the same transaction as the
+    # inserts. A failed import used to leave a table or a column behind that no row ever populated,
+    # so the next Strict/AppendOnly import passed schema checks it should have failed.
+    $tx = Start-DbTransaction -Database $Database -WhatIf:$false -Confirm:$false
+    try {
+        if ($SchemaMode -eq 'Relaxed') {
+            if (-not [string]::IsNullOrWhiteSpace($quotedCols)) {
+                $createQuery = "CREATE TABLE IF NOT EXISTS $quotedTableIdent ($quotedCols)"
+                Write-DbLog DEBUG "Creating table with query: $createQuery"
+                Invoke-DbQuery -Database $Database -Query $createQuery -NonQuery -Transaction $tx | Out-Null
+            }
+            # Re-read: the table may have just been created, and a widening rebuild replaces it.
+            $existing = @(Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($quotedTableIdent)")
+            $existingNames = @($existing | ForEach-Object { [string]$_.name })
+            $added = $false
+            $needUnique = New-Object System.Collections.Generic.List[string]
+            foreach ($h in $headers) {
+                if ($existingNames -notcontains $h) {
+                    # ALTER TABLE ADD COLUMN cannot add PRIMARY KEY / AUTOINCREMENT / UNIQUE columns;
+                    # add the bare storage type instead (e.g. 'id' becomes plain INTEGER).
+                    $fullType = [string]$columnTypes[$h]
+                    $addType = $fullType -replace '(?i)\s+(PRIMARY\s+KEY|AUTOINCREMENT|UNIQUE)\b.*$', ''
+                    if ([string]::IsNullOrWhiteSpace($addType)) { $addType = 'TEXT' }
+                    $sql = "ALTER TABLE $quotedTableIdent ADD COLUMN $(ConvertTo-Ident $h) $addType"
+                    Invoke-DbQuery -Database $Database -Query $sql -NonQuery -Transaction $tx | Out-Null
+                    $added = $true
+                    # E2E1-009: the uniqueness the inferred type asked for cannot be part of the
+                    # ALTER, so it is created as a unique index instead. Without it an 'id' column
+                    # that arrives on a later import accepted duplicate ids silently, and the
+                    # documented UNIQUE failure on a repeated import never happened.
+                    if ($fullType -match '(?i)\b(PRIMARY\s+KEY|UNIQUE)\b') { [void]$needUnique.Add($h) }
                 }
-                foreach ($row in $blankRows) { $next = [long]$next + 1; $row.$idHeader = $next }
+            }
+            if ($added) {
+                # Verify the columns really exist before inserting (on Windows PowerShell 5.1 the
+                # PSSQLite fallback reports SQL errors non-terminatingly).
+                $existing = @(Invoke-DbQuery -Database $Database -Query "PRAGMA table_info($quotedTableIdent)")
+                $existingNames = @($existing | ForEach-Object { [string]$_.name })
+                foreach ($h in $headers) { if ($existingNames -notcontains $h) { throw "Relaxed mode: failed to add column $h to $TableName" } }
+            }
+            foreach ($u in $needUnique) { Enable-UniqueIndex -Database $Database -Table $TableName -Columns @($u) | Out-Null }
+        }
+
+        # Blank ids in an INTEGER PRIMARY KEY column would be auto-numbered from the current maximum
+        # and collide with explicit ids later in the same file; number them past every known id first.
+        $idHeader = $headers | Where-Object { $_ -eq 'id' } | Select-Object -First 1
+        if ($idHeader) {
+            $idInfo = $existing | Where-Object { $_.name -eq $idHeader } | Select-Object -First 1
+            if ($idInfo -and [int]$idInfo.pk -eq 1 -and "$($idInfo.type)" -match '(?i)INT') {
+                $blankRows = @($csv | Where-Object { $null -eq $_.$idHeader })
+                $explicitIds = @($csv | Where-Object { $null -ne $_.$idHeader } | ForEach-Object { [long]$_.$idHeader })
+                if ($blankRows.Count -gt 0 -and $explicitIds.Count -gt 0) {
+                    $next = ($explicitIds | Measure-Object -Maximum).Maximum
+                    $maxRow = Invoke-DbQuery -Database $Database -Query "SELECT MAX($(ConvertTo-Ident $idHeader)) AS m FROM $quotedTableIdent" -Transaction $tx | Select-Object -First 1
+                    if ($maxRow -and $null -ne $maxRow.m -and $maxRow.m -isnot [System.DBNull] -and [long]$maxRow.m -gt $next) { $next = [long]$maxRow.m }
+                    $hasSeq = Invoke-DbQuery -Database $Database -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'" -Transaction $tx
+                    if ($hasSeq) {
+                        $seqRow = Invoke-DbQuery -Database $Database -Query "SELECT seq FROM sqlite_sequence WHERE name=@t" -SqlParameters @{ t = $TableName } -Transaction $tx | Select-Object -First 1
+                        if ($seqRow -and $null -ne $seqRow.seq -and $seqRow.seq -isnot [System.DBNull] -and [long]$seqRow.seq -gt $next) { $next = [long]$seqRow.seq }
+                    }
+                    foreach ($row in $blankRows) { $next = [long]$next + 1; $row.$idHeader = $next }
+                }
             }
         }
-    }
 
-    # Insert data
-    $tx = Start-DbTransaction -Database $Database
-    try {
+        # Insert data
         $count = 0
         foreach ($row in $csv) {
             $keys = $row.PSObject.Properties.Name
@@ -190,7 +240,7 @@ function Import-CsvToSqlite {
             # header text did ('a b', 'a_b' and 'a-b' all became @a_b).
             $paramNames = ConvertTo-ParamMap -Columns $keys
             $placeholders = (($keys | ForEach-Object { "@$($paramNames[$_])" })) -join ", "
-            $query = "INSERT INTO $(ConvertTo-Ident $TableName) ($columns) VALUES ($placeholders)"
+            $query = "INSERT INTO $quotedTableIdent ($columns) VALUES ($placeholders)"
             $params = @{}
             foreach ($k in $keys) {
                 $paramName = $paramNames[$k]
@@ -207,6 +257,7 @@ function Import-CsvToSqlite {
     }
     catch { Undo-DbTransaction -Database $Database -Transaction $tx; throw }
 
-    Update-DbCatalog -Database $Database -SourceCsvPath $CsvPath -Table $TableName
+    # E2E1-004: the catalog is part of this operation, not something the caller can skip on its own.
+    Update-DbCatalog -Database $Database -SourceCsvPath $CsvPath -Table $TableName -WhatIf:$false -Confirm:$false
     return $headers
 }

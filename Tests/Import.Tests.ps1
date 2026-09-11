@@ -533,3 +533,147 @@ Describe 'Relaxed import that rebuilds a table to widen a column' -Tag 'E2E1-001
         "$($fk.foreign_keys)" | Should -Be '1'
     }
 }
+
+Describe 'Import-CsvToSqlite bool token normalisation needs evidence' -Tag 'E2E1-002' {
+    It 'keeps a single bool token as ordinary text instead of rewriting the column to 1/0' {
+        $csv = New-TestCsv -Name 'e2e1002a.csv' -Lines @('id,initial,code', '1,Y,NO')
+        $db = New-TestDbPath -Name 'e2e1002a'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT initial, code FROM t' | Select-Object -First 1
+        $row.initial | Should -Be 'Y'
+        $row.code | Should -Be 'NO'
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)')
+        ($info | Where-Object { $_.name -eq 'initial' }).type | Should -Be 'TEXT'
+        ($info | Where-Object { $_.name -eq 'code' }).type | Should -Be 'TEXT'
+    }
+    It 'does not re-encode an append into a column the table already declares TEXT' {
+        $csv1 = New-TestCsv -Name 'e2e1002b1.csv' -Lines @('answer,name', 'yes,a', 'maybe,b')
+        $csv2 = New-TestCsv -Name 'e2e1002b2.csv' -Lines @('answer,name', 'no,c')
+        $db = New-TestDbPath -Name 'e2e1002b'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode Strict | Out-Null
+        $answers = @(Invoke-DbQuery -Database $db -Query 'SELECT answer FROM t ORDER BY name' | ForEach-Object { "$($_.answer)" })
+        $answers -join ',' | Should -Be 'yes,maybe,no'
+    }
+    It 'still converts a column that shows both a true and a false token' {
+        $csv = New-TestCsv -Name 'e2e1002c.csv' -Lines @('id,flag', '1,yes', '2,no')
+        $db = New-TestDbPath -Name 'e2e1002c'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        $flags = @(Invoke-DbQuery -Database $db -Query 'SELECT flag FROM t ORDER BY id' | ForEach-Object { "$($_.flag)" })
+        $flags -join ',' | Should -Be '1,0'
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'flag' }).type | Should -Be 'INTEGER'
+    }
+    It 'still converts a one-sided append into a column the table already declares INTEGER' {
+        $csv1 = New-TestCsv -Name 'e2e1002d1.csv' -Lines @('id,flag', '1,yes', '2,no')
+        $csv2 = New-TestCsv -Name 'e2e1002d2.csv' -Lines @('id,flag', '3,yes')
+        $db = New-TestDbPath -Name 'e2e1002d'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode Strict | Out-Null
+        # the column keeps its INTEGER type - the append is not widened back to TEXT
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'flag' }).type | Should -Be 'INTEGER'
+        $row = Invoke-DbQuery -Database $db -Query 'SELECT flag, typeof(flag) AS tf FROM t WHERE id=3' | Select-Object -First 1
+        [int]$row.flag | Should -Be 1
+        $row.tf | Should -Be 'integer'
+    }
+}
+
+Describe 'Import-CsvToSqlite honours -WhatIf' -Tag 'E2E1-004' {
+    It 'declares -WhatIf of its own' {
+        (Get-Command Import-CsvToSqlite).Parameters.ContainsKey('WhatIf') | Should -BeTrue
+    }
+    It 'writes no rows, no table and no catalog with -WhatIf' {
+        $csv = New-TestCsv -Name 'e2e1004a.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'e2e1004a'
+        $headers = @(Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WhatIf)
+        $headers -join ',' | Should -Be 'id,name'
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table'" | ForEach-Object { [string]$_.name })
+        $tables | Should -Not -Contain 't'
+        $tables | Should -Not -Contain '__tables__'
+    }
+    It 'writes no rows when $WhatIfPreference is set globally' {
+        $csv = New-TestCsv -Name 'e2e1004b.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'e2e1004b'
+        $previous = $global:WhatIfPreference
+        $global:WhatIfPreference = $true
+        try { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null }
+        finally { $global:WhatIfPreference = $previous }
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table'" | ForEach-Object { [string]$_.name })
+        $tables | Should -Not -Contain 't'
+        $tables | Should -Not -Contain '__tables__'
+    }
+    It 'still imports and catalogs normally without -WhatIf' {
+        $csv = New-TestCsv -Name 'e2e1004c.csv' -Lines @('id,name', '1,alpha', '2,beta')
+        $db = New-TestDbPath -Name 'e2e1004c'
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 2
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) FROM __tables__ WHERE table_name='t'" -Scalar) | Should -Be 1
+    }
+}
+
+Describe 'Import-CsvToSqlite keeps ids unique when the id column arrives later' -Tag 'E2E1-009' {
+    It 'refuses a re-import of the same ids after the id column was added by ALTER TABLE' {
+        $csv1 = New-TestCsv -Name 'e2e1009a1.csv' -Lines @('hostname,ip', 'first,1.1.1.1')
+        $csv2 = New-TestCsv -Name 'e2e1009a2.csv' -Lines @('id,hostname,ip', '1,a,2.2.2.2', '2,b,3.3.3.3')
+        $db = New-TestDbPath -Name 'e2e1009a'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' } | Should -Throw
+        $ids = @(Invoke-DbQuery -Database $db -Query 'SELECT id FROM t' | ForEach-Object { "$($_.id)" })
+        $ids -join ',' | Should -Be ',1,2'
+        # the column is still a plain INTEGER (ALTER TABLE cannot add a primary key); the
+        # uniqueness lives in an index instead
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'id' }).type | Should -Be 'INTEGER'
+        $unique = @(Invoke-DbQuery -Database $db -Query 'PRAGMA index_list(t)' | Where-Object { [int]$_.unique -eq 1 })
+        $unique.Count | Should -BeGreaterThan 0
+    }
+    It 'rejects duplicate ids inside the very file that adds the id column' {
+        $csv1 = New-TestCsv -Name 'e2e1009b1.csv' -Lines @('hostname', 'first')
+        $csv2 = New-TestCsv -Name 'e2e1009b2.csv' -Lines @('id,hostname', '1,a', '1,b')
+        $db = New-TestDbPath -Name 'e2e1009b'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' } | Should -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 1
+    }
+    It 'still lets rows that predate the id column keep a null id' {
+        $csv1 = New-TestCsv -Name 'e2e1009c1.csv' -Lines @('name,qty', 'x,1', 'y,2')
+        $csv2 = New-TestCsv -Name 'e2e1009c2.csv' -Lines @('id,name,qty', '7,z,9')
+        $db = New-TestDbPath -Name 'e2e1009c'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'n' | Out-Null
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'n' } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM n' -Scalar) | Should -Be 3
+    }
+}
+
+Describe 'Import-CsvToSqlite undoes its schema changes when the import fails' -Tag 'E2E1-012' {
+    It 'leaves no added column behind when the inserts fail' {
+        $csv1 = New-TestCsv -Name 'e2e1012a1.csv' -Lines @('id,name', '1,a')
+        $csv2 = New-TestCsv -Name 'e2e1012a2.csv' -Lines @('id,name,extra', '1,dup,zzz')
+        $db = New-TestDbPath -Name 'e2e1012a'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        $before = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' } | Should -Throw
+        $after = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        $after | Should -Be $before
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 1
+        # the failed import must not have made the column exist for a later AppendOnly run
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' -SchemaMode AppendOnly } | Should -Throw '*AppendOnly mode: column extra does not exist*'
+    }
+    It 'leaves no table behind when the first import into a new table fails' {
+        $csv = New-TestCsv -Name 'e2e1012b.csv' -Lines @('id,name', '1,a', '1,b')
+        $db = New-TestDbPath -Name 'e2e1012b'
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'newt' } | Should -Throw
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='newt'")
+        $tables.Count | Should -Be 0
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'newt' -SchemaMode Strict } | Should -Throw "*Strict mode: table 'newt' does not exist*"
+    }
+    It 'still commits the schema change when the import succeeds' {
+        $csv1 = New-TestCsv -Name 'e2e1012c1.csv' -Lines @('id,name', '1,a')
+        $csv2 = New-TestCsv -Name 'e2e1012c2.csv' -Lines @('id,name,extra', '2,b,zzz')
+        $db = New-TestDbPath -Name 'e2e1012c'
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 't' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 't' | Out-Null
+        $cols = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        $cols | Should -Be 'id|name|extra'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 2
+    }
+}

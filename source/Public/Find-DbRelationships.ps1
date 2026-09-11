@@ -52,7 +52,9 @@ function Find-DbRelationships {
 
     # BUG-066: refresh the catalog first so tables created with plain SQL or migrations
     # are considered (Update-DbCatalog also runs Initialize-Db).
-    Update-DbCatalog -Database $Database
+    # E2E1-004: -WhatIf:$false because this refresh is part of the lookup, not a separate operation
+    # the caller can skip; skipping it leaves __tables__ missing and the whole function fails.
+    Update-DbCatalog -Database $Database -WhatIf:$false -Confirm:$false
 
     $suggestions = New-Object System.Collections.ArrayList
 
