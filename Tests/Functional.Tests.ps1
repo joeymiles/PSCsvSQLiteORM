@@ -884,8 +884,9 @@ Describe 'Write-DbLog defaults to INFO when -Level is omitted' -Tag 'E2E1-028' {
     }
 }
 
-# The 3.2.0 documentation pass: every statement the README and the about topic make about this build is
-# executed here, and the README's own section 9 block is run line by line the way BASE-10 runs blocks 3-8.
+# The 3.2.0 documentation pass: every statement the documentation set (README plus docs\reference.md) and the
+# about topic make about this build is executed here, and the README's sections 9 and 10 are run the way
+# BASE-10 runs sections 3 to 8.
 Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-320' {
     BeforeAll {
         # Functions dot-sourced at container level are not in scope inside BeforeAll on either host.
@@ -1125,6 +1126,36 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
             Complete-DbTransaction -Database $db
         }
         Test-DbTransaction -Database $db | Should -BeFalse
+    }
+
+    It 'the documented licence and links match the repository' {
+        # A README that names the wrong licence is both wrong and legally material, and nothing else catches it.
+        $licenseText = Get-Content -LiteralPath (Join-Path $script:RepoRoot320 'LICENSE') -Raw
+        $readme = Get-Content -LiteralPath (Get-OrmDocPath -Name 'readme' -RepoRoot $script:RepoRoot320) -Raw
+        $claim = [regex]::Match($readme, '(?m)^\|\s*\*\*Licence\*\*\s*\|\s*\[(?<name>[^\]]+)\]\((?<target>[^)]+)\)')
+        $claim.Success | Should -BeTrue -Because 'the README states the licence in its requirements table'
+        $name = $claim.Groups['name'].Value
+        # The licence the README names must be the licence the file actually is.
+        if ($licenseText -match 'GNU GENERAL PUBLIC LICENSE') {
+            $version = if ($licenseText -match '(?m)^\s*Version\s+(?<v>\d+)') { $Matches['v'] } else { '' }
+            $name | Should -Match 'GNU General Public License'
+            $name | Should -Match ('v' + $version)
+        }
+        elseif ($licenseText -match 'MIT License') { $name | Should -Match 'MIT' }
+        else { throw "Unrecognised LICENSE file; teach this test to identify it before trusting the README." }
+        # Every relative link in the documentation set resolves to a file that exists.
+        foreach ($docName in @('readme', 'reference')) {
+            $path = Get-OrmDocPath -Name $docName -RepoRoot $script:RepoRoot320
+            $dir = Split-Path -Parent $path
+            $raw = Get-Content -LiteralPath $path -Raw
+            foreach ($m in [regex]::Matches($raw, '\]\((?<t>[^)#][^)]*)\)')) {
+                $target = $m.Groups['t'].Value
+                if ($target -match '^[a-z]+://') { continue }
+                $target = ($target -split '#')[0]
+                if (-not $target) { continue }
+                Test-Path -LiteralPath (Join-Path $dir $target) | Should -BeTrue -Because "$docName links to $target"
+            }
+        }
     }
 
     It 'both documents describe the behaviour this build has' {

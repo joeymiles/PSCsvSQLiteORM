@@ -5,6 +5,10 @@ exactly what a command does to your data.
 
 - [Logging and configuration](#logging-and-configuration)
 - [CSV import](#csv-import)
+  - [Schema modes](#schema-modes)
+  - [`id` columns and uniqueness](#id-columns-and-uniqueness)
+  - [What the import does to the values it reads](#what-the-import-does-to-the-values-it-reads)
+  - [Other rules of an import](#other-rules-of-an-import)
 - [Table and column names](#table-and-column-names)
 - [Foreign keys](#foreign-keys)
 - [Dynamic models](#dynamic-models)
@@ -147,13 +151,20 @@ checks the data already in the child table:
 - `Remove-DbForeignKey -Database <db> -From <table> -Column <column>` drops the three triggers of a
   relationship (including the ON DELETE trigger that lives on the parent table), deletes its `__fks__` row
   and returns the names of the triggers it dropped. Removing a relationship that is not there is not an
-  error. Call it **before** dropping a table that takes part in a confirmed relationship: SQLite drops a
-  trigger only together with the table the trigger is defined on, so the parent's trigger would otherwise
-  survive its child table and break every later DELETE on the parent.
+  error, and it supports `-WhatIf` and `-Confirm`. Call it **before** dropping a table that takes part in a
+  confirmed relationship: SQLite drops a trigger only together with the table the trigger is defined on, so
+  the parent's trigger would otherwise survive its child table and break every later DELETE on the parent.
 
-`Find-DbRelationships` proposes relationships from `*_id` column names and records them as candidates;
-`Confirm-DbForeignKey` is what promotes one to `confirmed`, and only confirmed relationships drive `Auto`
-joins and record navigation.
+`Find-DbRelationships` proposes relationships from `*_id` column names and records them in the catalog as
+`suggested`; `Confirm-DbForeignKey` promotes one to `confirmed` and creates the triggers. The two kinds are
+used differently:
+
+- `Auto` joins consider **every** catalog row, confirmed or merely suggested, preferring confirmed rows and
+  then higher confidence. So a relationship that `Find-DbRelationships` guessed is enough for an `Auto` join,
+  and a wrong guess can drive one. Check the catalog (`SELECT * FROM __fks__`) before relying on it.
+- `GetHasMany()` / `GetBelongsTo()` navigation uses **confirmed relationships only**, because the generated
+  models are built from confirmed rows. A suggested relationship gives
+  `No belongs_to '<table>' defined` until it is confirmed.
 
 ## Dynamic models
 
@@ -246,7 +257,8 @@ whatever the finders hand back.
   parameters, never interpolated, except for two forms: the strings `'excluded.<column>'` and `'@<column>'` refer to
   the proposed value of that row column (on both paths), and `@{ Sql = '<expression>' }` injects a raw SQL expression
   (which may itself use `excluded.<column>` or `@<column>`). An empty `UpdateSet` (`@{}`) means "insert or do
-  nothing".
+  nothing". All three forms are shown in
+  [Quick Start step 7](../README.md#7-upserts-and-tables-without-an-id-column).
 - `InsertMany()` and `BulkUpsert()` accept hashtables as well as objects with properties (the output of
   `Import-Csv`, `Select-Object` or `[pscustomobject]@{...}`); every row must supply at least one column.
 - A failed `BulkUpsert` rolls back its transaction and rethrows the original error.

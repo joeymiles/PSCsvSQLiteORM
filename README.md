@@ -13,7 +13,7 @@ well as PowerShell 7.
 | **Requires** | [PSSQLite](https://www.powershellgallery.com/packages/PSSQLite) 1.1.0 or later |
 | **Version** | 3.2.0 ([changelog](CHANGELOG.md)) |
 | **Reference** | [docs/reference.md](docs/reference.md), or `Get-Help about_PSCsvSQLiteORM` |
-| **Licence** | [MIT](LICENSE) |
+| **Licence** | [GNU General Public License v2.0](LICENSE) |
 
 ## Quick Start
 
@@ -79,9 +79,10 @@ $types = Export-DynamicModelsFromCatalog -Database .\myapp.db
 # Create PowerShell classes from the models
 Set-DynamicORMClass
 ```
-One class per table, named `Dynamic` plus the table name in PascalCase, with an accessor per column. The
-classes are only resolvable inside the module, so build instances with `New-DynamicRecord` (step 6) rather than
-`New-Object`. See [dynamic models](docs/reference.md#dynamic-models).
+One class per table, named `Dynamic` plus the table name in PascalCase, with an accessor for every column
+except `id`, which is the `.Id` property. The classes are only resolvable inside the module, so build
+instances with `New-DynamicRecord` (step 6) rather than `New-Object`. See
+[dynamic models](docs/reference.md#dynamic-models).
 
 ### 5. Query Your Data
 ```powershell
@@ -190,9 +191,9 @@ Remove-DbForeignKey -Database .\myapp.db -From vulns -Column asset_id
 # Release the file when the script is finished with it
 Close-DbConnections
 ```
-Because one pooled connection serves the whole database, an uncommitted transaction takes in every later write
-until it is completed. `Close-DbConnections` and `Initialize-ORMVars` roll one back with a warning rather than
-discarding it silently. See
+`Close-DbConnections` and `Initialize-ORMVars` roll an uncommitted transaction back with a warning rather than
+discarding it silently, and `Complete-DbTransaction` / `Undo-DbTransaction` accept `-Database` alone when the
+handle has been lost. See
 [transactions, raw SQL and maintenance](docs/reference.md#transactions-raw-sql-and-maintenance).
 
 ### 10. Schema Migrations
@@ -206,9 +207,11 @@ Add-DbMigration -Database .\myapp.db -Version '001-add-owner' -Up {
 # Applied versions, in the order they were applied
 Get-AppliedMigrations -Database .\myapp.db
 ```
-A version already applied is skipped, so a script may call the same migration on every run. `-Up` runs inside a
-transaction with its bookkeeping row, so a migration that throws leaves nothing behind. There is no rollback
-command: write a later migration instead. See [migrations](docs/reference.md#migrations).
+Migrations are one-way. There is no command that reverts one, and the `-Down` parameter `Add-DbMigration`
+accepts is never stored and never executed, so undoing a change means writing a later migration. A version
+already applied is skipped, which lets a script call the same migration on every run, and `-Up` runs inside a
+transaction with its bookkeeping row, so a migration that throws leaves nothing behind. See
+[migrations](docs/reference.md#migrations).
 
 ## Commands
 
@@ -237,4 +240,5 @@ Invoke-Pester -Path .\Tests
 
 The build writes `output\PSCsvSQLiteORM\<version>\` using [ModuleBuilder](https://github.com/PoshCode/ModuleBuilder)
 and fails if the docs or the sample settings file do not reach it. The test suite runs on Windows PowerShell 5.1
-and on PowerShell 7, and executes every command in this file and in the reference.
+and on PowerShell 7, and executes every code block in sections 3 to 10 of this file line by line, so an example
+that stops working fails the build.

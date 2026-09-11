@@ -69,7 +69,9 @@ function Get-OrmDocCodeBlock {
         The PowerShell code blocks under a markdown heading, found by the heading text rather than by the
         ordinal position of the block in the file, so that adding or reordering sections cannot silently
         point a test at the wrong code. -Heading matches the part of the heading line after the '#'
-        characters, case-insensitively, as a substring ('3. Import CSV Data').
+        characters, case-insensitively, as a substring ('3. Import CSV Data'). The first heading that contains
+        -Heading wins, so pass enough of the heading to be unambiguous when one heading is a substring of
+        another.
         Returns the block bodies; throws when the heading is absent or carries no PowerShell block.
     #>
     [CmdletBinding()]
