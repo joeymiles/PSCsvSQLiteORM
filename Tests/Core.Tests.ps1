@@ -1555,3 +1555,130 @@ Describe 'Set-DbLogging applies only the parameters the caller supplied' -Tag 'E
         (& $m { $script:DbLogPath }) | Should -Be $logA
     }
 }
+
+Describe 'Initialize-ORMVars takes the hashtable out of everything a settings script emits' -Tag 'E2E1-023' {
+    BeforeAll {
+        function New-SettingsFile023 {
+            param([string]$Name, [string[]]$Lines)
+            $p = Join-Path $script:coreWorkDir $Name
+            Set-Content -LiteralPath $p -Value $Lines -Encoding ASCII
+            return $p
+        }
+    }
+    AfterAll { Initialize-ORMVars }
+
+    It 'applies the settings when the script writes other output before returning the hashtable' {
+        # Before the fix the dot-source captured an Object[] (the New-Item output plus the hashtable),
+        # the '$cfg -is [hashtable]' guard was false and every configured key was dropped in silence.
+        $logDir = Join-Path $script:coreWorkDir 'e2e1023_logs'
+        $logFile = Join-Path $logDir 'app.log'
+        $dbPath = Join-Path $script:coreWorkDir 'e2e1023_cfg.db'
+        $settings = New-SettingsFile023 -Name 'e2e1023_noisy.ps1' -Lines @(
+            ("New-Item -ItemType Directory -Path '{0}' -Force" -f $logDir),
+            "Write-Output 'stray output'",
+            ("@{{ LogLevel = 'DEBUG'; LogPath = '{0}'; DbPath = '{1}' }}" -f $logFile, $dbPath)
+        )
+        Initialize-ORMVars -SettingsPath $settings
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logFile
+        (& $m { $script:DbDefaultPath }) | Should -Be $dbPath
+        Write-DbLog -Level DEBUG -Message 'e2e1023 noisy settings applied'
+        $logFile | Should -Exist
+        (Get-Content -LiteralPath $logFile -Raw) | Should -Match 'e2e1023 noisy settings applied'
+    }
+
+    It 'uses the last hashtable when the script emits more than one' {
+        $settings = New-SettingsFile023 -Name 'e2e1023_two.ps1' -Lines @(
+            "@{ LogLevel = 'DEBUG' }",
+            "@{ LogLevel = 'WARN' }"
+        )
+        Initialize-ORMVars -SettingsPath $settings
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+    }
+
+    It 'throws and keeps the previous configuration when the script returns something else' {
+        $log = Join-Path $script:coreWorkDir 'e2e1023_keep.log'
+        Initialize-ORMVars -LogLevel WARN -LogPath $log -DbPath 'e2e1023_keep.db'
+        $settings = New-SettingsFile023 -Name 'e2e1023_string.ps1' -Lines @("'just a string'")
+        { Initialize-ORMVars -SettingsPath $settings } | Should -Throw '*did not return a hashtable*'
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+        (& $m { $script:DbLogPath }) | Should -Be $log
+        (& $m { $script:DbDefaultPath }) | Should -Be 'e2e1023_keep.db'
+    }
+
+    It 'throws when the settings script emits nothing at all' {
+        $log = Join-Path $script:coreWorkDir 'e2e1023_empty.log'
+        Initialize-ORMVars -LogLevel ERROR -LogPath $log
+        $settings = New-SettingsFile023 -Name 'e2e1023_empty.ps1' -Lines @('$null = 1')
+        { Initialize-ORMVars -SettingsPath $settings } | Should -Throw '*did not return a hashtable*'
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { $script:DbLogLevel }) | Should -Be 'ERROR'
+        (& $m { $script:DbLogPath }) | Should -Be $log
+    }
+}
+
+Describe 'Initialize-ORMVars resets every piece of state it owns' -Tag 'E2E1-029' {
+    AfterAll { Initialize-ORMVars; Close-DbConnections }
+
+    It 'clears the default database path like it clears the logging configuration' {
+        # Before the fix DbDefaultPath was only ever assigned, so a bare re-init wiped the log
+        # level and log path but left the previous default database path behind.
+        $m = (Get-Command Initialize-ORMVars).Module
+        $log = Join-Path $script:coreWorkDir 'e2e1029.log'
+        Initialize-ORMVars -DbPath 'e2e1029_first.db' -LogLevel DEBUG -LogPath $log
+        (& $m { $script:DbDefaultPath }) | Should -Be 'e2e1029_first.db'
+        Initialize-ORMVars
+        (& $m { $script:DbLogLevel }) | Should -Be 'INFO'
+        (& $m { $script:DbLogPath }) | Should -BeNullOrEmpty
+        (& $m { $script:DbDefaultPath }) | Should -BeNullOrEmpty
+    }
+
+    It 'clears the model registry together with the generated class scripts' {
+        $db = New-CoreDbPath -Name 'e2e1029models'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE assets (id INTEGER PRIMARY KEY, hostname TEXT)' -NonQuery | Out-Null
+        $typeName = New-DynamicModel -TableName 'assets' -Database $db -Columns @('id', 'hostname') -Confirm:$false
+        Set-DynamicORMClass -Confirm:$false
+        (New-DynamicRecord -Table 'assets' -Database $db) | Should -Not -BeNullOrEmpty
+
+        Initialize-ORMVars
+        $m = (Get-Command Initialize-ORMVars).Module
+        (& $m { @($script:DynamicClassScripts).Count }) | Should -Be 0
+        (& $m { @($script:ModelRegistry.Keys).Count }) | Should -Be 0
+        (& $m { @($script:ModelTypes.Keys).Count }) | Should -Be 0
+        (& $m { @($script:ModelTypeObjects.Keys).Count }) | Should -Be 0
+        # Before the fix the stale registry still answered here while Set-DynamicORMClass had
+        # nothing left to load, so the two halves of the dynamic model state disagreed.
+        { New-DynamicRecord -Table 'assets' -Database $db } | Should -Throw '*No dynamic model is registered*'
+
+        # A type name handed out in this session stays reserved, so re-registering the same table
+        # gets its original readable name back instead of a hash suffixed one.
+        $again = New-DynamicModel -TableName 'assets' -Database $db -Columns @('id', 'hostname') -Confirm:$false
+        $again | Should -Be $typeName
+        Set-DynamicORMClass -Confirm:$false
+        (New-DynamicRecord -Table 'assets' -Database $db) | Should -Not -BeNullOrEmpty
+        Close-DbConnections
+    }
+
+    It 'clears the warn-once markers of a log path that can never be written' {
+        # The parent of the log path is an existing file, so every write to it fails and is
+        # warned about once. After a re-init the marker must be gone and the next failure for
+        # the same path must warn again; before the fix DbLogFailedPaths survived and it did not.
+        $blocker = Join-Path $script:coreWorkDir 'e2e1029_blocker.txt'
+        Set-Content -LiteralPath $blocker -Value 'x' -Encoding ASCII
+        $logFile = Join-Path $blocker 'db.log'
+        $m = (Get-Command Initialize-ORMVars).Module
+
+        $first = @(Initialize-ORMVars -LogLevel INFO -LogPath $logFile 3>&1)
+        @($first | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count | Should -Be 1
+        (& $m { @($script:DbLogFailedPaths.Keys).Count }) | Should -BeGreaterThan 0
+
+        Initialize-ORMVars
+        (& $m { @($script:DbLogFailedPaths.Keys).Count }) | Should -Be 0
+
+        $second = @(Initialize-ORMVars -LogLevel INFO -LogPath $logFile 3>&1)
+        @($second | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count | Should -Be 1
+    }
+}
