@@ -51,15 +51,53 @@ try {
 
     # Copy docs and examples
     $builtVersionPath = Join-Path $builtBase $Version
+    $aboutTopic = "about_$ModuleName.help.txt"
 
     $docsSrc = Join-Path $PSScriptRoot 'docs'
     if (Test-Path $docsSrc) {
         Copy-Item -Recurse -Force $docsSrc (Join-Path $builtVersionPath 'docs')
+
+        # Get-Help searches the module's culture folder for about topics, never docs\. Without this copy
+        # Get-Help about_PSCsvSQLiteORM silently answers from whatever older copy of the module happens to
+        # sit on PSModulePath instead of from the build under test (E2E1-031).
+        $aboutSrc = Join-Path $docsSrc $aboutTopic
+        if (Test-Path -LiteralPath $aboutSrc) {
+            $cultureDir = Join-Path $builtVersionPath 'en-US'
+            if (-not (Test-Path -LiteralPath $cultureDir)) {
+                New-Item -ItemType Directory -Path $cultureDir | Out-Null
+            }
+            Copy-Item -Force -LiteralPath $aboutSrc -Destination (Join-Path $cultureDir $aboutTopic)
+        }
     }
 
     $examplesSrc = Join-Path $SourcePath 'Examples'
     if (Test-Path $examplesSrc) {
         Copy-Item -Recurse -Force $examplesSrc (Join-Path $builtVersionPath 'Examples')
+    }
+
+    # Verify the extra content really shipped. Until this check existed, a build whose docs\ or
+    # source\Examples\ folder was missing (or whose copy failed) still reported success, and the module it
+    # produced broke README's promise of Examples\orm.settings.ps1 and carried no about topic (E2E1-031).
+    $requiredBuiltFiles = @(
+        (Join-Path (Join-Path $builtVersionPath 'docs') $aboutTopic),
+        (Join-Path (Join-Path $builtVersionPath 'en-US') $aboutTopic),
+        (Join-Path (Join-Path $builtVersionPath 'Examples') 'orm.settings.ps1')
+    )
+    # Every file under docs\ and source\Examples\ must have a counterpart in the built module, so content
+    # added later is covered without anyone having to extend the list above.
+    $contentPairs = @()
+    $contentPairs += [PSCustomObject]@{ Source = $docsSrc; Target = (Join-Path $builtVersionPath 'docs') }
+    $contentPairs += [PSCustomObject]@{ Source = $examplesSrc; Target = (Join-Path $builtVersionPath 'Examples') }
+    foreach ($pair in $contentPairs) {
+        if (-not (Test-Path -LiteralPath $pair.Source)) { continue }
+        foreach ($sourceFile in @(Get-ChildItem -LiteralPath $pair.Source -Recurse -File)) {
+            $relative = $sourceFile.FullName.Substring($pair.Source.Length).TrimStart('\', '/')
+            $requiredBuiltFiles += (Join-Path $pair.Target $relative)
+        }
+    }
+    $missingContent = @($requiredBuiltFiles | Sort-Object -Unique | Where-Object { -not (Test-Path -LiteralPath $_) })
+    if ($missingContent.Count -gt 0) {
+        throw "Build incomplete: the built module is missing $($missingContent -join ', '). Check that docs\ and source\Examples\ exist and were copied into $builtVersionPath."
     }
 
     Write-Host "Successfully built $ModuleName version $Version" -ForegroundColor Green
