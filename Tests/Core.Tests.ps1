@@ -1,9 +1,13 @@
 # Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068)
 
-$moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+$moduleFolder = Get-OrmBuiltManifestPath
 Import-Module $moduleFolder -Force
 
 BeforeAll {
+    # Pester runs It blocks in their own scope, so the helper must be dot-sourced here as well
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
     function New-Rows {
         param([string]$Header, [object[]]$Values)
         $rows = @()
@@ -399,8 +403,9 @@ Describe 'Module import sets defaults without calling module functions' -Tag 'BU
         # A child process of the current host gives a clean session with the default PSModulePath
         # (installed copies of the module present), which is where the auto-load used to happen.
         $exe = (Get-Process -Id $PID).Path
-        $folder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
-        $expectedRoot = (Resolve-Path -LiteralPath $folder).Path
+        # Import the built manifest of the declared version, not the unversioned folder (BUG-077)
+        $folder = Get-OrmBuiltManifestPath
+        $expectedRoot = Split-Path -Parent (Resolve-Path -LiteralPath $folder).Path
         $probe = @'
 param($Folder)
 $Error.Clear()

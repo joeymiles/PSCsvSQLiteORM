@@ -1,12 +1,14 @@
 # Regression tests for DynamicActiveRecord (dynamic models).
 # Runs on Windows PowerShell 5.1 and PowerShell 7. Databases are created under a unique directory inside $env:TEMP.
 
-# Join two pieces at a time: the three-argument Join-Path form does not exist on Windows PowerShell 5.1
-$script:ModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+$script:ModuleFolder = Get-OrmBuiltManifestPath
 Import-Module $script:ModuleFolder -Force
 
 BeforeAll {
-    $script:ModuleFolder = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'output') 'PSCsvSQLiteORM'
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+    $script:ModuleFolder = Get-OrmBuiltManifestPath
     Import-Module $script:ModuleFolder -Force
     $script:Orm = Get-Module PSCsvSQLiteORM | Where-Object { $_.ModuleBase -like ((Split-Path -Parent $PSScriptRoot) + '*') } | Select-Object -First 1
     if (-not $script:Orm) { $script:Orm = Get-Module PSCsvSQLiteORM | Select-Object -First 1 }
@@ -1015,5 +1017,27 @@ Describe 'BUG-069 record keys are 64-bit' -Tag 'BUG-069' {
         $rec = New-DynamicRecord -Table 'assets' -Database $script:db069
         $rec.SetAttribute('hostname', 'after'); $rec.SetAttribute('ip', '2.2.2.2'); $rec.Save()
         $rec.Id | Should -BeGreaterThan ([long]4000000000)
+    }
+}
+
+Describe 'BUG-062 record writes with spaced or dashed columns neither fail nor silently no-op' -Tag 'BUG-062' {
+    BeforeAll {
+        $script:db062 = New-TestDbPath 'bug062'
+        Invoke-DbQuery -Database $script:db062 -Query 'CREATE TABLE people(id INTEGER PRIMARY KEY AUTOINCREMENT, "First Name" TEXT, "Last-Name" TEXT)' -NonQuery | Out-Null
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'Save() on a base record inserts the row, sets the Id and stores the row on either host' {
+        $rec = New-BaseRecord 'people' $script:db062 @('id', 'First Name', 'Last-Name')
+        $rec.SetAttribute('First Name', 'Ann'); $rec.SetAttribute('Last-Name', 'Lee')
+        { $rec.Save() } | Should -Not -Throw
+        $rec.Id | Should -BeGreaterThan 0
+        (Get-Count $script:db062 'SELECT COUNT(*) AS c FROM people WHERE "First Name" = ''Ann'' AND "Last-Name" = ''Lee''') | Should -Be 1
+    }
+
+    It 'InsertMany() on a base record binds spaced and dashed columns without error' {
+        $rec = New-BaseRecord 'people' $script:db062 @('id', 'First Name', 'Last-Name')
+        { $rec.InsertMany(@(@{ 'First Name' = 'Bob'; 'Last-Name' = 'Ray' })) } | Should -Not -Throw
+        (Get-Count $script:db062 'SELECT COUNT(*) AS c FROM people') | Should -Be 2
     }
 }

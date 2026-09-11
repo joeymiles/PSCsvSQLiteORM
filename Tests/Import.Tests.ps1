@@ -1,6 +1,8 @@
 # Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074)
 
-$moduleFolder = Join-Path (Join-Path $PSScriptRoot '..') 'output\PSCsvSQLiteORM'
+# Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
+$moduleFolder = Get-OrmBuiltManifestPath
 Import-Module $moduleFolder -Force
 
 BeforeAll {

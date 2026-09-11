@@ -1,10 +1,6 @@
 # Build output
 output/
 
-# Build and publish scripts
-build-and-test.ps1
-publish.ps1
-
 # AI assistance files
 CLAUDE.md
 .claude/

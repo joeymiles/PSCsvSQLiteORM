@@ -14,7 +14,7 @@ RootModule = 'PSCsvSQLiteORM.psm1'
 ModuleVersion = '3.1.3'
 
 # Supported PSEditions
-CompatiblePSEditions = @('Desktop')
+CompatiblePSEditions = @('Desktop', 'Core')
 
 # ID used to uniquely identify this module
 GUID = '6109e160-fe6f-4fc3-87be-bb71db65bfd7'
@@ -29,7 +29,7 @@ CompanyName = 'SomeGuyDoingCoolStuff'
 Copyright = '(c) Joey A Miles. All rights reserved.'
 
 # Description of the functionality provided by this module
-Description = 'A SQLite ORM for Windows PowerShell 5.1 with catalog, relationships, joins, upserts, and migrations.'
+Description = 'A SQLite ORM for Windows PowerShell 5.1 and PowerShell 7 with catalog, relationships, joins, upserts, and migrations.'
 
 # Minimum version of the PowerShell engine required by this module
 PowerShellVersion = '5.1'
@@ -50,7 +50,7 @@ PowerShellVersion = '5.1'
 # ProcessorArchitecture = ''
 
 # Modules that must be imported into the global environment prior to importing this module
-RequiredModules = @('PSSQLite')
+RequiredModules = @(@{ ModuleName = 'PSSQLite'; ModuleVersion = '1.1.0' })
 
 # Assemblies that must be loaded prior to importing this module
 # RequiredAssemblies = @()
@@ -106,7 +106,33 @@ PrivateData = @{
         # IconUri = ''
 
         # ReleaseNotes of this module
-        ReleaseNotes = 'v3.1.3 - Fixed SQL parameter binding errors when column names contain spaces or special characters - Sanitize parameter names to use only alphanumeric characters and underscores - Improved compatibility with CSV files that have complex column naming'
+        ReleaseNotes = @'
+Unreleased (since v3.1.3)
+- DynamicActiveRecord Save, InsertMany, InsertOnConflict and BulkUpsert bind every column value under a
+  positional parameter name (@p0..@pN), so record writes work for columns with spaces, dashes or other
+  special characters; a failed insert now throws on Windows PowerShell 5.1 as well as on PowerShell 7
+- Manifest declares both the Desktop and Core editions and pins PSSQLite 1.1.0 or later
+
+v3.1.3
+- Import-CsvToSqlite sanitizes SQL parameter names (alphanumeric characters and underscores only), so CSV
+  files with spaces or special characters in their headers import without binding errors
+- Note: this release did not change the DynamicActiveRecord write paths; see Unreleased above
+
+v3.1.2
+- Fixed SQLite version compatibility by replacing ON CONFLICT (UPSERT) syntax with traditional INSERT/UPDATE
+- Supports older SQLite versions (< 3.24.0) that don't have UPSERT support
+- Fixed catalog update functions for broader SQLite compatibility
+
+v3.1.1
+- Fixed PowerShell 5.1 compatibility by replacing null-coalescing operator (??) with conditional statements
+- Resolved module import errors on Windows PowerShell 5.1
+
+v3.1.0
+- Added AppendOnly schema mode
+- RIGHT/FULL join emulation support
+- Settings script support for configuration
+- Improved error handling and logging
+'@
 
         # Prerelease string of this module
         # Prerelease = ''
