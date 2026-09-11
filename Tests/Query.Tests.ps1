@@ -284,3 +284,192 @@ Describe 'DbQuery two-argument and one-argument Join overloads (BUG-065)' -Tag '
         { (New-DbQuery -Database $script:db065 -From 'assets').Join('vulns', 'vulns.asset_id = assets.id', 'Cross') } | Should -Throw -ExpectedMessage "*Invalid join type*"
     }
 }
+
+Describe 'DbQuery Right/Full join projection with the default SELECT * (E2E1-005)' -Tag 'E2E1-005' {
+    BeforeAll {
+        $script:db005 = New-TestDbPath 'e2e1005'
+        Invoke-DbQuery -Database $script:db005 -Query 'CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, city TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db005 -Query 'CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db005 -Query "INSERT INTO customers VALUES (1,'Ann','Oslo')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db005 -Query 'INSERT INTO orders VALUES (10,1,5.0),(99,777,9.0)' -NonQuery | Out-Null
+
+        function Get-ColumnNames([object]$Row) {
+            return , @($Row.PSObject.Properties | ForEach-Object { $_.Name })
+        }
+        function Get-ColumnValue([object]$Row, [int]$Index) {
+            return (@($Row.PSObject.Properties)[$Index]).Value
+        }
+    }
+
+    It 'a Full join without Select() keeps both halves of the UNION in the same column order' {
+        # The unmatched order used to come back with its own values sitting in the customer columns, because
+        # '*' expands in FROM order and the emulation swaps the tables round for the second half.
+        $rows = Get-Rows ((New-DbQuery -Database $script:db005 -From 'customers').Join('orders', 'orders.customer_id = customers.id', 'Full').Run())
+        $rows.Count | Should -Be 2
+        $names = Get-ColumnNames $rows[0]
+        $names.Count | Should -Be 6
+        $names[0] | Should -Be 'id'
+        $names[1] | Should -Be 'name'
+        $names[2] | Should -Be 'city'
+        $names[4] | Should -Be 'customer_id'
+        $names[5] | Should -Be 'total'
+
+        $matched = @($rows | Where-Object { -not (Test-IsNull $_.name) })
+        $matched.Count | Should -Be 1
+        $matched[0].name | Should -Be 'Ann'
+        $matched[0].city | Should -Be 'Oslo'
+        [int](Get-ColumnValue $matched[0] 3) | Should -Be 10
+        [int]$matched[0].customer_id | Should -Be 1
+
+        $unmatched = @($rows | Where-Object { Test-IsNull $_.name })
+        $unmatched.Count | Should -Be 1
+        Test-IsNull $unmatched[0].id | Should -BeTrue -Because 'the order without a customer must leave every customer column NULL'
+        Test-IsNull $unmatched[0].city | Should -BeTrue
+        [int](Get-ColumnValue $unmatched[0] 3) | Should -Be 99
+        [int]$unmatched[0].customer_id | Should -Be 777
+        [double]$unmatched[0].total | Should -Be 9
+    }
+
+    It 'a Right join without Select() returns the From table columns first, like Inner and Left do' {
+        $inner = Get-Rows ((New-DbQuery -Database $script:db005 -From 'customers').Join('orders', 'orders.customer_id = customers.id', 'Inner').Run())
+        $right = Get-Rows ((New-DbQuery -Database $script:db005 -From 'customers').Join('orders', 'orders.customer_id = customers.id', 'Right').Run())
+        $right.Count | Should -Be 2
+        (Get-ColumnNames $right[0]) | Should -Be (Get-ColumnNames $inner[0])
+        $matched = @($right | Where-Object { -not (Test-IsNull $_.name) })
+        $matched.Count | Should -Be 1
+        $matched[0].name | Should -Be 'Ann'
+        [int]$matched[0].customer_id | Should -Be 1
+    }
+
+    It 'an explicit Select() is still used verbatim for both join types' {
+        $rows = Get-Rows ((New-DbQuery -Database $script:db005 -From 'customers').Join('orders', 'orders.customer_id = customers.id', 'Full').Select(@('customers.name AS cname', 'orders.id AS oid')).OrderBy('oid').Run())
+        $rows.Count | Should -Be 2
+        (Get-ColumnNames $rows[0]) | Should -Be @('cname', 'oid')
+    }
+
+    It 'aliased table references project the alias columns in From order' {
+        $rows = Get-Rows ((New-DbQuery -Database $script:db005 -From 'customers c').Join('orders o', 'o.customer_id = c.id', 'Full').Run())
+        $rows.Count | Should -Be 2
+        $names = Get-ColumnNames $rows[0]
+        $names[0] | Should -Be 'id'
+        $names[1] | Should -Be 'name'
+        $names[4] | Should -Be 'customer_id'
+    }
+}
+
+Describe 'DbQuery Auto join rejects an ambiguous catalog relationship (E2E1-015)' -Tag 'E2E1-015' {
+    BeforeAll {
+        $script:db015 = New-TestDbPath 'e2e1015'
+        Invoke-DbQuery -Database $script:db015 -Query 'CREATE TABLE users (id INTEGER PRIMARY KEY, uname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db015 -Query 'CREATE TABLE tickets (id INTEGER PRIMARY KEY, created_by INTEGER, assigned_to INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db015 -Query "INSERT INTO users VALUES (1,'ann'),(2,'bob')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db015 -Query 'INSERT INTO tickets VALUES (1,1,2),(2,2,1),(3,1,NULL),(4,2,NULL),(5,1,NULL)' -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $script:db015 -From 'tickets' -Column 'created_by' -To 'users'
+        Confirm-DbForeignKey -Database $script:db015 -From 'tickets' -Column 'assigned_to' -To 'users'
+    }
+
+    It 'two confirmed foreign keys to the same table make Join(<table>) throw instead of picking one' {
+        $q = New-DbQuery -Database $script:db015 -From 'tickets'
+        { $q.Join('users') } | Should -Throw -ExpectedMessage '*ambiguous*'
+        { $q.Join('users', 'Auto', 'Left') } | Should -Throw -ExpectedMessage '*created_by*'
+        $q.Joins.Count | Should -Be 0 -Because 'a rejected Auto join must not be recorded'
+    }
+
+    It 'the four-argument overload selects the foreign key to join on' {
+        $byCreated = (New-DbQuery -Database $script:db015 -From 'tickets').Join('users', 'Auto', 'Inner', 'created_by')
+        $byCreated.Joins[0].On | Should -Be 'tickets."created_by" = users."id"'
+        (Get-Rows ($byCreated.Run())).Count | Should -Be 5
+
+        $byAssigned = (New-DbQuery -Database $script:db015 -From 'tickets').Join('users', 'Auto', 'Inner', 'assigned_to')
+        $byAssigned.Joins[0].On | Should -Be 'tickets."assigned_to" = users."id"'
+        (Get-Rows ($byAssigned.Run())).Count | Should -Be 2
+    }
+
+    It 'the four-argument overload works with aliases and other join types' {
+        $q = (New-DbQuery -Database $script:db015 -From 'tickets t').Join('users u', 'Auto', 'Left', 'assigned_to')
+        $q.Joins[0].Type | Should -Be 'Left'
+        $q.Joins[0].On | Should -Be 't."assigned_to" = u."id"'
+        (Get-Rows ($q.Select(@('t.id AS tid', 'u.uname AS un')).Run())).Count | Should -Be 5
+    }
+
+    It 'an unknown foreign-key column and a ForeignKey next to an explicit ON are rejected' {
+        $q = New-DbQuery -Database $script:db015 -From 'tickets'
+        { $q.Join('users', 'Auto', 'Inner', 'nosuch') } | Should -Throw -ExpectedMessage "*'nosuch'*"
+        { $q.Join('users', 'tickets.created_by = users.id', 'Inner', 'created_by') } | Should -Throw -ExpectedMessage '*ForeignKey argument*'
+        $q.Joins.Count | Should -Be 0
+    }
+
+    It 'a single relationship is still resolved automatically' {
+        $db = New-RelationalDb
+        $q = (New-DbQuery -Database $db -From 'vulns').Join('assets')
+        $q.Joins[0].On | Should -Be 'vulns."asset_id" = assets."id"'
+        (Get-Rows ($q.Run())).Count | Should -Be 4
+    }
+}
+
+Describe 'DbQuery Full join rejects a From source without a rowid (E2E1-016)' -Tag 'E2E1-016' {
+    BeforeAll {
+        $script:db016 = New-TestDbPath 'e2e1016'
+        Invoke-DbQuery -Database $script:db016 -Query 'CREATE TABLE hosts (id INTEGER PRIMARY KEY, hostname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db016 -Query "INSERT INTO hosts VALUES (1,'server01'),(2,'server02'),(3,'server03')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db016 -Query 'CREATE VIEW v_hosts AS SELECT * FROM hosts' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db016 -Query 'CREATE TABLE norowid (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db016 -Query "INSERT INTO norowid VALUES ('a','1'),('b','2')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db016 -Query 'CREATE TABLE tags (k TEXT, n INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db016 -Query "INSERT INTO tags VALUES ('a',1),('z',9)" -NonQuery | Out-Null
+    }
+
+    It 'a Full join whose From table is a view throws instead of answering differently per host' {
+        # It used to return 3 rows on Windows PowerShell 5.1 and 6 duplicated rows on PowerShell 7.
+        $q = (New-DbQuery -Database $script:db016 -From 'v_hosts').Join('hosts', 'hosts.id = v_hosts.id', 'Full').Select(@('v_hosts.hostname AS h'))
+        { $q.Run() } | Should -Throw -ExpectedMessage '*Full join requires a rowid table*'
+        { $q.Run() } | Should -Throw -ExpectedMessage '*view*'
+    }
+
+    It 'a Full join whose From table is WITHOUT ROWID throws a clear message' {
+        $q = (New-DbQuery -Database $script:db016 -From 'norowid').Join('tags', 'norowid.k = tags.k', 'Full').Select(@('norowid.k AS k1', 'tags.k AS k2'))
+        { $q.Run() } | Should -Throw -ExpectedMessage '*WITHOUT ROWID*'
+    }
+
+    It 'the same query against the base table still returns the full outer join' {
+        $rows = Get-Rows ((New-DbQuery -Database $script:db016 -From 'tags').Join('norowid', 'norowid.k = tags.k', 'Full').Select(@('tags.k AS k1', 'norowid.k AS k2')).Run())
+        $rows.Count | Should -Be 3
+    }
+
+    It 'Inner, Left and Right joins from a view are untouched' {
+        (Get-Rows ((New-DbQuery -Database $script:db016 -From 'v_hosts').Join('hosts', 'hosts.id = v_hosts.id', 'Inner').Select(@('v_hosts.hostname AS h')).Run())).Count | Should -Be 3
+        (Get-Rows ((New-DbQuery -Database $script:db016 -From 'v_hosts').Join('hosts', 'hosts.id = v_hosts.id', 'Left').Select(@('v_hosts.hostname AS h')).Run())).Count | Should -Be 3
+        (Get-Rows ((New-DbQuery -Database $script:db016 -From 'v_hosts').Join('hosts', 'hosts.id = v_hosts.id', 'Right').Select(@('v_hosts.hostname AS h')).Run())).Count | Should -Be 3
+    }
+}
+
+Describe 'DbQuery.Run() returns an array for an empty result (E2E1-017)' -Tag 'E2E1-017' {
+    BeforeAll {
+        $script:db017 = New-TestDbPath 'e2e1017'
+        Invoke-DbQuery -Database $script:db017 -Query 'CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db017 -Query 'CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db017 -Query "INSERT INTO customers VALUES (1,'Ann')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db017 -Query 'INSERT INTO orders VALUES (10,1)' -NonQuery | Out-Null
+    }
+
+    It 'an empty plain query yields an empty array, not $null' {
+        $result = (New-DbQuery -Database $script:db017 -From 'customers').Where('1=0', $null).Run()
+        $null -eq $result | Should -BeFalse
+        @($result).Count | Should -Be 0
+        $result.Count | Should -Be 0
+    }
+
+    It 'an empty Right/Full emulation yields an empty array too' {
+        foreach ($type in @('Right', 'Full')) {
+            $result = (New-DbQuery -Database $script:db017 -From 'customers').Join('orders', 'orders.customer_id = customers.id', $type).Select(@('customers.id AS cid')).Where('1=0', $null).Run()
+            $null -eq $result | Should -BeFalse -Because "$type must return an array"
+            @($result).Count | Should -Be 0 -Because "$type must return an empty array"
+        }
+    }
+
+    It 'a non-empty result is unchanged' {
+        $result = (New-DbQuery -Database $script:db017 -From 'customers').Run()
+        @($result).Count | Should -Be 1
+        [int]$result[0].id | Should -Be 1
+    }
+}
