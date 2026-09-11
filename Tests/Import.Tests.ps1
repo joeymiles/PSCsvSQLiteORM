@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -410,5 +410,70 @@ Describe 'Import-CsvToSqlite Strict mode requires an existing table' -Tag 'BUG-0
         Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'fresh' -SchemaMode Relaxed | Out-Null
         $count = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM fresh' | Select-Object -First 1
         [int]$count.c | Should -Be 1
+    }
+}
+
+Describe 'Relaxed import that rebuilds a table to widen a column' -Tag 'E2E1-001' {
+    It 'widens a table that a Confirm-DbForeignKey ON DELETE trigger on the parent refers to' {
+        $db = New-TestDbPath -Name 'e2e1001a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE parent (id INTEGER PRIMARY KEY, t TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE prices (id INTEGER PRIMARY KEY, parent_id INTEGER, amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO parent(id,t) VALUES(1,'p')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,parent_id,amount) VALUES(1,1,1.5)' -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $db -From 'prices' -Column 'parent_id' -To 'parent' -OnDelete 'CASCADE'
+
+        # '10.0' is inferred TEXT, so Relaxed widens the declared REAL column and rebuilds the table.
+        # The ON DELETE trigger lives on 'parent' and names 'prices', so before the fix the rename
+        # inside the rebuild failed on SQLite 3.25+ after 'prices' had already been dropped.
+        $csv = New-TestCsv -Name 'e2e1001a.csv' -Lines @('id,parent_id,amount', '3,1,10.0')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode Relaxed } | Should -Not -Throw
+
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)')
+        ($info | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'TEXT'
+        $rows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM prices' | Select-Object -First 1
+        [int]$rows.c | Should -Be 2
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%__widen_tmp'").Count | Should -Be 0
+
+        # every foreign key trigger survived the rebuild, including the one on the parent table
+        $triggers = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name" | ForEach-Object { [string]$_.name })
+        $triggers | Should -Contain 'trg_fk_prices_parent_id_check'
+        $triggers | Should -Contain 'trg_fk_prices_parent_id_check_upd'
+        $triggers | Should -Contain 'trg_fk_prices_parent_id_ondelete'
+
+        # and they still enforce the relationship
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,parent_id,amount) VALUES(9,777,1)' -NonQuery } | Should -Throw
+        Invoke-DbQuery -Database $db -Query 'DELETE FROM parent WHERE id=1' -NonQuery | Out-Null
+        $afterCascade = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM prices' | Select-Object -First 1
+        [int]$afterCascade.c | Should -Be 0
+    }
+
+    It 'rolls a failed rebuild back instead of leaving the connection inside an aborted transaction' {
+        $db = New-TestDbPath -Name 'e2e1001b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
+        # an index already holding the name the rebuild needs for its temporary table makes the
+        # CREATE TABLE inside the rebuild fail, after the batch has issued BEGIN
+        Invoke-DbQuery -Database $db -Query 'CREATE INDEX "t__widen_tmp" ON t(v)' -NonQuery | Out-Null
+
+        $csv = New-TestCsv -Name 'e2e1001b.csv' -Lines @('id,v', '2,abc')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Throw
+
+        # the original table is untouched
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'v' }).type | Should -Be 'REAL'
+        $kept = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$kept.c | Should -Be 1
+
+        # the pooled connection is no longer inside the transaction the failed batch opened
+        $txError = $null
+        $tx = $null
+        try { $tx = Start-DbTransaction -Database $db } catch { $txError = $_ }
+        $txError | Should -BeNullOrEmpty
+        if ($tx) { Undo-DbTransaction -Database $db -Transaction $tx }
+
+        # a write made after the failure is committed instead of being discarded on close
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE later (x INTEGER)' -NonQuery | Out-Null
+        Close-DbConnections
+        $later = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='later'" | Select-Object -First 1
+        [int]$later.c | Should -Be 1
     }
 }
