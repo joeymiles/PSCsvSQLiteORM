@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014; TASK B6 round 2: E2E1-013, E2E1-019)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014; TASK B6 round 2: E2E1-013, E2E1-019; TASK B7 round 2: E2E1-021)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -600,12 +600,18 @@ Describe 'Update-DbCatalog skips tables whose names ConvertTo-Ident rejects' -Ta
     BeforeAll {
         $script:b043Db = New-CoreDbPath -Name 'b043'
         Invoke-DbQuery -Database $script:b043Db -Query 'CREATE TABLE "t$1"(id INTEGER PRIMARY KEY, x TEXT)' -NonQuery | Out-Null
+        # E2E1-021: '$' is quotable, so that table is cataloged now. A name ConvertTo-Ident still
+        # refuses needs a control character in it.
+        $script:b043Ctl = 'ctl' + [char]1 + 'x'
+        Invoke-DbQuery -Database $script:b043Db -Query ('CREATE TABLE "' + $script:b043Ctl + '"(id INTEGER PRIMARY KEY, x TEXT)') -NonQuery | Out-Null
     }
     It 'Import-CsvToSqlite succeeds and catalogs the new table' {
         { Import-CsvToSqlite -CsvPath (Join-Path $PSScriptRoot 'vulns.csv') -TableName vulns -Database $script:b043Db | Out-Null } | Should -Not -Throw
         [int](Invoke-DbQuery -Database $script:b043Db -Query 'SELECT COUNT(*) AS c FROM vulns')[0].c | Should -Be 4
         [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='vulns'")[0].c | Should -Be 1
-        [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='t`$1'")[0].c | Should -Be 0
+        # The unquotable table is skipped; the merely punctuated one is cataloged (E2E1-021).
+        [int](Invoke-DbQuery -Database $script:b043Db -Query 'SELECT COUNT(*) AS c FROM __tables__ WHERE table_name=@t' -SqlParameters @{ t = $script:b043Ctl })[0].c | Should -Be 0
+        [int](Invoke-DbQuery -Database $script:b043Db -Query "SELECT COUNT(*) AS c FROM __tables__ WHERE table_name='t`$1'")[0].c | Should -Be 1
     }
     It 'Export-DynamicModelsFromCatalog does not throw for the whole database' {
         { Export-DynamicModelsFromCatalog -Database $script:b043Db | Out-Null } | Should -Not -Throw
@@ -1360,5 +1366,85 @@ Describe 'Invoke-DbQuery -Scalar maps a SQL NULL cell to $null' -Tag 'E2E1-019' 
             $null -eq $v | Should -BeTrue
             $v -is [System.DBNull] | Should -BeFalse
         }
+    }
+}
+
+Describe 'ConvertTo-Ident quotes ordinary punctuation instead of refusing it' -Tag 'E2E1-021' {
+    It 'accepts the punctuation real CSV headers carry' {
+        ConvertTo-Ident 'Cost (USD)' | Should -Be '"Cost (USD)"'
+        ConvertTo-Ident '50%' | Should -Be '"50%"'
+        ConvertTo-Ident 'A/B' | Should -Be '"A/B"'
+        ConvertTo-Ident 'Weight [kg]' | Should -Be '"Weight [kg]"'
+        ConvertTo-Ident 'Done?' | Should -Be '"Done?"'
+        ConvertTo-Ident 'name+alias' | Should -Be '"name+alias"'
+        ConvertTo-Ident 'price$' | Should -Be '"price$"'
+        ConvertTo-Ident "O'Brien" | Should -Be '"O''Brien"'
+        # the characters the old whitelist did allow are unchanged
+        ConvertTo-Ident 'a b-c_d.e' | Should -Be '"a b-c_d.e"'
+    }
+    It 'doubles an embedded double quote so the identifier cannot be broken out of' {
+        ConvertTo-Ident 'a"b' | Should -Be '"a""b"'
+        ConvertTo-Ident 'x"; DROP TABLE t; --' | Should -Be '"x""; DROP TABLE t; --"'
+    }
+    It 'still refuses a NUL, another control character and an empty name' {
+        { ConvertTo-Ident ('a' + [char]0 + 'b') } | Should -Throw '*control characters*'
+        { ConvertTo-Ident ('a' + [char]1 + 'b') } | Should -Throw '*control characters*'
+        { ConvertTo-Ident ('a' + [char]27 + 'b') } | Should -Throw '*control characters*'
+        { ConvertTo-Ident '' } | Should -Throw '*null or empty*'
+        # the message must not carry the control character itself
+        $msg = ''
+        try { ConvertTo-Ident ('a' + [char]0 + 'b') } catch { $msg = $_.Exception.Message }
+        $msg.IndexOf([char]0) | Should -Be -1
+    }
+    It 'the quoted form really works as an identifier in SQLite' {
+        $db = New-CoreDbPath -Name 'e2e1021id'
+        $t = ConvertTo-Ident 'odd table (1)'
+        $c = ConvertTo-Ident "O'Brien %"
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $t (id INTEGER PRIMARY KEY, $c TEXT)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO $t (id, $c) VALUES (1, 'v')" -NonQuery | Out-Null
+        (Invoke-DbQuery -Database $db -Query "SELECT $c FROM $t" -Scalar) | Should -Be 'v'
+        Close-DbConnections
+    }
+    It 'a name that tries to escape the quoting cannot reach the parser' {
+        $db = New-CoreDbPath -Name 'e2e1021inj'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE keepme(id INTEGER)' -NonQuery | Out-Null
+        $evil = ConvertTo-Ident 'x"); DROP TABLE keepme; --'
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $evil (id INTEGER)" -NonQuery | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='keepme'")[0].c | Should -Be 1
+        Close-DbConnections
+    }
+}
+
+Describe 'Confirm-DbForeignKey handles punctuated table and column names' -Tag 'E2E1-021' {
+    It 'enforces a relationship whose names carry an apostrophe and a comment marker' {
+        $db = New-CoreDbPath -Name 'e2e1021fk'
+        $parent = "O'Brien"
+        $child = 'kid*/x'
+        $col = "p'id"
+        $qParent = ConvertTo-Ident $parent
+        $qChild = ConvertTo-Ident $child
+        $qCol = ConvertTo-Ident $col
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $qParent (id INTEGER PRIMARY KEY)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "CREATE TABLE $qChild (id INTEGER PRIMARY KEY, $qCol INTEGER)" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO $qParent (id) VALUES (1)" -NonQuery | Out-Null
+
+        { Confirm-DbForeignKey -Database $db -From $child -Column $col -To $parent -RefColumn id -OnDelete RESTRICT } | Should -Not -Throw
+        # Re-confirming must recognise the triggers it already owns through the marker comment.
+        { Confirm-DbForeignKey -Database $db -From $child -Column $col -To $parent -RefColumn id -OnDelete RESTRICT } | Should -Not -Throw
+
+        # The '*/' in the child table name is percent-encoded, so the marker comment is not closed early.
+        $trigSql = @(Invoke-DbQuery -Database $db -Query "SELECT sql FROM sqlite_master WHERE type='trigger' ORDER BY name" | ForEach-Object { [string]$_.sql })
+        $trigSql.Count | Should -Be 3
+        ($trigSql[0].Contains('table=kid%2A%2Fx')) | Should -BeTrue
+
+        Invoke-DbQuery -Database $db -Query "INSERT INTO $qChild (id, $qCol) VALUES (1, 1)" -NonQuery | Out-Null
+        { Invoke-DbQuery -Database $db -Query "INSERT INTO $qChild (id, $qCol) VALUES (2, 99)" -NonQuery | Out-Null } | Should -Throw
+        { Invoke-DbQuery -Database $db -Query "DELETE FROM $qParent WHERE id = 1" -NonQuery | Out-Null } | Should -Throw
+
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" | ForEach-Object { [string]$_.name })
+        $tables | Should -Contain $parent
+        $tables | Should -Contain $child
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM $qChild")[0].c | Should -Be 1
+        Close-DbConnections
     }
 }

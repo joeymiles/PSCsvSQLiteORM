@@ -27,11 +27,19 @@ function Get-DbFkTriggerName {
         [Parameter(Mandatory)][string]$From,
         [Parameter(Mandatory)][string]$Column
     )
-    # ConvertTo-Ident rejects every character outside \w, whitespace, dash, underscore and dot, so
-    # neither '*/' (which would end the marker early) nor a -like wildcard can reach the marker.
+    # E2E1-021: ConvertTo-Ident used to reject every character outside \w, whitespace, dash,
+    # underscore and dot, which kept '*/' out of the marker for free. It now accepts anything
+    # double-quoting can carry, so a name may contain '*' or '/', and a literal '*/' inside the
+    # marker would close this SQL comment early and leave the rest of the name standing as SQL in
+    # the CREATE TRIGGER text. Percent-encode '%', '*' and '/' in the two marker fields. None of
+    # those three was ever accepted by the old whitelist, so a marker written by an earlier version
+    # of the module is unchanged and the ownership checks below still recognise it; the encoding is
+    # reversible, so two different pairs still get two different markers.
     $quotedFrom = ConvertTo-Ident $From
     $quotedCol = ConvertTo-Ident $Column
-    $marker = "/* psORM-fk table=$From column=$Column */"
+    $markerFrom = ($From -replace '%', '%25') -replace '\*', '%2A' -replace '/', '%2F'
+    $markerCol = ($Column -replace '%', '%25') -replace '\*', '%2A' -replace '/', '%2F'
+    $marker = "/* psORM-fk table=$markerFrom column=$markerCol */"
     $bodyRef = $quotedFrom + '.' + $quotedCol
 
     $plainBase = "trg_fk_${From}_${Column}"

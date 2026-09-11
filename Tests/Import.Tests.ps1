@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001; round 2 TASK B5: E2E1-011, E2E1-020, E2E1-026, E2E1-027; round 2 TASK B6: E2E1-013)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001; round 2 TASK B5: E2E1-011, E2E1-020, E2E1-026, E2E1-027; round 2 TASK B6: E2E1-013; round 2 TASK B7: E2E1-021)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -838,6 +838,53 @@ Describe 'Import-CsvToSqlite refuses a cell containing a NUL character' -Tag 'E2
         $csv = New-TestCsv -Name 'e2e1013imp2.csv' -Lines @('id,note', '1,ab')
         Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'nulrows2' | Out-Null
         (Invoke-DbQuery -Database $db -Query 'SELECT note FROM nulrows2' -Scalar) | Should -Be 'ab'
+        Close-DbConnections
+    }
+}
+
+Describe 'Import-CsvToSqlite accepts ordinary punctuation in CSV headers' -Tag 'E2E1-021' {
+    BeforeAll {
+        # Parentheses, brackets, percent, slash, plus, question mark, dollar and an apostrophe:
+        # every one of these used to abort the whole import with "contains illegal characters".
+        $script:e2e1021Lines = @(
+            'id,Cost (USD),50%,A/B,O''Brien,Weight [kg],Done?,name+alias,price$',
+            '1,1.50,2,x,y,7,yes,al,9',
+            '2,2.50,3,z,w,8,no,bo,10')
+        $script:e2e1021Csv = New-TestCsv -Name 'e2e1021.csv' -Lines $script:e2e1021Lines
+        $script:e2e1021Db = New-TestDbPath -Name 'e2e1021'
+    }
+    It 'creates the table and stores every value under its real column name' {
+        $headers = @(Import-CsvToSqlite -CsvPath $script:e2e1021Csv -Database $script:e2e1021Db -TableName 'costs')
+        $headers | Should -Contain 'Cost (USD)'
+        $headers | Should -Contain "O'Brien"
+        $row = Invoke-DbQuery -Database $script:e2e1021Db -Query 'SELECT * FROM costs WHERE id = 1' | Select-Object -First 1
+        [double]$row.'Cost (USD)' | Should -Be 1.5
+        [int]$row.'50%' | Should -Be 2
+        [string]$row.'A/B' | Should -Be 'x'
+        [string]$row."O'Brien" | Should -Be 'y'
+        [int]$row.'Weight [kg]' | Should -Be 7
+        [string]$row.'name+alias' | Should -Be 'al'
+        [int]$row.'price$' | Should -Be 9
+    }
+    It 'catalogs the punctuated columns under their real names' {
+        $cols = @(Invoke-DbQuery -Database $script:e2e1021Db -Query "SELECT column_name FROM __columns__ WHERE table_name='costs'" | ForEach-Object { [string]$_.column_name })
+        $cols | Should -Contain 'Cost (USD)'
+        $cols | Should -Contain "O'Brien"
+        $cols | Should -Contain 'A/B'
+        $cols | Should -Contain '50%'
+    }
+    It 'a Strict re-import matches the punctuated columns and appends' {
+        $csv2 = New-TestCsv -Name 'e2e1021b.csv' -Lines @($script:e2e1021Lines[0], '3,3.50,4,q,r,9,yes,co,11')
+        { Import-CsvToSqlite -CsvPath $csv2 -Database $script:e2e1021Db -TableName 'costs' -SchemaMode Strict | Out-Null } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $script:e2e1021Db -Query 'SELECT COUNT(*) AS c FROM costs')[0].c | Should -Be 3
+        [string](Invoke-DbQuery -Database $script:e2e1021Db -Query 'SELECT "A/B" FROM costs WHERE id = 3' -Scalar) | Should -Be 'q'
+        Close-DbConnections
+    }
+    It 'a header carrying a control character is still refused, and nothing is created' {
+        $db = New-TestDbPath -Name 'e2e1021ctl'
+        $csv = New-TestCsv -Name 'e2e1021ctl.csv' -Lines @(('id,bad' + [char]1 + 'name'), '1,v')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'ctltbl' } | Should -Throw '*control characters*'
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='ctltbl'")[0].c | Should -Be 0
         Close-DbConnections
     }
 }

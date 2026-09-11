@@ -53,7 +53,11 @@ function Confirm-DbForeignKey {
     $marker = $trigNames.Marker
 
     # BUG-027: keep the RAISE text ASCII so a Windows PowerShell build does not corrupt it.
-    $violationMsg = "FK violation: $From.$Column -> $To.$RefColumn"
+    # E2E1-021: table and column names may now contain an apostrophe (ConvertTo-Ident no longer
+    # refuses one, because double-quoting the identifier is what makes it safe). This text is
+    # pasted into a single-quoted SQL string literal in the RAISE(ABORT, '...') calls below, so
+    # the apostrophes in it must be doubled or the CREATE TRIGGER statement breaks apart.
+    $violationMsg = ("FK violation: $From.$Column -> $To.$RefColumn") -replace "'", "''"
 
     # BUG-023: trigger names depend only on From/Column, so drop any earlier versions before
     # recreating; otherwise re-confirming with a new target or OnDelete leaves stale triggers.
