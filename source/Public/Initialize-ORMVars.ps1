@@ -56,8 +56,13 @@ Function Initialize-ORMVars {
     $oldPool = $null
     try { $oldPool = Get-Variable -Name DbPool -Scope Script -ValueOnly -ErrorAction Stop } catch { $oldPool = $null }
     if ($oldPool -and $oldPool.Count -gt 0) {
-        foreach ($conn in @($oldPool.Values)) {
+        foreach ($key in @($oldPool.Keys)) {
+            $conn = $oldPool[$key]
             if ($conn) {
+                # E2E1-003: closing the connection rolls back a transaction the caller never completed, and
+                # every write made on that database since then goes with it. Roll it back on purpose and
+                # warn, so the loss is visible instead of silent.
+                try { [void](Clear-DbPendingTransaction -Connection $conn -Key ([string]$key) -Reason 'Initialize-ORMVars is resetting the connection pool') } catch { }
                 try { if ($conn.State -eq 'Open') { $conn.Close() } } catch { }
                 try { $conn.Dispose() } catch { }
             }
@@ -66,6 +71,7 @@ Function Initialize-ORMVars {
 
     # Initialize base state
     $script:DbPool = @{}
+    $script:DbTx = @{}
     $script:DbLogPath = $null
     $script:DbLogLevel = 'INFO'
     $script:PragmaSet = @{}
@@ -93,6 +99,7 @@ Function Initialize-ORMVars {
 # is defined; command discovery for the missing name then auto-loads any other PSCsvSQLiteORM copy on
 # PSModulePath. Plain assignments need no function and cannot trigger auto-loading.
 $script:DbPool = @{}
+$script:DbTx = @{}
 $script:DbLogPath = $null
 $script:DbLogLevel = 'INFO'
 $script:PragmaSet = @{}

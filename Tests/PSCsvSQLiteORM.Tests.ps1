@@ -32,6 +32,7 @@ Describe 'PSCsvSQLiteORM Exported Functions' {
         'Set-DbLogging',
         'Set-DynamicORMClass',
         'Start-DbTransaction',
+        'Test-DbTransaction',
         'Find-DbRelationships',
         'Update-DbCatalog',
         'Write-DbLog'

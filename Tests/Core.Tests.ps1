@@ -1008,3 +1008,113 @@ Describe 'Invoke-DbQuery -AsDataTable returns a DataTable on both paths' -Tag 'B
         }
     }
 }
+
+# E2E1-003: every statement for one database goes through the same pooled connection, so a transaction that
+# is started and never completed takes in every later write and loses all of it when the connection is
+# closed, re-initialised or the module is unloaded. The module now records the pending transaction: it can
+# be reported (Test-DbTransaction), finished without the handle (Complete-/Undo-DbTransaction -Database),
+# and the rollback that closing performs is announced instead of happening silently.
+Describe 'A pending transaction on the pooled connection is visible and recoverable' -Tag 'E2E1-003' {
+    It 'warns instead of silently discarding the writes when Close-DbConnections rolls an abandoned transaction back' {
+        $db = New-CoreDbPath -Name 'e2e1003a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)' -NonQuery | Out-Null
+        # the handle is dropped: the transaction is never committed or rolled back by the caller
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('x')" -NonQuery | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM a' | Select-Object -First 1).c | Should -Be 1
+
+        $closeWarnings = @()
+        Close-DbConnections -WarningVariable closeWarnings -WarningAction SilentlyContinue
+        $closeWarnings.Count | Should -BeGreaterThan 0
+        ($closeWarnings -join ' ') | Should -BeLike '*uncommitted transaction*'
+        ($closeWarnings -join ' ') | Should -BeLike "*$([System.IO.Path]::GetFileName($db))*"
+        # the write is still lost - that part is what a rollback means - but it is no longer lost in silence
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM a' | Select-Object -First 1).c | Should -Be 0
+        Close-DbConnections
+    }
+
+    It 'commits a transaction whose handle the script no longer has' {
+        $db = New-CoreDbPath -Name 'e2e1003b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)' -NonQuery | Out-Null
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('keep')" -NonQuery | Out-Null
+
+        Complete-DbTransaction -Database $db
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+
+        $closeWarnings = @()
+        Close-DbConnections -WarningVariable closeWarnings -WarningAction SilentlyContinue
+        $closeWarnings.Count | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM a' | Select-Object -First 1).c | Should -Be 1
+        Close-DbConnections
+    }
+
+    It 'clears an abandoned transaction with Undo-DbTransaction so later writes are committed' {
+        $db = New-CoreDbPath -Name 'e2e1003c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)' -NonQuery | Out-Null
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('lost')" -NonQuery | Out-Null
+
+        # rolling back without the handle is how a script recovers; it asked for it, so it gets no warning
+        $undoWarnings = @()
+        Undo-DbTransaction -Database $db -WarningVariable undoWarnings -WarningAction SilentlyContinue
+        $undoWarnings.Count | Should -Be 0
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+
+        Invoke-DbQuery -Database $db -Query "INSERT INTO a(v) VALUES('after')" -NonQuery | Out-Null
+        Close-DbConnections
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT v FROM a')
+        $rows.Count | Should -Be 1
+        $rows[0].v | Should -Be 'after'
+        Close-DbConnections
+    }
+
+    It 'reports whether a database is inside a transaction and never opens a connection to answer' {
+        $db = New-CoreDbPath -Name 'e2e1003d'
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+        $db | Should -Not -Exist
+
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+        $tx = Start-DbTransaction -Database $db
+        (Test-DbTransaction -Database $db) | Should -BeTrue
+        Complete-DbTransaction -Database $db -Transaction $tx
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+        Close-DbConnections
+    }
+
+    It 'still allows a nested transaction and reports the outer one as pending until it is committed' {
+        $db = New-CoreDbPath -Name 'e2e1003e'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        $outer = Start-DbTransaction -Database $db
+        # Import-CsvToSqlite starts its own transaction even when the caller already holds one
+        $inner = Start-DbTransaction -Database $db
+        $inner | Should -Not -BeNullOrEmpty
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(1)' -NonQuery -Transaction $inner | Out-Null
+        Complete-DbTransaction -Database $db -Transaction $inner
+        (Test-DbTransaction -Database $db) | Should -BeTrue
+        Complete-DbTransaction -Database $db -Transaction $outer
+        (Test-DbTransaction -Database $db) | Should -BeFalse
+
+        $closeWarnings = @()
+        Close-DbConnections -WarningVariable closeWarnings -WarningAction SilentlyContinue
+        $closeWarnings.Count | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1).c | Should -Be 1
+        Close-DbConnections
+    }
+
+    It 'warns before Initialize-ORMVars discards an open transaction' {
+        $db = New-CoreDbPath -Name 'e2e1003f'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x INTEGER)' -NonQuery | Out-Null
+        $null = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(7)' -NonQuery | Out-Null
+
+        # Initialize-ORMVars is not an advanced function, so the warning stream is captured by redirection
+        $records = @(Initialize-ORMVars 3>&1)
+        $warnings = @($records | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+        $warnings.Count | Should -BeGreaterThan 0
+        ($warnings -join ' ') | Should -BeLike '*uncommitted transaction*'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1).c | Should -Be 0
+        Close-DbConnections
+    }
+}
