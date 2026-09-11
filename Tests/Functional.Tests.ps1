@@ -537,6 +537,97 @@ Describe 'BUG-059 BUG-060 BUG-076 BUG-077 build-module.ps1 builds the manifest v
     }
 }
 
+Describe 'E2E1-031 build-module.ps1 ships docs and Examples and verifies that they arrived' -Tag 'E2E1-031' {
+    BeforeAll {
+        $script:RepoRoot31 = Split-Path -Parent $PSScriptRoot
+        $script:AboutTopic31 = 'about_PSCsvSQLiteORM.help.txt'
+
+        # The build the whole suite imports: docs\, en-US\ and Examples\ must be part of it.
+        # Dot-source the helper here as well: functions defined while the container is discovered are not
+        # in scope inside BeforeAll on either host.
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:BuiltRoot31 = Split-Path -Parent (Get-OrmBuiltManifestPath -RepoRoot $script:RepoRoot31)
+
+        $script:Root31 = Join-Path $env:TEMP ("orm_ship_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Root31 -Force | Out-Null
+        $script:Copy31 = Join-Path $script:Root31 'repo'
+        New-Item -ItemType Directory -Path $script:Copy31 -Force | Out-Null
+        Copy-Item -Recurse -LiteralPath (Join-Path $script:RepoRoot31 'source') -Destination (Join-Path $script:Copy31 'source')
+        Copy-Item -Recurse -LiteralPath (Join-Path $script:RepoRoot31 'docs') -Destination (Join-Path $script:Copy31 'docs')
+        Copy-Item -LiteralPath (Join-Path $script:RepoRoot31 'build-module.ps1') -Destination (Join-Path $script:Copy31 'build-module.ps1')
+        $script:BuildScript31 = Join-Path $script:Copy31 'build-module.ps1'
+        $script:Version31 = [string](Import-PowerShellDataFile -Path (Join-Path (Join-Path $script:Copy31 'source') 'PSCsvSQLiteORM.psd1')).ModuleVersion
+        $script:BuiltBase31 = Join-Path (Join-Path $script:Copy31 'output') 'PSCsvSQLiteORM'
+        $script:HostExe31 = (Get-Process -Id $PID).Path
+
+        # Runs the copied build script in a child process of THIS host, so the build never disturbs the
+        # module loaded into the test session.
+        function Invoke-Build31 {
+            $callArgs = @('-NoProfile')
+            if ($PSVersionTable.PSVersion.Major -lt 6) { $callArgs += @('-ExecutionPolicy', 'Bypass') }
+            $callArgs += @('-File', $script:BuildScript31)
+            # Stderr from the child host arrives as error records; they are build output here, not test errors.
+            $lines = @(& { $ErrorActionPreference = 'Continue'; & $script:HostExe31 @callArgs 2>&1 } | ForEach-Object { [string]$_ })
+            $code = $LASTEXITCODE
+            return [pscustomobject]@{ ExitCode = $code; Lines = $lines; Text = ($lines -join "`n") }
+        }
+    }
+    AfterAll {
+        Close-DbConnections
+        if ($script:Root31 -and (Test-Path -LiteralPath $script:Root31)) {
+            Remove-Item -LiteralPath $script:Root31 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'E2E1-031: the build under test carries the about topic, its en-US copy and the settings example' {
+        # README points at Examples\orm.settings.ps1 inside the module folder, and Get-Help looks for the
+        # about topic in the module's culture folder; both have to exist in the module the tests import.
+        Test-Path -LiteralPath (Join-Path (Join-Path $script:BuiltRoot31 'docs') $script:AboutTopic31) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path (Join-Path $script:BuiltRoot31 'en-US') $script:AboutTopic31) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path (Join-Path $script:BuiltRoot31 'Examples') 'orm.settings.ps1') | Should -BeTrue
+        $shipped = Get-Content -LiteralPath (Join-Path (Join-Path $script:BuiltRoot31 'en-US') $script:AboutTopic31) -Raw
+        $source = Get-Content -LiteralPath (Join-Path (Join-Path $script:RepoRoot31 'docs') $script:AboutTopic31) -Raw
+        $shipped | Should -Be $source
+    }
+
+    It 'E2E1-031: a build copies docs, en-US and Examples into the built module folder' {
+        $run = Invoke-Build31
+        $run.ExitCode | Should -Be 0
+        $run.Text | Should -Match 'Successfully built'
+        $built = Join-Path $script:BuiltBase31 $script:Version31
+        Test-Path -LiteralPath (Join-Path (Join-Path $built 'docs') $script:AboutTopic31) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path (Join-Path $built 'en-US') $script:AboutTopic31) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path (Join-Path $built 'Examples') 'orm.settings.ps1') | Should -BeTrue
+    }
+
+    It 'E2E1-031: the build fails instead of reporting success when docs and Examples do not ship' {
+        # Before the post-build check the script skipped both copies without a word and still printed
+        # "Successfully built", so an incomplete module shipped with no signal at all.
+        $docsCopy = Join-Path $script:Copy31 'docs'
+        $examplesCopy = Join-Path (Join-Path $script:Copy31 'source') 'Examples'
+        $docsBackup = Join-Path $script:Root31 'docs_backup'
+        $examplesBackup = Join-Path $script:Root31 'examples_backup'
+        Copy-Item -Recurse -LiteralPath $docsCopy -Destination $docsBackup
+        Copy-Item -Recurse -LiteralPath $examplesCopy -Destination $examplesBackup
+        Remove-Item -LiteralPath $docsCopy -Recurse -Force
+        Remove-Item -LiteralPath $examplesCopy -Recurse -Force
+        try {
+            $run = Invoke-Build31
+            $run.ExitCode | Should -Not -Be 0
+            $run.Text | Should -Match 'Build incomplete'
+            $run.Text | Should -Match 'about_PSCsvSQLiteORM\.help\.txt'
+            $run.Text | Should -Match 'orm\.settings\.ps1'
+            $run.Text | Should -Not -Match 'Successfully built'
+        }
+        finally {
+            Copy-Item -Recurse -LiteralPath $docsBackup -Destination $docsCopy
+            Copy-Item -Recurse -LiteralPath $examplesBackup -Destination $examplesCopy
+            Remove-Item -LiteralPath $docsBackup -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $examplesBackup -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Describe 'BUG-061 publish-module.ps1 publishes the committed build of this checkout' -Tag 'BUG-061' {
     BeforeAll {
         $script:RepoRoot61 = Split-Path -Parent $PSScriptRoot
@@ -731,5 +822,55 @@ Describe 'BUG-080 no database artifact is tracked under Tests and .gitignore nam
             if ($run.ExitCode -eq 128) { Set-ItResult -Skipped -Because 'the checkout is not a git repository' }
             $run.ExitCode | Should -Be 1 -Because "$name must not be ignored"
         }
+    }
+}
+
+Describe 'Write-DbLog defaults to INFO when -Level is omitted' -Tag 'E2E1-028' {
+    BeforeAll {
+        # Unique directory inside TEMP so concurrent runs cannot share the log file.
+        $script:Dir028 = Join-Path $env:TEMP ("orm_e2e1028_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Dir028 | Out-Null
+        $script:Log028 = Join-Path $script:Dir028 'log028.log'
+        function Get-Log028Text {
+            if (-not (Test-Path -LiteralPath $script:Log028)) { return '' }
+            return [string](Get-Content -LiteralPath $script:Log028 -Raw)
+        }
+    }
+    AfterAll {
+        # Restore the module's import-time logging defaults so later containers are unaffected.
+        Set-DbLogging -Level INFO -Path $null
+        Close-DbConnections
+        if ($script:Dir028 -and (Test-Path -LiteralPath $script:Dir028)) {
+            Remove-Item -LiteralPath $script:Dir028 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'E2E1-028: writes the message and labels it INFO when no -Level is given' {
+        Remove-Item -LiteralPath $script:Log028 -Force -ErrorAction SilentlyContinue
+        Set-DbLogging -Level DEBUG -Path $script:Log028
+        Write-DbLog -Message 'no level given'
+        Write-DbLog -Level INFO -Message 'level given'
+
+        $text = Get-Log028Text
+        $text | Should -Match 'no level given'
+        $text | Should -Match '\[INFO\] no level given'
+        $text | Should -Match '\[INFO\] level given'
+    }
+
+    It 'E2E1-028: the defaulted level is still filtered by the configured threshold' {
+        Remove-Item -LiteralPath $script:Log028 -Force -ErrorAction SilentlyContinue
+        Set-DbLogging -Level WARN -Path $script:Log028
+        Write-DbLog -Message 'default level below threshold'
+        Write-DbLog -Level WARN -Message 'warn above threshold'
+
+        $text = Get-Log028Text
+        $text | Should -Not -Match 'default level below threshold'
+        $text | Should -Match '\[WARN\] warn above threshold'
+    }
+
+    It 'E2E1-028: with no log path the defaulted level still reaches the verbose stream' {
+        Set-DbLogging -Level DEBUG -Path $null
+        $verbose = @(Write-DbLog -Message 'verbose without level' -Verbose 4>&1 | ForEach-Object { [string]$_ })
+        ($verbose -join ' ') | Should -Match '\[INFO\] verbose without level'
     }
 }

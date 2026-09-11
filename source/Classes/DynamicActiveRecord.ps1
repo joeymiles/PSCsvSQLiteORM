@@ -98,23 +98,45 @@ class DynamicActiveRecord {
         if ($exists.Count -eq 0) { return }
         # Ordered by column name so both sides of a relationship pick the same default when a table has several
         # foreign keys to the same parent (BUG-019)
-        $fksFrom = @(Invoke-DbQuery -Database $this.Database -Query "SELECT column_name, ref_table FROM __fks__ WHERE table_name=@t AND status='confirmed' ORDER BY column_name" -SqlParameters @{ t = $this.TableName })
-        foreach ($fk in $fksFrom) { if ($fk) { $this.BelongsTo([string]$fk.ref_table, [string]$fk.column_name) } }
-        $fksTo = @(Invoke-DbQuery -Database $this.Database -Query "SELECT table_name, column_name FROM __fks__ WHERE ref_table=@t AND status='confirmed' ORDER BY table_name, column_name" -SqlParameters @{ t = $this.TableName })
-        foreach ($fk in $fksTo) { if ($fk) { $this.HasMany([string]$fk.table_name, [string]$fk.column_name) } }
+        # ref_column travels with the association so a foreign key that points at a non-id column still navigates
+        # (E2E1-006); an empty or missing ref_column keeps the historical 'id' default.
+        $fksFrom = @(Invoke-DbQuery -Database $this.Database -Query "SELECT column_name, ref_table, ref_column FROM __fks__ WHERE table_name=@t AND status='confirmed' ORDER BY column_name" -SqlParameters @{ t = $this.TableName })
+        foreach ($fk in $fksFrom) { if ($fk) { $this.BelongsTo([string]$fk.ref_table, [string]$fk.column_name, [string]$fk.ref_column) } }
+        $fksTo = @(Invoke-DbQuery -Database $this.Database -Query "SELECT table_name, column_name, ref_column FROM __fks__ WHERE ref_table=@t AND status='confirmed' ORDER BY table_name, column_name" -SqlParameters @{ t = $this.TableName })
+        foreach ($fk in $fksTo) { if ($fk) { $this.HasMany([string]$fk.table_name, [string]$fk.column_name, [string]$fk.ref_column) } }
     }
 
     # Associations are keyed by (table, foreign key) so a table with several foreign keys to the same parent keeps
     # every relationship (BUG-019). The plain "<type>_<table>" key stays for the first registered foreign key so
     # GetHasMany($table) / GetBelongsTo($table) keep working when there is only one.
-    [void]HasMany([string]$relatedTable, [string]$foreignKey) { $this.AddAssociation('has_many', $relatedTable, $foreignKey) }
-    [void]BelongsTo([string]$relatedTable, [string]$foreignKey) { $this.AddAssociation('belongs_to', $relatedTable, $foreignKey) }
+    [void]HasMany([string]$relatedTable, [string]$foreignKey) { $this.AddAssociation('has_many', $relatedTable, $foreignKey, 'id') }
+    [void]BelongsTo([string]$relatedTable, [string]$foreignKey) { $this.AddAssociation('belongs_to', $relatedTable, $foreignKey, 'id') }
+
+    # Overloads naming the referenced column when the foreign key does not point at the parent's key column
+    # (E2E1-006). PowerShell ignores default values on class method parameters, so these are explicit overloads.
+    [void]HasMany([string]$relatedTable, [string]$foreignKey, [string]$refColumn) { $this.AddAssociation('has_many', $relatedTable, $foreignKey, $refColumn) }
+    [void]BelongsTo([string]$relatedTable, [string]$foreignKey, [string]$refColumn) { $this.AddAssociation('belongs_to', $relatedTable, $foreignKey, $refColumn) }
 
     hidden [void]AddAssociation([string]$type, [string]$relatedTable, [string]$foreignKey) {
-        $assoc = @{ Type = $type; Table = $relatedTable; ForeignKey = $foreignKey }
+        $this.AddAssociation($type, $relatedTable, $foreignKey, 'id')
+    }
+
+    hidden [void]AddAssociation([string]$type, [string]$relatedTable, [string]$foreignKey, [string]$refColumn) {
+        $ref = $refColumn
+        if ([string]::IsNullOrEmpty($ref)) { $ref = 'id' }
+        $assoc = @{ Type = $type; Table = $relatedTable; ForeignKey = $foreignKey; RefColumn = $ref }
         $this.Associations[$type + '_' + $relatedTable + '|' + $foreignKey] = $assoc
         $plain = $this.Associations[$type + '_' + $relatedTable]
         if (-not $plain -or $plain.ForeignKey -eq $foreignKey) { $this.Associations[$type + '_' + $relatedTable] = $assoc }
+    }
+
+    # The column an association references on the parent table; 'id' unless __fks__ named another one (E2E1-006).
+    hidden [string]GetAssociationRefColumn([hashtable]$Assoc) {
+        if ($Assoc -and $Assoc.ContainsKey('RefColumn')) {
+            $ref = [string]$Assoc['RefColumn']
+            if (-not [string]::IsNullOrEmpty($ref)) { return $ref }
+        }
+        return 'id'
     }
 
     # Finds an association by table and optional foreign key; throws when it is not defined.
@@ -271,10 +293,15 @@ class DynamicActiveRecord {
         return $rec
     }
 
-    [object[]] All() {
+    # Returns records, exactly like Where()/First()/FindById(), so every row can navigate relationships and be
+    # saved (E2E1-018). AllRows() keeps the older plain-object projection.
+    [object[]] All() { return $this.Where('', $null) }
+
+    # Every row as a plain [PSCustomObject] carrying the table's columns (no record API).
+    [object[]] AllRows() {
     $query = "SELECT * FROM $(ConvertTo-Ident $($this.TableName))"
         $results = Invoke-DbQuery -Database $this.Database -Query $query
-    
+
         $objects = @()
         foreach ($row in $results) {
             $obj = [PSCustomObject]@{}
@@ -444,8 +471,14 @@ class DynamicActiveRecord {
     [object[]]GetHasMany([string]$relatedTable, [string]$foreignKey) {
         $assoc = $this.FindAssociation('has_many', $relatedTable, $foreignKey)
         $proto = $this.NewRelatedInstance($assoc.Table)
+        # The child's foreign key matches $assoc.RefColumn on THIS table, not necessarily its key column (E2E1-006)
+        $refColumn = $this.GetAssociationRefColumn($assoc)
+        $refValue = $null
+        if ($refColumn -eq 'id' -or $refColumn -eq $this.GetKeyColumn()) { $refValue = $this.Id }
+        elseif ($this.Attributes.ContainsKey($refColumn)) { $refValue = $this.Attributes[$refColumn] }
+        if ($null -eq $refValue -or $refValue -is [System.DBNull]) { return @() }
     $sql = $proto.SelectSql() + " WHERE $(ConvertTo-Ident $($assoc.ForeignKey)) = @id"
-        $results = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $this.Id }
+        $results = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $refValue }
         $records = @()
         foreach ($row in $results) {
             $rec = $proto.NewInstance()
@@ -460,9 +493,13 @@ class DynamicActiveRecord {
     # Overload selecting the relationship by foreign key column when this table has several to the same parent (BUG-019)
     [DynamicActiveRecord]GetBelongsTo([string]$relatedTable, [string]$foreignKey) {
         $assoc = $this.FindAssociation('belongs_to', $relatedTable, $foreignKey)
-        $fkId = $this.Attributes[$assoc.ForeignKey]; if ($null -eq $fkId) { return $null }
+        $fkId = $this.Attributes[$assoc.ForeignKey]; if ($null -eq $fkId -or $fkId -is [System.DBNull]) { return $null }
         $proto = $this.NewRelatedInstance($assoc.Table)
-    $sql = $proto.SelectSql() + " WHERE $($proto.GetKeyColumn()) = @id"
+        # Match the column the foreign key actually references on the parent, not always its key column (E2E1-006)
+        $refColumn = $this.GetAssociationRefColumn($assoc)
+        $keyExpr = $proto.GetKeyColumn()
+        if ($refColumn -ne 'id' -and $refColumn -ne $keyExpr) { $keyExpr = ConvertTo-Ident $refColumn }
+    $sql = $proto.SelectSql() + " WHERE $keyExpr = @id"
         $res = Invoke-DbQuery -Database $this.Database -Query $sql -SqlParameters @{id = $fkId }
         if (-not $res -or $res.Count -eq 0) { return $null }
         $rec = $proto.NewInstance()
