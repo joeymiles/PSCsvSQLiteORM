@@ -733,3 +733,53 @@ Describe 'BUG-080 no database artifact is tracked under Tests and .gitignore nam
         }
     }
 }
+
+Describe 'Write-DbLog defaults to INFO when -Level is omitted' -Tag 'E2E1-028' {
+    BeforeAll {
+        # Unique directory inside TEMP so concurrent runs cannot share the log file.
+        $script:Dir028 = Join-Path $env:TEMP ("orm_e2e1028_{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:Dir028 | Out-Null
+        $script:Log028 = Join-Path $script:Dir028 'log028.log'
+        function Get-Log028Text {
+            if (-not (Test-Path -LiteralPath $script:Log028)) { return '' }
+            return [string](Get-Content -LiteralPath $script:Log028 -Raw)
+        }
+    }
+    AfterAll {
+        # Restore the module's import-time logging defaults so later containers are unaffected.
+        Set-DbLogging -Level INFO -Path $null
+        Close-DbConnections
+        if ($script:Dir028 -and (Test-Path -LiteralPath $script:Dir028)) {
+            Remove-Item -LiteralPath $script:Dir028 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'E2E1-028: writes the message and labels it INFO when no -Level is given' {
+        Remove-Item -LiteralPath $script:Log028 -Force -ErrorAction SilentlyContinue
+        Set-DbLogging -Level DEBUG -Path $script:Log028
+        Write-DbLog -Message 'no level given'
+        Write-DbLog -Level INFO -Message 'level given'
+
+        $text = Get-Log028Text
+        $text | Should -Match 'no level given'
+        $text | Should -Match '\[INFO\] no level given'
+        $text | Should -Match '\[INFO\] level given'
+    }
+
+    It 'E2E1-028: the defaulted level is still filtered by the configured threshold' {
+        Remove-Item -LiteralPath $script:Log028 -Force -ErrorAction SilentlyContinue
+        Set-DbLogging -Level WARN -Path $script:Log028
+        Write-DbLog -Message 'default level below threshold'
+        Write-DbLog -Level WARN -Message 'warn above threshold'
+
+        $text = Get-Log028Text
+        $text | Should -Not -Match 'default level below threshold'
+        $text | Should -Match '\[WARN\] warn above threshold'
+    }
+
+    It 'E2E1-028: with no log path the defaulted level still reaches the verbose stream' {
+        Set-DbLogging -Level DEBUG -Path $null
+        $verbose = @(Write-DbLog -Message 'verbose without level' -Verbose 4>&1 | ForEach-Object { [string]$_ })
+        ($verbose -join ' ') | Should -Match '\[INFO\] verbose without level'
+    }
+}
