@@ -34,7 +34,12 @@ function Update-DbColumnType {
     foreach ($col in @($ColumnTypes.Keys)) {
         $newType = [string]$ColumnTypes[$col]
         if ($newType -notmatch '^[A-Za-z]+$') { throw "Cannot widen column '$col' of table '$Table': invalid type '$newType'" }
-        $identPattern = '(?:"' + [regex]::Escape($col) + '"|' + [regex]::Escape($col) + ')'
+        # E2E1-021: inside the stored CREATE TABLE text an embedded double quote is doubled (the
+        # column co"l is written as "co""l"), because ConvertTo-Ident quotes it that way and such
+        # names are accepted now. Match the doubled form, not the raw one, or the widen throws
+        # "column definition not recognised" for any column whose name contains a quote. For a
+        # name without a quote both forms are identical, so nothing else changes.
+        $identPattern = '(?:"' + [regex]::Escape(($col -replace '"', '""')) + '"|' + [regex]::Escape($col) + ')'
         # "<col> <type>" right after "(" or "," at the start of a column definition
         $defPattern = '(?i)([(,]\s*)(' + $identPattern + ')\s+([A-Za-z]+(?:\s*\([^)]*\))?)'
         $m = [regex]::Match($newSql, $defPattern)
@@ -63,7 +68,9 @@ function Update-DbColumnType {
     # table. On SQLite 3.25+ "ALTER TABLE ... RENAME TO" reparses every trigger in the schema, so a
     # trigger naming a table that is dropped at that moment aborts the whole rebuild. Drop those
     # triggers for the duration of the rebuild and recreate them from their stored SQL afterwards.
-    $tableIdentPattern = '(?i)(?:"' + [regex]::Escape($Table) + '"|(?<!\w)' + [regex]::Escape($Table) + '(?!\w))'
+    # E2E1-021: same doubling rule as $identPattern above - a table name carrying a double quote is
+    # stored as "a""b", so the quoted alternative has to look for the doubled form.
+    $tableIdentPattern = '(?i)(?:"' + [regex]::Escape(($Table -replace '"', '""')) + '"|(?<!\w)' + [regex]::Escape($Table) + '(?!\w))'
     $foreignTriggers = @(Invoke-DbQuery -Database $Database -Query "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL AND tbl_name<>@t" -SqlParameters @{ t = $Table } |
             Where-Object { ([string]$_.sql) -match $tableIdentPattern })
 

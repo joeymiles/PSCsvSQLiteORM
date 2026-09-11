@@ -1448,3 +1448,45 @@ Describe 'Confirm-DbForeignKey handles punctuated table and column names' -Tag '
         Close-DbConnections
     }
 }
+
+Describe 'Find-DbRelationships treats names as literals, not as wildcard patterns' -Tag 'E2E1-021' {
+    # E2E1-021: relaxing ConvertTo-Ident let PowerShell wildcard metacharacters into table and
+    # column names. The prefix heuristic built a -like PATTERN out of such a name, so an
+    # unbalanced '[' made the pattern invalid and the whole call threw, and '*' or '?' quietly
+    # turned the prefix test into a wildcard match.
+    It 'does not throw when a table name contains an unbalanced bracket' {
+        $db = New-CoreDbPath -Name 'e2e1021wild'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE "a[b" (id INTEGER PRIMARY KEY, nm TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE kids (kid INTEGER PRIMARY KEY, "a[b_id" INTEGER)' -NonQuery | Out-Null
+        { Find-DbRelationships -Database $db | Out-Null } | Should -Not -Throw
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 1
+        $found[0].table_name | Should -Be 'kids'
+        $found[0].column_name | Should -Be 'a[b_id'
+        $found[0].ref_table | Should -Be 'a[b'
+        $found[0].ref_column | Should -Be 'id'
+        Close-DbConnections
+    }
+    It 'does not let an asterisk in a name match an unrelated column' {
+        # Parent "a*" has no key-looking column at all, so nothing may be suggested. With -like the
+        # pattern 'a**' matched the unrelated column 'abc' and a bogus relationship was stored.
+        $db = New-CoreDbPath -Name 'e2e1021star'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE "a*" (zz TEXT, abc TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE kids (kid INTEGER PRIMARY KEY, "a*_id" TEXT)' -NonQuery | Out-Null
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 0
+        [int](Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM __fks__")[0].c | Should -Be 0
+        Close-DbConnections
+    }
+    It 'still makes the prefix suggestion it always made' {
+        $db = New-CoreDbPath -Name 'e2e1021pref'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE dept (deptcode TEXT, other TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE kids (kid INTEGER PRIMARY KEY, dept_id TEXT)' -NonQuery | Out-Null
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 1
+        $found[0].ref_table | Should -Be 'dept'
+        $found[0].ref_column | Should -Be 'deptcode'
+        [double]$found[0].confidence | Should -Be 0.75
+        Close-DbConnections
+    }
+}

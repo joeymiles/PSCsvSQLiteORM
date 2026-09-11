@@ -888,3 +888,37 @@ Describe 'Import-CsvToSqlite accepts ordinary punctuation in CSV headers' -Tag '
         Close-DbConnections
     }
 }
+
+Describe 'punctuated names survive the paths an import feeds' -Tag 'E2E1-021' {
+    It 'Find-DbRelationships still works after importing a table whose name contains a bracket' {
+        # Two ordinary imports were enough to break Find-DbRelationships for the whole database:
+        # the table name became a PowerShell -like pattern, and '[' made that pattern invalid.
+        $db = New-TestDbPath -Name 'e2e1021rel'
+        $parentCsv = New-TestCsv -Name 'e2e1021rel_p.csv' -Lines @('id,name', '1,HQ')
+        $childCsv = New-TestCsv -Name 'e2e1021rel_c.csv' -Lines @('id,Dept [HQ_id', '1,1')
+        Import-CsvToSqlite -CsvPath $parentCsv -Database $db -TableName 'Dept [HQ' | Out-Null
+        Import-CsvToSqlite -CsvPath $childCsv -Database $db -TableName 'orders' | Out-Null
+        { Find-DbRelationships -Database $db | Out-Null } | Should -Not -Throw
+        $found = @(Find-DbRelationships -Database $db)
+        $found.Count | Should -Be 1
+        $found[0].table_name | Should -Be 'orders'
+        $found[0].ref_table | Should -Be 'Dept [HQ'
+        $found[0].ref_column | Should -Be 'id'
+        Close-DbConnections
+    }
+    It 'a Relaxed re-import widens a column whose name contains a double quote' {
+        # The stored CREATE TABLE text doubles an embedded quote ("co""l"), so the rebuild's
+        # column-definition regex has to look for the doubled form; it used to look for the raw
+        # name and fail with "column definition not recognised".
+        $db = New-TestDbPath -Name 'e2e1021quote'
+        $first = New-TestCsv -Name 'e2e1021quote_a.csv' -Lines @('id,"co""l"', '1,5')
+        $second = New-TestCsv -Name 'e2e1021quote_b.csv' -Lines @('id,"co""l"', '2,text-value')
+        Import-CsvToSqlite -CsvPath $first -Database $db -TableName 'q5' | Out-Null
+        (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info("q5")' | Where-Object { $_.name -eq 'co"l' })[0].type) | Should -Be 'INTEGER'
+        { Import-CsvToSqlite -CsvPath $second -Database $db -TableName 'q5' -SchemaMode Relaxed -WarningAction SilentlyContinue | Out-Null } | Should -Not -Throw
+        (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info("q5")' | Where-Object { $_.name -eq 'co"l' })[0].type) | Should -Be 'TEXT'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM q5')[0].c | Should -Be 2
+        [string](Invoke-DbQuery -Database $db -Query 'SELECT "co""l" FROM q5 WHERE id = 2' -Scalar) | Should -Be 'text-value'
+        Close-DbConnections
+    }
+}

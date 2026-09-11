@@ -33,7 +33,13 @@ function Find-DbRelationships {
             # BUG-033: any other *_id column is a foreign key of the referenced table,
             # not its key; never suggest it.
             elseif ($c -match '_id$') { 0.0 }
-            elseif ($cN -like ($baseN + '*') -or $cN -like ($refN + '*')) { 0.75 }
+            # E2E1-021: this was "$cN -like ($baseN + '*')". ConvertTo-Ident no longer keeps
+            # PowerShell wildcard metacharacters out of names, so a table or column name is not a
+            # safe -like PATTERN any more: an unbalanced '[' makes the pattern invalid and throws
+            # for the whole database, and '*' or '?' silently turn the prefix test into a wildcard
+            # match. StartsWith compares literally and cannot throw. Both operands are already
+            # lower-cased by $norm; OrdinalIgnoreCase keeps the case-insensitive behaviour -like had.
+            elseif ($cN.StartsWith($baseN, [System.StringComparison]::OrdinalIgnoreCase) -or $cN.StartsWith($refN, [System.StringComparison]::OrdinalIgnoreCase)) { 0.75 }
             elseif ($cN -like '*id*') { 0.60 }
             else { 0.0 }
 
