@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001; round 2 TASK B5: E2E1-011, E2E1-020, E2E1-026, E2E1-027)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -422,10 +422,12 @@ Describe 'Relaxed import that rebuilds a table to widen a column' -Tag 'E2E1-001
         Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,parent_id,amount) VALUES(1,1,1.5)' -NonQuery | Out-Null
         Confirm-DbForeignKey -Database $db -From 'prices' -Column 'parent_id' -To 'parent' -OnDelete 'CASCADE'
 
-        # '10.0' is inferred TEXT, so Relaxed widens the declared REAL column and rebuilds the table.
-        # The ON DELETE trigger lives on 'parent' and names 'prices', so before the fix the rename
-        # inside the rebuild failed on SQLite 3.25+ after 'prices' had already been dropped.
-        $csv = New-TestCsv -Name 'e2e1001a.csv' -Lines @('id,parent_id,amount', '3,1,10.0')
+        # 'unpriced' is inferred TEXT, so Relaxed widens the declared REAL column and rebuilds the
+        # table. The ON DELETE trigger lives on 'parent' and names 'prices', so before the fix the
+        # rename inside the rebuild failed on SQLite 3.25+ after 'prices' had already been dropped.
+        # (E2E1-011: a value such as '10.0' no longer widens a declared REAL column - it is only a
+        # different spelling of a number - so this case needs genuinely textual data.)
+        $csv = New-TestCsv -Name 'e2e1001a.csv' -Lines @('id,parent_id,amount', '3,1,unpriced')
         { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode Relaxed } | Should -Not -Throw
 
         $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)')
@@ -675,5 +677,141 @@ Describe 'Import-CsvToSqlite undoes its schema changes when the import fails' -T
         $cols = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
         $cols | Should -Be 'id|name|extra'
         [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 2
+    }
+}
+
+Describe 'Import-CsvToSqlite keeps a declared numeric column numeric when decimals are spelled with a trailing zero' -Tag 'E2E1-011' {
+    It 'does not rewrite a declared REAL column to TEXT in Relaxed mode' {
+        $db = New-TestDbPath -Name 'e2e1011a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE prices (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,amount) VALUES(1,1.5),(2,2.25)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011a.csv' -Lines @('amount', '10.0', '20.0')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode Relaxed | Out-Null
+        $info = @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)')
+        ($info | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'REAL'
+        # the value that was already stored is still a number, not the string '1.5'
+        $old = Invoke-DbQuery -Database $db -Query 'SELECT amount, typeof(amount) AS ta FROM prices WHERE id=1' | Select-Object -First 1
+        $old.ta | Should -Be 'real'
+        [double]$old.amount | Should -Be 1.5
+        # and the imported rows are stored as numbers too, so SUM and ORDER BY keep working
+        $sum = Invoke-DbQuery -Database $db -Query 'SELECT SUM(amount) AS s FROM prices' | Select-Object -First 1
+        [double]$sum.s | Should -Be 33.75
+    }
+    It 'appends such a file in AppendOnly mode instead of refusing it' {
+        $db = New-TestDbPath -Name 'e2e1011b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE prices (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO prices(id,amount) VALUES(1,1.5)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011b.csv' -Lines @('amount', '10.0', '20.0')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'prices' -SchemaMode AppendOnly } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM prices' -Scalar) | Should -Be 3
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(prices)') | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'REAL'
+    }
+    It 'still widens a declared REAL column when the CSV really contains text, and warns about it' {
+        $db = New-TestDbPath -Name 'e2e1011c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (amount REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO p(amount) VALUES(1.5)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011c.csv' -Lines @('amount', 'unpriced')
+        $warnings = @()
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'p' -SchemaMode Relaxed -WarningVariable warnings -WarningAction SilentlyContinue | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(p)') | Where-Object { $_.name -eq 'amount' }).type | Should -Be 'TEXT'
+        ($warnings -join ' ') | Should -BeLike "*column 'amount'*REAL to TEXT*"
+    }
+    It 'still refuses genuinely textual values for a declared REAL column in AppendOnly mode' {
+        $db = New-TestDbPath -Name 'e2e1011d'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (amount REAL)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011d.csv' -Lines @('amount', 'unpriced')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'p' -SchemaMode AppendOnly } | Should -Throw '*declared REAL but the CSV contains TEXT*'
+    }
+    It 'widens a declared INTEGER column only as far as REAL for decimal values' {
+        $db = New-TestDbPath -Name 'e2e1011e'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE p (n INTEGER)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO p(n) VALUES(7)' -NonQuery | Out-Null
+        $csv = New-TestCsv -Name 'e2e1011e.csv' -Lines @('n', '10.0')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'p' -SchemaMode Relaxed -WarningAction SilentlyContinue | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(p)') | Where-Object { $_.name -eq 'n' }).type | Should -Be 'REAL'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM p' -Scalar) | Should -Be 2
+    }
+    It 'still stores a trailing-zero decimal as TEXT in a column the table does not have yet' {
+        $db = New-TestDbPath -Name 'e2e1011f'
+        $csv = New-TestCsv -Name 'e2e1011f.csv' -Lines @('id,version', '1,1.10', '2,1.0')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'v' | Out-Null
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(v)') | Where-Object { $_.name -eq 'version' }).type | Should -Be 'TEXT'
+        $rows = @(Invoke-DbQuery -Database $db -Query 'SELECT version FROM v ORDER BY id' | ForEach-Object { "$($_.version)" })
+        $rows -join ',' | Should -Be '1.10,1.0'
+    }
+}
+
+Describe 'Import-CsvToSqlite refuses a CSV wider than the SQLite parameter limit' -Tag 'E2E1-020' {
+    It 'names the real cause and creates nothing when the CSV has more than 999 columns' {
+        $db = New-TestDbPath -Name 'e2e1020a'
+        $cols = ((1..1000) | ForEach-Object { "c$_" }) -join ','
+        $vals = ((1..1000) | ForEach-Object { "v$_" }) -join ','
+        $csv = New-TestCsv -Name 'e2e1020a.csv' -Lines @($cols, $vals)
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'wide' } | Should -Throw '*1000 columns*at most 999 parameters*'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='wide'").Count | Should -Be 0
+    }
+    It 'still imports a CSV with exactly 999 columns' {
+        $db = New-TestDbPath -Name 'e2e1020b'
+        $cols = ((1..999) | ForEach-Object { "c$_" }) -join ','
+        $vals = ((1..999) | ForEach-Object { "v$_" }) -join ','
+        $csv = New-TestCsv -Name 'e2e1020b.csv' -Lines @($cols, $vals)
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'wide9' } | Should -Not -Throw
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM wide9' -Scalar) | Should -Be 1
+    }
+}
+
+Describe 'Import-CsvToSqlite rejects a header with a nameless column' -Tag 'E2E1-026' {
+    It 'throws instead of importing the column as H1' {
+        $db = New-TestDbPath -Name 'e2e1026a'
+        $csv = New-TestCsv -Name 'e2e1026a.csv' -Lines @(',b', 'val1,val2')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WarningAction SilentlyContinue } |
+            Should -Throw '*empty column name*'
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='t'").Count | Should -Be 0
+    }
+    It 'throws for a header field that is only whitespace' {
+        $db = New-TestDbPath -Name 'e2e1026b'
+        $csv = New-TestCsv -Name 'e2e1026b.csv' -Lines @('   ,b', 'val1,val2')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WarningAction SilentlyContinue } |
+            Should -Throw '*empty column name*'
+    }
+    It 'throws for a nameless column in a header-only CSV' {
+        $db = New-TestDbPath -Name 'e2e1026c'
+        $csv = New-TestCsv -Name 'e2e1026c.csv' -Lines @('a,,c')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -WarningAction SilentlyContinue } |
+            Should -Throw '*empty column name*'
+    }
+    It 'still imports a header whose names are quoted or padded' {
+        $db = New-TestDbPath -Name 'e2e1026d'
+        $csv = New-TestCsv -Name 'e2e1026d.csv' -Lines @('"first name",  second  ', 'a,b')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' } | Should -Not -Throw
+        $cols = (@(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | ForEach-Object { [string]$_.name }) -join '|'
+        $cols | Should -Be 'first name|second'
+    }
+}
+
+Describe 'Import-CsvToSqlite trims the table name' -Tag 'E2E1-027' {
+    It 'does not create a second table for a name that differs only by surrounding whitespace' {
+        $db = New-TestDbPath -Name 'e2e1027a'
+        $csv1 = New-TestCsv -Name 'e2e1027a1.csv' -Lines @('a', '1')
+        $csv2 = New-TestCsv -Name 'e2e1027a2.csv' -Lines @('a', '2')
+        Import-CsvToSqlite -CsvPath $csv1 -Database $db -TableName 'spaced ' | Out-Null
+        Import-CsvToSqlite -CsvPath $csv2 -Database $db -TableName 'spaced' | Out-Null
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'spaced%'" | ForEach-Object { [string]$_.name })
+        $tables.Count | Should -Be 1
+        $tables[0] | Should -Be 'spaced'
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM spaced' -Scalar) | Should -Be 2
+    }
+    It 'records the trimmed name in the catalog' {
+        $db = New-TestDbPath -Name 'e2e1027b'
+        $csv = New-TestCsv -Name 'e2e1027b.csv' -Lines @('a', '1')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName ' padded ' | Out-Null
+        $cat = @(Invoke-DbQuery -Database $db -Query "SELECT table_name FROM __tables__ WHERE table_name LIKE '%padded%'" | ForEach-Object { [string]$_.table_name })
+        $cat.Count | Should -Be 1
+        $cat[0] | Should -Be 'padded'
+    }
+    It 'throws when the table name is only whitespace' {
+        $db = New-TestDbPath -Name 'e2e1027c'
+        $csv = New-TestCsv -Name 'e2e1027c.csv' -Lines @('a', '1')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName '   ' } | Should -Throw '*TableName is empty*'
     }
 }

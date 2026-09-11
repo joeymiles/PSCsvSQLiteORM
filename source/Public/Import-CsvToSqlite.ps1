@@ -19,28 +19,62 @@ function Import-CsvToSqlite {
         [ValidateSet('Strict', 'Relaxed', 'AppendOnly')][string]$SchemaMode = 'Relaxed',
         [int]$BatchSize = 0  # 0 = all
     )
+    # E2E1-027: a header is trimmed before it becomes a column name, so the table name is trimmed
+    # too. Without this 'spaced ' created a table literally called "spaced " and the next import
+    # spelled without the trailing space silently created a second, separate table.
+    $TableName = "$TableName".Trim()
+    if ($TableName -eq '') { throw "TableName is empty." }
     # -LiteralPath: '[' and ']' in the file name are not wildcards (BUG-071).
     if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) { throw "CSV file not found: $CsvPath" }
     # BUG-007: @() so a one-row CSV (a bare PSCustomObject on 5.1, where .Count is $null) is counted
     $csv = @(Import-Csv -LiteralPath $CsvPath)
+    # The header line itself is read in both branches: Import-Csv returns nothing at all for a
+    # header-only file (BUG-054), and it hides a nameless column behind a generated name (E2E1-026).
+    $headerLine = Get-Content -LiteralPath $CsvPath -TotalCount 1
     if ($csv.Count -gt 0) {
         $rawHeaders = @($csv[0].PSObject.Properties.Name)
     }
     else {
-        # Import-Csv returns nothing for a header-only file. Read the header line so the table
-        # can still be created from a template CSV (BUG-054); a zero-byte file is an error.
-        $headerLine = Get-Content -LiteralPath $CsvPath -TotalCount 1
+        # Read the header line so the table can still be created from a template CSV (BUG-054);
+        # a zero-byte file is an error.
         if ([string]::IsNullOrWhiteSpace("$headerLine")) { throw "CSV file is empty: $CsvPath" }
         $rawHeaders = @((ConvertFrom-Csv -InputObject @("$headerLine", "$headerLine"))[0].PSObject.Properties.Name)
     }
     if ($rawHeaders.Count -eq 0) { throw "No columns in CSV." }
     $total = [math]::Max(1, $csv.Count)
 
+    # E2E1-026: Import-Csv and ConvertFrom-Csv substitute a generated name ('H1', 'H2', ...) for a
+    # missing header and only write a PowerShell warning, so the empty-column-name guard below never
+    # saw a nameless column: its data landed in a column called H1 and the caller got no error.
+    # Re-read the header line and check the names the file really carries. Parsing that line as DATA
+    # with positional field names keeps quoting and embedded commas working.
+    $positionalNames = @(0..($rawHeaders.Count - 1) | ForEach-Object { "f$_" })
+    $rawHeaderRow = @(ConvertFrom-Csv -InputObject @("$headerLine") -Header $positionalNames)
+    if ($rawHeaderRow.Count -gt 0) {
+        foreach ($pn in $positionalNames) {
+            $rawName = $rawHeaderRow[0].$pn
+            # $null means the first line carries fewer fields than Import-Csv reported (a header
+            # that spans lines); only a field that is present and blank is a nameless column.
+            if ($null -ne $rawName -and [string]::IsNullOrWhiteSpace([string]$rawName)) {
+                throw "CSV header contains an empty column name."
+            }
+        }
+    }
+
     # Leading/trailing whitespace in a header is never part of the column name (BUG-073).
     $headers = @($rawHeaders | ForEach-Object { "$_".Trim() })
     foreach ($h in $headers) { if ($h -eq '') { throw "CSV header contains an empty column name." } }
     $dupHeaders = @($headers | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
     if ($dupHeaders.Count -gt 0) { throw "CSV header contains duplicate column names after trimming whitespace: $($dupHeaders -join ', ')" }
+    # E2E1-020: every row binds one parameter per column and SQLite accepts at most 999 bound
+    # variables per statement, so a wider file used to die on the FIRST INSERT with the provider's
+    # raw 'too many SQL variables' message - by which time the table had already been created and a
+    # retry in Strict/AppendOnly hit the same opaque error. Refuse the file before anything is
+    # written, and name the real cause.
+    $maxBoundParameters = 999
+    if ($headers.Count -gt $maxBoundParameters) {
+        throw "CSV has $($headers.Count) columns; SQLite binds at most $maxBoundParameters parameters per statement, so rows from this file cannot be inserted. Split it into imports of at most $maxBoundParameters columns."
+    }
     if ($csv.Count -gt 0 -and (Compare-Object -ReferenceObject $rawHeaders -DifferenceObject $headers -SyncWindow 0 -CaseSensitive)) {
         # Re-read with the trimmed names as the header (the first line is then a data row to skip).
         $csv = @(Import-Csv -LiteralPath $CsvPath -Header $headers | Select-Object -Skip 1)
@@ -135,6 +169,7 @@ function Import-CsvToSqlite {
     # exactly the storage type that was inferred for it.
     $rank = @{ INTEGER = 1; REAL = 2; TEXT = 3 }
     $widen = @{}
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     foreach ($h in $headers) {
         $hasValue = $false
         foreach ($row in $csv) { if ($null -ne $row.$h) { $hasValue = $true; break } }
@@ -148,9 +183,35 @@ function Import-CsvToSqlite {
         if ($declared -match 'INT') { $declaredRank = 1 }
         elseif ($declared -match 'CHAR|CLOB|TEXT' -or $declared -eq '' -or $declared -match 'BLOB') { $declaredRank = 3 }
         else { $declaredRank = 2 }
-        if ($rank[$inferred] -gt $declaredRank) {
-            if ($SchemaMode -eq 'Relaxed') { $widen[$h] = $inferred }
-            else { throw "$SchemaMode mode: column '$h' in table '$TableName' is declared $($info.type) but the CSV contains $inferred values; use -SchemaMode Relaxed to widen the column" }
+        # E2E1-011: a column the table already declares numeric, holding CSV values that are only
+        # non-canonical spellings of numbers ('10.0', '1.10' - a REAL round-trips them as '10' and
+        # '1.1', so Get-CsvValueKind calls them TEXT), differs in formatting, not in type. Rewriting
+        # such a column to TEXT changed every value already stored in it (and every later numeric
+        # comparison, ORDER BY and SUM), while Strict and AppendOnly refused the file outright and
+        # pointed at the one mode that must not be used here. Store the numbers in the numeric
+        # column instead. Columns the table does not have yet are untouched by this: they are still
+        # created as TEXT so a trailing zero is preserved exactly.
+        $effective = $inferred
+        if ($inferred -eq 'TEXT' -and $declaredRank -lt 3) {
+            $allNumeric = $true
+            foreach ($row in $csv) {
+                $val = $row.$h
+                if ($null -eq $val) { continue }
+                $text = "$val"
+                $kind = Get-CsvValueKind -Value $text
+                if ($kind -eq 'INTEGER' -or $kind -eq 'REAL') { continue }
+                if ($text -match '^-?\d+\.\d+$') {
+                    $parsed = [double]0
+                    if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$parsed) -and -not [double]::IsInfinity($parsed)) { continue }
+                }
+                $allNumeric = $false
+                break
+            }
+            if ($allNumeric) { $effective = 'REAL' }
+        }
+        if ($rank[$effective] -gt $declaredRank) {
+            if ($SchemaMode -eq 'Relaxed') { $widen[$h] = $effective }
+            else { throw "$SchemaMode mode: column '$h' in table '$TableName' is declared $($info.type) but the CSV contains $effective values; use -SchemaMode Relaxed to widen the column" }
         }
     }
 
@@ -163,6 +224,13 @@ function Import-CsvToSqlite {
     # and when the caller already holds a transaction a failure inside it must leave that
     # transaction intact (E2E1-001). It only ever touches columns that already exist.
     if ($widen.Count -gt 0) {
+        # E2E1-011: changing the declared type of an existing column rewrites every value already
+        # stored in it, so say so instead of leaving only a DEBUG log line behind.
+        foreach ($wcol in @($widen.Keys)) {
+            $wasType = [string]$declaredTypes[$wcol]
+            if ($wasType -eq '') { $wasType = '(no type)' }
+            Write-Warning "Import-CsvToSqlite: column '$wcol' of table '$TableName' is changed from $wasType to $($widen[$wcol]); the values already stored in it are rewritten."
+        }
         Update-DbColumnType -Database $Database -Table $TableName -ColumnTypes $widen
     }
 
