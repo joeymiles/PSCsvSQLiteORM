@@ -1,4 +1,4 @@
-# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001; round 2 TASK B5: E2E1-011, E2E1-020, E2E1-026, E2E1-027)
+# Regression tests for Import-CsvToSqlite (TASK B1: BUG-003, BUG-006, BUG-050, BUG-051; TASK B4: BUG-007; TASK B10: BUG-052, BUG-054, BUG-071, BUG-073; TASK B13: BUG-074; round 2 TASK B1: E2E1-001; round 2 TASK B5: E2E1-011, E2E1-020, E2E1-026, E2E1-027; round 2 TASK B6: E2E1-013)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -813,5 +813,31 @@ Describe 'Import-CsvToSqlite trims the table name' -Tag 'E2E1-027' {
         $db = New-TestDbPath -Name 'e2e1027c'
         $csv = New-TestCsv -Name 'e2e1027c.csv' -Lines @('a', '1')
         { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName '   ' } | Should -Throw '*TableName is empty*'
+    }
+}
+
+Describe 'Import-CsvToSqlite refuses a cell containing a NUL character' -Tag 'E2E1-013' {
+    It 'names the column and row instead of storing the value truncated at the NUL' {
+        $db = New-TestDbPath -Name 'e2e1013imp'
+        $csv = New-TestCsv -Name 'e2e1013imp.csv' -Lines @('id,note', ('1,a' + [char]0 + 'b'))
+        # sanity: the CSV reader keeps the NUL, so the loss used to happen at bind time
+        $cell = [string](@(Import-Csv -LiteralPath $csv)[0].note)
+        $cell.Length | Should -Be 3
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'nulrows' } |
+            Should -Throw "*column 'note' in row 1*NUL character*"
+        # the aborted import must not leave a partial (truncated) row behind
+        $tables = @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE type='table' AND name='nulrows'")
+        if ($tables.Count -gt 0) {
+            [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM nulrows' -Scalar) | Should -Be 0
+        }
+        Close-DbConnections
+    }
+
+    It 'imports the same CSV normally once the NUL is removed' {
+        $db = New-TestDbPath -Name 'e2e1013imp2'
+        $csv = New-TestCsv -Name 'e2e1013imp2.csv' -Lines @('id,note', '1,ab')
+        Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 'nulrows2' | Out-Null
+        (Invoke-DbQuery -Database $db -Query 'SELECT note FROM nulrows2' -Scalar) | Should -Be 'ab'
+        Close-DbConnections
     }
 }

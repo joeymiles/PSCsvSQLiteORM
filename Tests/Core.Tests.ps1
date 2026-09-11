@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014; TASK B6 round 2: E2E1-013, E2E1-019)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -1288,5 +1288,77 @@ Describe 'A pending transaction on the pooled connection is visible and recovera
         ($warnings -join ' ') | Should -BeLike '*uncommitted transaction*'
         [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1).c | Should -Be 0
         Close-DbConnections
+    }
+}
+
+Describe 'Invoke-DbQuery rejects a NUL character in a bound string parameter' -Tag 'E2E1-013' {
+    It 'throws instead of storing the value truncated at the NUL' {
+        $db = New-CoreDbPath -Name 'e2e1013a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(v TEXT)' -NonQuery | Out-Null
+        { Invoke-DbQuery -Database $db -Query 'INSERT INTO t(v) VALUES(@p0)' -SqlParameters @{ p0 = ('a' + [char]0 + 'b') } -NonQuery } |
+            Should -Throw "*parameter 'p0' contains a NUL character*"
+        # before the fix the row was inserted holding only 'a' (length 1 instead of 3)
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 0
+        Close-DbConnections
+    }
+
+    It 'still accepts text whose only control characters are tab, CR and LF' {
+        $db = New-CoreDbPath -Name 'e2e1013b'
+        $text = "a`tb`r`nc"
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(v TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(v) VALUES(@p0)' -SqlParameters @{ p0 = $text } -NonQuery | Out-Null
+        [int](Invoke-DbQuery -Database $db -Query 'SELECT length(v) FROM t' -Scalar) | Should -Be $text.Length
+        (Invoke-DbQuery -Database $db -Query 'SELECT v FROM t' -Scalar) | Should -Be $text
+        Close-DbConnections
+    }
+
+    Context 'on the PSSQLite fallback path' {
+        BeforeAll { Disable-DirectConnection }
+        AfterAll { Restore-DirectConnection }
+        It 'throws there as well' {
+            $db = New-CoreDbPath -Name 'e2e1013c'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(v TEXT)' -NonQuery | Out-Null
+            { Invoke-DbQuery -Database $db -Query 'INSERT INTO t(v) VALUES(@p0)' -SqlParameters @{ p0 = ('x' + [char]0 + 'y') } -NonQuery } |
+                Should -Throw '*NUL character*'
+            [int](Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) FROM t' -Scalar) | Should -Be 0
+        }
+    }
+}
+
+Describe 'Invoke-DbQuery -Scalar maps a SQL NULL cell to $null' -Tag 'E2E1-019' {
+    It 'returns $null rather than System.DBNull for a NULL cell' {
+        $db = New-CoreDbPath -Name 'e2e1019a'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(NULL)' -NonQuery | Out-Null
+        $v = Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar
+        # before the fix $v was [System.DBNull]::Value, so '$null -eq $v' was False
+        $null -eq $v | Should -BeTrue
+        $v -is [System.DBNull] | Should -BeFalse
+        # the row path already mapped DBNull to $null; both shapes must agree
+        $row = @(Invoke-DbQuery -Database $db -Query 'SELECT x FROM t')[0]
+        $null -eq $row.x | Should -BeTrue
+        Close-DbConnections
+    }
+
+    It 'still returns the value of a non-NULL cell and $null for an empty result' {
+        $db = New-CoreDbPath -Name 'e2e1019b'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query "INSERT INTO t(x) VALUES('keep')" -NonQuery | Out-Null
+        (Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar) | Should -Be 'keep'
+        $null -eq (Invoke-DbQuery -Database $db -Query "SELECT x FROM t WHERE x='none'" -Scalar) | Should -BeTrue
+        Close-DbConnections
+    }
+
+    Context 'on the PSSQLite fallback path' {
+        BeforeAll { Disable-DirectConnection }
+        AfterAll { Restore-DirectConnection }
+        It 'returns $null for a NULL cell there as well' {
+            $db = New-CoreDbPath -Name 'e2e1019c'
+            Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(x TEXT)' -NonQuery | Out-Null
+            Invoke-DbQuery -Database $db -Query 'INSERT INTO t(x) VALUES(NULL)' -NonQuery | Out-Null
+            $v = Invoke-DbQuery -Database $db -Query 'SELECT x FROM t' -Scalar
+            $null -eq $v | Should -BeTrue
+            $v -is [System.DBNull] | Should -BeFalse
+        }
     }
 }

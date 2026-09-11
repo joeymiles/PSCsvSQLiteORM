@@ -312,7 +312,14 @@ function Import-CsvToSqlite {
             $params = @{}
             foreach ($k in $keys) {
                 $paramName = $paramNames[$k]
-                $params[$paramName] = $row.$k
+                $value = $row.$k
+                # BUG-E2E1-013: SQLite text parameters cannot carry an embedded NUL (the value
+                # would be stored truncated at the NUL). Invoke-DbQuery guards this too, but it
+                # only knows the positional parameter name, so name the column and row here.
+                if ($value -is [string] -and $value.IndexOf([char]0) -ge 0) {
+                    throw "Import-CsvToSqlite: column '$k' in row $($count + 1) contains a NUL character (U+0000), which SQLite cannot store as text. Clean the CSV before importing."
+                }
+                $params[$paramName] = $value
             }
             [void](Invoke-DbQuery -Database $Database -Query $query -SqlParameters $params -NonQuery -Transaction $tx)
             $count++
