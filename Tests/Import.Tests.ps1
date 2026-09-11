@@ -452,7 +452,7 @@ Describe 'Relaxed import that rebuilds a table to widen a column' -Tag 'E2E1-001
         Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
         Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
         # an index already holding the name the rebuild needs for its temporary table makes the
-        # CREATE TABLE inside the rebuild fail, after the batch has issued BEGIN
+        # CREATE TABLE inside the rebuild fail, after the batch has opened its savepoint
         Invoke-DbQuery -Database $db -Query 'CREATE INDEX "t__widen_tmp" ON t(v)' -NonQuery | Out-Null
 
         $csv = New-TestCsv -Name 'e2e1001b.csv' -Lines @('id,v', '2,abc')
@@ -475,5 +475,61 @@ Describe 'Relaxed import that rebuilds a table to widen a column' -Tag 'E2E1-001
         Close-DbConnections
         $later = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='later'" | Select-Object -First 1
         [int]$later.c | Should -Be 1
+    }
+
+    It 'widens a table inside a transaction the caller already opened' {
+        $db = New-TestDbPath -Name 'e2e1001c'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
+
+        $tx = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE userwork (x INTEGER)' -NonQuery -Transaction $tx | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO userwork(x) VALUES(42)' -NonQuery -Transaction $tx | Out-Null
+
+        # the rebuild must nest inside the caller's transaction (SAVEPOINT), not try to BEGIN a
+        # second one, and it must never roll the caller's transaction back
+        $csv = New-TestCsv -Name 'e2e1001c.csv' -Lines @('id,v', '2,abc')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Not -Throw
+
+        Complete-DbTransaction -Database $db -Transaction $tx
+        Close-DbConnections
+
+        $survived = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='userwork'" | Select-Object -First 1
+        [int]$survived.c | Should -Be 1
+        $rows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM userwork' | Select-Object -First 1
+        [int]$rows.c | Should -Be 1
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'v' }).type | Should -Be 'TEXT'
+        $tRows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$tRows.c | Should -Be 2
+    }
+
+    It 'keeps the caller transaction usable when the rebuild itself fails' {
+        $db = New-TestDbPath -Name 'e2e1001d'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id,v) VALUES(1,1.5)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $db -Query 'CREATE INDEX "t__widen_tmp" ON t(v)' -NonQuery | Out-Null
+
+        $tx = Start-DbTransaction -Database $db
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE userwork (x INTEGER)' -NonQuery -Transaction $tx | Out-Null
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO userwork(x) VALUES(42)' -NonQuery -Transaction $tx | Out-Null
+
+        $csv = New-TestCsv -Name 'e2e1001d.csv' -Lines @('id,v', '2,abc')
+        { Import-CsvToSqlite -CsvPath $csv -Database $db -TableName 't' -SchemaMode Relaxed } | Should -Throw
+
+        # the cleanup rolls back to the rebuild's own savepoint only, so the caller can still commit
+        { Complete-DbTransaction -Database $db -Transaction $tx } | Should -Not -Throw
+        Close-DbConnections
+
+        $survived = Invoke-DbQuery -Database $db -Query "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='userwork'" | Select-Object -First 1
+        [int]$survived.c | Should -Be 1
+        $rows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM userwork' | Select-Object -First 1
+        [int]$rows.c | Should -Be 1
+        # and the failed rebuild left the table exactly as it was
+        ((Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(t)') | Where-Object { $_.name -eq 'v' }).type | Should -Be 'REAL'
+        $tRows = Invoke-DbQuery -Database $db -Query 'SELECT COUNT(*) AS c FROM t' | Select-Object -First 1
+        [int]$tRows.c | Should -Be 1
+        # foreign key enforcement was restored on the pooled connection
+        $fk = Invoke-DbQuery -Database $db -Query 'PRAGMA foreign_keys' | Select-Object -First 1
+        "$($fk.foreign_keys)" | Should -Be '1'
     }
 }

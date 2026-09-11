@@ -10,9 +10,12 @@ function Update-DbColumnType {
         name, such as the ON DELETE triggers Confirm-DbForeignKey puts on the
         parent - are re-created afterwards. Foreign key enforcement is switched
         off for the duration of the rebuild so child tables keep their rows and
-        their references to the table name. The whole rebuild is one transaction
-        and is rolled back if any statement fails, so a failure never leaves the
-        table dropped or the connection inside an aborted transaction.
+        their references to the table name. The rebuild runs inside a SAVEPOINT
+        and is rolled back to that savepoint if any statement fails, so a failure
+        never leaves the table dropped or the connection inside an aborted
+        transaction. A savepoint is used instead of BEGIN/COMMIT so the rebuild
+        also works when the caller already has a transaction open, and so that a
+        failure undoes only the rebuild's own work, never the caller's.
         ColumnTypes maps column name to the new storage type (for example
         @{ zip = 'TEXT' }). A PRIMARY KEY column loses AUTOINCREMENT when it
         stops being INTEGER.
@@ -64,12 +67,23 @@ function Update-DbColumnType {
     $foreignTriggers = @(Invoke-DbQuery -Database $Database -Query "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL AND tbl_name<>@t" -SqlParameters @{ t = $Table } |
             Where-Object { ([string]$_.sql) -match $tableIdentPattern })
 
+    # E2E1-001: the rebuild is wrapped in a SAVEPOINT rather than BEGIN/COMMIT. Outside a transaction
+    # a savepoint behaves exactly like BEGIN/COMMIT; inside one - the caller may hold a transaction
+    # from Start-DbTransaction - BEGIN would fail outright ("cannot start a transaction within a
+    # transaction") and a plain ROLLBACK in the failure path would throw the caller's uncommitted
+    # work away. ROLLBACK TO only undoes what the rebuild itself did.
+    $savepoint = ConvertTo-Ident 'psorm_widen_rebuild'
+    # Restore foreign_keys to whatever the connection had rather than forcing it ON.
+    $fkBefore = Invoke-DbQuery -Database $Database -Query 'PRAGMA foreign_keys' | Select-Object -First 1
+    $fkRestore = 'ON'
+    if ($fkBefore -and "$($fkBefore.foreign_keys)" -eq '0') { $fkRestore = 'OFF' }
+
     $steps = New-Object System.Collections.Generic.List[string]
     $steps.Add('PRAGMA foreign_keys = OFF;')
     # Belt and braces for the same reparse: legacy_alter_table exists in exactly the SQLite versions
     # that reparse on rename, and older builds ignore an unknown pragma silently.
     $steps.Add('PRAGMA legacy_alter_table = ON;')
-    $steps.Add('BEGIN;')
+    $steps.Add("SAVEPOINT $savepoint;")
     $steps.Add("DROP TABLE IF EXISTS $quotedTmp;")
     foreach ($f in $foreignTriggers) { $steps.Add("DROP TRIGGER IF EXISTS $(ConvertTo-Ident ([string]$f.name));") }
     $steps.Add($createTmp + ';')
@@ -78,23 +92,24 @@ function Update-DbColumnType {
     $steps.Add("ALTER TABLE $quotedTmp RENAME TO $quotedTable;")
     foreach ($d in $dependents) { $steps.Add(([string]$d.sql) + ';') }
     foreach ($f in $foreignTriggers) { $steps.Add(([string]$f.sql) + ';') }
-    $steps.Add('COMMIT;')
+    $steps.Add("RELEASE $savepoint;")
     $steps.Add('PRAGMA legacy_alter_table = OFF;')
-    $steps.Add('PRAGMA foreign_keys = ON;')
+    $steps.Add("PRAGMA foreign_keys = $fkRestore;")
     $script = $steps -join "`n"
     Write-DbLog INFO "Rebuilding table $Table to widen columns: $(($ColumnTypes.Keys | ForEach-Object { "$_=$($ColumnTypes[$_])" }) -join ', ')"
     try {
         Invoke-DbQuery -Database $Database -Query $script -NonQuery | Out-Null
     }
     catch {
-        # E2E1-001: the batch aborts at the failing statement, which is past BEGIN and possibly past
-        # "DROP TABLE <original>". Without an explicit ROLLBACK the pooled connection stays inside an
-        # open transaction, so every later statement in the session silently joins it and is thrown
-        # away when the connection closes, and the original table stays missing for the rest of the
-        # session. Reset-DbRebuildState rolls back and restores the two pragmas.
+        # E2E1-001: the batch aborts at the failing statement, which is past SAVEPOINT and possibly
+        # past "DROP TABLE <original>". Without an explicit rollback the pooled connection stays
+        # inside the transaction the savepoint opened, so every later statement in the session
+        # silently joins it and is thrown away when the connection closes, and the original table
+        # stays missing for the rest of the session. Reset-DbRebuildState rolls back to the savepoint
+        # (never further, so a caller-owned transaction survives) and restores the two pragmas.
         $rebuildError = $_
-        Reset-DbRebuildState -Database $Database
-        Write-DbLog ERROR "Rebuild of table $Table failed; the transaction was rolled back" $rebuildError.Exception
+        Reset-DbRebuildState -Database $Database -Savepoint $savepoint -ForeignKeys $fkRestore
+        Write-DbLog ERROR "Rebuild of table $Table failed; it was rolled back to its savepoint" $rebuildError.Exception
         throw $rebuildError
     }
 
@@ -111,18 +126,36 @@ function Update-DbColumnType {
 # [B] Private helper for Update-DbColumnType (E2E1-001). Not exported.
 #
 # A rebuild batch that fails part way through leaves the pooled System.Data.SQLite connection inside
-# the transaction the batch opened with BEGIN: every later statement on that connection silently
-# joins the doomed transaction and is discarded when the connection is closed. Roll the transaction
-# back and restore the two pragmas the batch changed before the error reaches the caller. Each
-# statement is best effort - ROLLBACK fails when no transaction is open, which is the normal case
-# when the batch failed before BEGIN - and the PSSQLite fallback path has no persistent connection
-# to clean up (its per-call connection is closed, and therefore rolled back, by PSSQLite itself).
+# the transaction the batch's SAVEPOINT opened: every later statement on that connection silently
+# joins the doomed transaction and is discarded when the connection is closed. Undo the rebuild and
+# restore the two pragmas the batch changed before the error reaches the caller.
+#
+# "ROLLBACK TO <sp>" undoes the rebuild's own statements and nothing else, and the following
+# "RELEASE <sp>" discards the savepoint - which commits (an empty) transaction when the rebuild
+# opened it, and leaves the caller's transaction open and intact when the caller opened it. A plain
+# unqualified ROLLBACK must never be used here: when the batch fails on its very first statement
+# because the caller already holds a transaction, it would discard the caller's uncommitted work.
+#
+# Each statement is best effort - the savepoint does not exist when the batch failed before reaching
+# it, or when SQLite already unwound the transaction itself - and the PSSQLite fallback path has no
+# persistent connection to clean up (its per-call connection is closed, and therefore rolled back,
+# by PSSQLite itself).
 function Reset-DbRebuildState {
-    param([Parameter(Mandatory)][string]$Database)
+    param(
+        [Parameter(Mandatory)][string]$Database,
+        [Parameter(Mandatory)][string]$Savepoint,
+        [ValidateSet('ON', 'OFF')][string]$ForeignKeys = 'ON'
+    )
     $conn = $null
     try { $conn = Get-DbConnection -Database $Database } catch { $conn = $null }
     if (-not $conn -or $conn.State -ne 'Open') { return }
-    foreach ($stmt in @('ROLLBACK;', 'PRAGMA legacy_alter_table = OFF;', 'PRAGMA foreign_keys = ON;')) {
+    $statements = @(
+        "ROLLBACK TO $Savepoint;",
+        "RELEASE $Savepoint;",
+        'PRAGMA legacy_alter_table = OFF;',
+        "PRAGMA foreign_keys = $ForeignKeys;"
+    )
+    foreach ($stmt in $statements) {
         $cmd = $null
         try {
             $cmd = $conn.CreateCommand()
