@@ -116,11 +116,15 @@ Describe 'BUG-064 README SchemaMode example and documentation' -Tag 'BUG-064' {
         }
     }
 
-    It 'the README documents every SchemaMode value' {
+    It 'the documentation describes every SchemaMode value' {
+        # Asserted against the documentation set (Quick Start plus reference), because the detail lives in
+        # the reference while the Quick Start summarises it.
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $docs = Get-OrmDocText -RepoRoot $script:RepoRoot
         foreach ($mode in @('Relaxed', 'Strict', 'AppendOnly')) {
-            $script:ReadmeRaw | Should -Match ('`' + $mode + '`:')
+            $docs | Should -Match ('`' + $mode + '`:')
         }
-        $script:ReadmeRaw | Should -Match 'default `Relaxed`'
+        $docs | Should -Match 'default `Relaxed`'
     }
 
     It 'AppendOnly on a fresh database throws the documented message' {
@@ -165,6 +169,8 @@ Describe 'BUG-064 README SchemaMode example and documentation' -Tag 'BUG-064' {
 
 Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
     BeforeAll {
+        # Functions dot-sourced at container level are not in scope inside BeforeAll on either host.
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:RepoRoot = Split-Path -Parent $PSScriptRoot
         $script:ReadmeRaw = (Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw)
         $script:HelpRaw = (Get-Content -LiteralPath (Join-Path (Join-Path $script:RepoRoot 'docs') 'about_PSCsvSQLiteORM.help.txt') -Raw)
@@ -180,9 +186,17 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
             $rows = @($Result | Where-Object { $null -ne $_ })
             return , $rows
         }
-        # The README code blocks in order: 1 install, 2 initialize, 3 import, 4 models, 5 query, 6 records,
-        # 7 upserts, 8 validation. Blocks 3-8 are executed verbatim (only the sample paths are rewritten).
-        $script:Blocks10 = @([regex]::Matches($script:ReadmeRaw, '(?s)```powershell\r?\n(.*?)```') | ForEach-Object { $_.Groups[1].Value })
+        # The Quick Start sections that are executed verbatim (only the sample paths are rewritten), in the
+        # order a reader runs them. Located by heading, not by ordinal, so adding or reordering a section
+        # cannot silently point this test at the wrong code.
+        $script:QuickStart10 = @(
+            '3. Import CSV Data'
+            '4. Generate Dynamic Models'
+            '5. Query Your Data'
+            '6. Work with Dynamic Models'
+            '7. Upserts and Tables Without an'
+            '8. Validation and Callbacks'
+        )
         function Convert-ReadmePath10([string]$Line) {
             # Replacement strings are literal apart from '$', so paths are quoted and any '$' is doubled.
             $map = @(
@@ -196,17 +210,10 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
             }
             return $Line
         }
-        function Get-ReadmeLines10([int]$BlockNumber) {
-            # Returns the executable statements of a README block: comments, blank lines and the two
-            # $ticket/$user stand-in lines (records of tables the Quick Start does not create) are dropped.
-            $lines = @()
-            foreach ($raw in ($script:Blocks10[$BlockNumber - 1] -split "\r?\n")) {
-                $line = $raw.Trim()
-                if (-not $line -or $line.StartsWith('#')) { continue }
-                if ($line -match '\$ticket\.|\$user\.') { continue }
-                $lines += $line
-            }
-            return , $lines
+        function Get-ReadmeLines10([string]$Heading) {
+            # The executable statements under a Quick Start heading. Comments and blank lines are dropped by
+            # the helper; nothing in the Quick Start is excluded beyond that.
+            return , (Get-OrmDocStatement -Heading $Heading -RepoRoot $script:RepoRoot)
         }
     }
     AfterAll { Close-DbConnections }
@@ -232,19 +239,20 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
                 $called += $m.Groups[1].Value
             }
         }
-        $called = @($called | Where-Object { $_ -ne 'Import-Module' -and $_ -ne 'Install-Module' } | Sort-Object -Unique)
+        # Commands of other modules that the document legitimately shows (installing, importing, testing).
+        $notOurs = @('Import-Module', 'Install-Module', 'Invoke-Pester')
+        $called = @($called | Where-Object { $notOurs -notcontains $_ } | Sort-Object -Unique)
         $called.Count | Should -BeGreaterThan 5
         foreach ($c in $called) { $exported | Should -Contain $c }
     }
 
-    It 'the README Quick Start blocks 3-8 run line by line without an error on this host' {
-        # Blocks 1-8 are the Quick Start; later blocks (section 9) are executed by the DOCS-320 container.
-        $script:Blocks10.Count | Should -BeGreaterOrEqual 8
+    It 'the README Quick Start sections 3-8 run line by line without an error on this host' {
+        # Sections 9 and 10 are executed by the DOCS-320 container, against their own databases.
         $failures = @()
         $executed = 0
-        foreach ($blockNumber in 3..8) {
-            $lines = Get-ReadmeLines10 $blockNumber
-            $lines.Count | Should -BeGreaterThan 0 -Because "README block $blockNumber must contain executable statements"
+        foreach ($heading in $script:QuickStart10) {
+            $lines = Get-ReadmeLines10 $heading
+            $lines.Count | Should -BeGreaterThan 0 -Because "README section '$heading' must contain executable statements"
             foreach ($line in $lines) {
                 $cmd = Convert-ReadmePath10 $line
                 # On Windows PowerShell 5.1 SQLite errors surface as non-terminating errors (Get-DbConnection is
@@ -254,9 +262,9 @@ Describe 'BASE-10 README Quick Start runs against the real API' -Tag 'BASE-10' {
                 try {
                     Invoke-Expression $cmd | Out-Null
                     $errs = @($global:Error | Where-Object { -not ($_ -is [System.Management.Automation.ErrorRecord] -and $_.InvocationInfo -and $_.InvocationInfo.MyCommand -and $_.InvocationInfo.MyCommand.Name -eq 'Add-Type') })
-                    if ($errs.Count -gt 0) { $failures += ("block {0}: {1} :: {2}" -f $blockNumber, $line, $errs[0]) }
+                    if ($errs.Count -gt 0) { $failures += ("section {0}: {1} :: {2}" -f $heading, $line, $errs[0]) }
                 } catch {
-                    $failures += ("block {0}: {1} :: {2}" -f $blockNumber, $line, $_.Exception.Message)
+                    $failures += ("section {0}: {1} :: {2}" -f $heading, $line, $_.Exception.Message)
                 }
                 $executed++
             }
@@ -888,7 +896,6 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
         $script:Help320 = Get-Content -LiteralPath $script:HelpPath320 -Raw
         $script:SamplePath320 = Join-Path (Join-Path (Join-Path $script:RepoRoot320 'source') 'Examples') 'orm.settings.ps1'
         $script:Manifest320 = Import-PowerShellDataFile -Path (Join-Path (Join-Path $script:RepoRoot320 'source') 'PSCsvSQLiteORM.psd1')
-        $script:Blocks320 = @([regex]::Matches($script:Readme320, '(?s)```powershell\r?\n(.*?)```') | ForEach-Object { $_.Groups[1].Value })
 
         $script:Root320 = Join-Path $env:TEMP ("orm_docs320_{0}" -f ([guid]::NewGuid().ToString('N')))
         New-Item -ItemType Directory -Path $script:Root320 -Force | Out-Null
@@ -940,7 +947,7 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
     }
 
     It 'E2E1-025: Import-CsvToSqlite returns the trimmed headers, as both documents now say' {
-        $script:Readme320 | Should -Match 'returns the trimmed CSV header names'
+        (Get-OrmDocText -RepoRoot $script:RepoRoot320) | Should -Match 'returns the trimmed CSV header names'
         $script:Help320 | Should -Match 'returns the trimmed CSV header names'
         $db = Join-Path $script:Root320 'ret320.db'
         $csv = New-Csv320 'ret320.csv' "id, hostname ,ip`r`n1,server01,10.0.0.1"
@@ -962,13 +969,7 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
     }
 
     It 'the README section 9 block runs line by line without an error on this host' {
-        $script:Blocks320.Count | Should -BeGreaterOrEqual 9
-        $lines = @()
-        foreach ($raw in ($script:Blocks320[8] -split "\r?\n")) {
-            $line = $raw.Trim()
-            if (-not $line -or $line.StartsWith('#')) { continue }
-            $lines += $line
-        }
+        $lines = Get-OrmDocStatement -Heading '9. Transactions, Raw SQL and Maintenance' -RepoRoot $script:RepoRoot320
         $lines.Count | Should -BeGreaterThan 5
         $failures = @()
         foreach ($line in $lines) {
@@ -990,6 +991,35 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
         Test-DbTransaction -Database $script:Db320 | Should -BeFalse
         @(Invoke-DbQuery -Database $script:Db320 -Query "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_fk_vulns_asset_id%'").Count | Should -Be 0
         @(Invoke-DbQuery -Database $script:Db320 -Query "SELECT table_name FROM __fks__ WHERE table_name='vulns' AND column_name='asset_id'").Count | Should -Be 0
+    }
+
+    It 'the README section 10 migrations block runs and behaves as documented' {
+        # Its own database: the block alters the assets table, which the section 9 database is asserted on.
+        $db = Join-Path $script:Root320 'mig320.db'
+        Import-CsvToSqlite -CsvPath $script:Assets320 -Database $db -TableName assets | Out-Null
+        $lines = Get-OrmDocStatement -Heading '10. Schema Migrations' -RepoRoot $script:RepoRoot320
+        $lines.Count | Should -BeGreaterThan 1
+        # The Add-DbMigration call spans several lines, so the block is run as one script rather than line by line.
+        $script = ($lines -join "`n")
+        $script = [regex]::Replace($script, [regex]::Escape('.\myapp.db'), ("'" + ($db -replace '\$', '$$$$') + "'"))
+        $global:Error.Clear()
+        { Invoke-Expression $script | Out-Null } | Should -Not -Throw
+        @($global:Error | Where-Object { -not ($_ -is [System.Management.Automation.ErrorRecord] -and $_.InvocationInfo -and $_.InvocationInfo.MyCommand -and $_.InvocationInfo.MyCommand.Name -eq 'Add-Type') }) | Should -BeNullOrEmpty
+        $global:Error.Clear()
+        # The documented effect: the column exists and the version is recorded
+        @(Invoke-DbQuery -Database $db -Query 'PRAGMA table_info(assets)' | ForEach-Object { $_.name }) | Should -Contain 'owner'
+        @(Get-AppliedMigrations -Database $db) | Should -Contain '001-add-owner'
+        # "A version already applied is skipped, so a script may call the same migration on every run"
+        { Invoke-Expression $script | Out-Null } | Should -Not -Throw
+        @(Get-AppliedMigrations -Database $db | Where-Object { $_ -eq '001-add-owner' }).Count | Should -Be 1
+        # "-Up runs inside a transaction with its bookkeeping row, so a migration that throws leaves nothing behind"
+        { Add-DbMigration -Database $db -Version '002-fails' -Up {
+                param($Database)
+                Invoke-DbQuery -Database $Database -Query 'CREATE TABLE mig_should_not_exist (x INTEGER)' -NonQuery | Out-Null
+                throw 'boom'
+            } } | Should -Throw
+        @(Invoke-DbQuery -Database $db -Query "SELECT name FROM sqlite_master WHERE name='mig_should_not_exist'").Count | Should -Be 0
+        @(Get-AppliedMigrations -Database $db) | Should -Not -Contain '002-fails'
     }
 
     It 'the documented Join overloads, Auto ambiguity, Full join source and Run() shape behave as described' {
@@ -1098,7 +1128,8 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
     }
 
     It 'both documents describe the behaviour this build has' {
-        foreach ($doc in @($script:Readme320, $script:Help320)) {
+        # The markdown side is the documentation set: the Quick Start summarises, the reference has the detail.
+        foreach ($doc in @((Get-OrmDocText -RepoRoot $script:RepoRoot320), $script:Help320)) {
             $doc | Should -Match 'AllRows'
             $doc | Should -Match 'Remove-DbForeignKey'
             $doc | Should -Match 'Test-DbTransaction'
@@ -1111,7 +1142,7 @@ Describe 'DOCS-320 the documentation describes the build under test' -Tag 'DOCS-
             $doc | Should -Match '-Force'
             $doc | Should -Match ([regex]::Escape('-WhatIf'))
         }
-        $script:Readme320 | Should -Match ([regex]::Escape('Join(<table>, <on>, <type>, <foreign key column>)'))
+        (Get-OrmDocText -RepoRoot $script:RepoRoot320) | Should -Match ([regex]::Escape('Join(<table>, <on>, <type>, <foreign key column>)'))
         $script:Help320 | Should -Match ([regex]::Escape('Join(<table>, <on>, <type>, <foreign key>)'))
     }
 }
