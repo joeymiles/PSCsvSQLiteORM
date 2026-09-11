@@ -1,4 +1,4 @@
-# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014; TASK B6 round 2: E2E1-013, E2E1-019; TASK B7 round 2: E2E1-021)
+# Unit tests for core helpers (TASK B2: BUG-004, BUG-005, BUG-013; TASK B3: BASE-02, BUG-014, BUG-049, BUG-072; TASK B4: BUG-007, BUG-009, BUG-026, BUG-047; TASK B5: BUG-008; TASK B6: BUG-011, BUG-025, BUG-058; TASK B7: BUG-012, BUG-031, BUG-032, BUG-043; TASK B8: BUG-022, BUG-023, BUG-027, BUG-030; TASK B9: BUG-024, BUG-033, BUG-066; TASK B11: BUG-044; TASK B12: BUG-034; TASK B14: BUG-068; TASK B4 round 2: E2E1-007, E2E1-008, E2E1-014; TASK B6 round 2: E2E1-013, E2E1-019; TASK B7 round 2: E2E1-021; TASK B8 round 2: E2E1-022)
 
 # Import the build of the version declared in source\PSCsvSQLiteORM.psd1 (BUG-077, see Tests\TestSupport.ps1)
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -1488,5 +1488,70 @@ Describe 'Find-DbRelationships treats names as literals, not as wildcard pattern
         $found[0].ref_column | Should -Be 'deptcode'
         [double]$found[0].confidence | Should -Be 0.75
         Close-DbConnections
+    }
+}
+
+Describe 'Set-DbLogging applies only the parameters the caller supplied' -Tag 'E2E1-022' {
+    BeforeEach { Initialize-ORMVars }
+    AfterAll { Initialize-ORMVars }
+    It 'keeps the current level when only -Path is given' {
+        # Before the fix $Level was assigned unconditionally, so changing only the log
+        # file silently reset an existing DEBUG threshold back to the 'INFO' default.
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_a.log'
+        $logB = Join-Path $script:coreWorkDir 'e2e1022_b.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        Set-DbLogging -Path $logB -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logB
+    }
+    It 'keeps DEBUG diagnostics flowing to the new file after a -Path only change' {
+        $db = New-CoreDbPath -Name 'e2e1022'
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_flow_a.log'
+        $logB = Join-Path $script:coreWorkDir 'e2e1022_flow_b.log'
+        Invoke-DbQuery -Database $db -Query 'CREATE TABLE t(id INTEGER)' -NonQuery | Out-Null
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Path $logB -Confirm:$false
+        Invoke-DbQuery -Database $db -Query 'INSERT INTO t(id) VALUES (1)' -NonQuery | Out-Null
+        Set-DbLogging -Level INFO -Path '' -Confirm:$false
+        Close-DbConnections
+        $logB | Should -Exist
+        (Get-Content -LiteralPath $logB -Raw) | Should -Match 'INSERT INTO t'
+    }
+    It 'keeps the current path when only -Level is given' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_keep.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Level ERROR -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'ERROR'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+    }
+    It 'applies both when both are given and clears the path with an empty -Path' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_both.log'
+        Set-DbLogging -Level WARN -Path $logA -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'WARN'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+        Set-DbLogging -Level INFO -Path '' -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'INFO'
+        (& $m { $script:DbLogPath }) | Should -BeNullOrEmpty
+    }
+    It 'changes nothing when called with no parameters at all' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_noargs.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Confirm:$false
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
+    }
+    It 'changes nothing under -WhatIf' {
+        $m = (Get-Command Set-DbLogging).Module
+        $logA = Join-Path $script:coreWorkDir 'e2e1022_whatif.log'
+        $logB = Join-Path $script:coreWorkDir 'e2e1022_whatif_b.log'
+        Set-DbLogging -Level DEBUG -Path $logA -Confirm:$false
+        Set-DbLogging -Level ERROR -Path $logB -WhatIf
+        (& $m { $script:DbLogLevel }) | Should -Be 'DEBUG'
+        (& $m { $script:DbLogPath }) | Should -Be $logA
     }
 }
