@@ -676,3 +676,56 @@ $splat = @{ NuGetApiKey = $NuGetApiKey; WhatIf = $WhatIf; SkipBuild = $SkipBuild
         }
     }
 }
+
+Describe 'BUG-080 no database artifact is tracked under Tests and .gitignore names only real things' -Tag 'BUG-080' {
+    BeforeAll {
+        $script:RepoRoot80 = Split-Path -Parent $PSScriptRoot
+        $script:IgnoreLines80 = @(Get-Content -LiteralPath (Join-Path $script:RepoRoot80 '.gitignore') | ForEach-Object { $_.Trim() })
+        $script:Git80 = Get-Command git -ErrorAction SilentlyContinue
+        # Runs git against this checkout; ExitCode 128 means the checkout is not a git repository (for example
+        # an extracted archive), in which case the git-backed assertions are skipped rather than failed.
+        function Invoke-Git80 {
+            param([string[]]$GitArgs)
+            $lines = @(& { $ErrorActionPreference = 'Continue'; & $script:Git80.Source -C $script:RepoRoot80 @GitArgs 2>&1 } | ForEach-Object { [string]$_ })
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = $lines }
+        }
+    }
+
+    It 'BUG-080: Tests/sample.db is not present in the working tree' {
+        Test-Path -LiteralPath (Join-Path $PSScriptRoot 'sample.db') | Should -BeFalse
+    }
+
+    It 'BUG-080: git tracks no .db file under Tests' {
+        if (-not $script:Git80) { Set-ItResult -Skipped -Because 'git is not available' }
+        $run = Invoke-Git80 @('ls-files', '--', 'Tests/*.db')
+        if ($run.ExitCode -eq 128) { Set-ItResult -Skipped -Because 'the checkout is not a git repository' }
+        $run.ExitCode | Should -Be 0
+        @($run.Lines | Where-Object { $_ -ne '' }) | Should -BeNullOrEmpty
+    }
+
+    It 'BUG-080: the ignore rules exclude Tests/sample.db and Tests/tmp' {
+        $script:IgnoreLines80 | Should -Contain '*.db'
+        $script:IgnoreLines80 | Should -Contain 'Tests/tmp/'
+        if (-not $script:Git80) { Set-ItResult -Skipped -Because 'git is not available' }
+        foreach ($path in @('Tests/sample.db', 'Tests/tmp/orm_func_x.db')) {
+            $run = Invoke-Git80 @('check-ignore', '--no-index', '-q', '--', $path)
+            if ($run.ExitCode -eq 128) { Set-ItResult -Skipped -Because 'the checkout is not a git repository' }
+            $run.ExitCode | Should -Be 0 -Because "$path must match an ignore rule"
+        }
+    }
+
+    It 'BUG-080: .gitignore does not name scripts that do not exist and does not ignore the committed scripts' {
+        $script:IgnoreLines80 | Should -Not -Contain 'build-and-test.ps1'
+        $script:IgnoreLines80 | Should -Not -Contain 'publish.ps1'
+        foreach ($name in @('build-module.ps1', 'publish-module.ps1')) {
+            Test-Path -LiteralPath (Join-Path $script:RepoRoot80 $name) | Should -BeTrue -Because "$name is the committed script"
+            $script:IgnoreLines80 | Should -Not -Contain $name
+        }
+        if (-not $script:Git80) { Set-ItResult -Skipped -Because 'git is not available' }
+        foreach ($name in @('build-module.ps1', 'publish-module.ps1')) {
+            $run = Invoke-Git80 @('check-ignore', '--no-index', '-q', '--', $name)
+            if ($run.ExitCode -eq 128) { Set-ItResult -Skipped -Because 'the checkout is not a git repository' }
+            $run.ExitCode | Should -Be 1 -Because "$name must not be ignored"
+        }
+    }
+}
