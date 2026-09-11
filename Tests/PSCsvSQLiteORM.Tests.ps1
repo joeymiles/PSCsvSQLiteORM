@@ -247,7 +247,9 @@ Describe 'module manifest editions, dependencies and release notes' {
 
     It 'release notes scope the v3.1.3 parameter fix to Import-CsvToSqlite and keep the per-version history' -Tag 'BUG-062' {
         $notes = [string]$script:SourceData.PrivateData.PSData.ReleaseNotes
-        $notes | Should -Match 'Unreleased'
+        # The entries that used to sit under 'Unreleased (since v3.1.3)' were released as v3.2.0.
+        $notes | Should -Match 'v3\.2\.0'
+        $notes | Should -Not -Match 'Unreleased'
         $notes | Should -Match 'DynamicActiveRecord'
         $notes | Should -Match 'v3\.1\.3'
         $notes | Should -Match 'Import-CsvToSqlite'
