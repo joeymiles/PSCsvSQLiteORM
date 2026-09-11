@@ -519,8 +519,10 @@ Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version f
 Describe 'BUG-061 publish-module.ps1 publishes the committed build of this checkout' -Tag 'BUG-061' {
     BeforeAll {
         $script:RepoRoot61 = Split-Path -Parent $PSScriptRoot
-        $script:Root61 = Join-Path $env:TEMP ("orm_publish_{0}" -f ([guid]::NewGuid().ToString('N')))
-        $script:Copy61 = Join-Path $script:Root61 'repo'
+        # Keep the path short: git object paths under this copy must stay below the 260 character limit
+        # regardless of how long the caller's TEMP directory is.
+        $script:Root61 = Join-Path $env:TEMP ("p61_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        $script:Copy61 = Join-Path $script:Root61 'r'
         New-Item -ItemType Directory -Path $script:Copy61 -Force | Out-Null
         foreach ($item in @('source', 'docs')) {
             Copy-Item -Recurse -LiteralPath (Join-Path $script:RepoRoot61 $item) -Destination (Join-Path $script:Copy61 $item)
@@ -537,7 +539,8 @@ Describe 'BUG-061 publish-module.ps1 publishes the committed build of this check
         $script:Git61 = Get-Command git -ErrorAction SilentlyContinue
         function Invoke-Git61 { param([string[]]$GitArgs) & $script:Git61.Source -C $script:Copy61 @GitArgs 2>&1 | Out-Null }
         if ($script:Git61) {
-            Invoke-Git61 @('init', '-q')
+            Invoke-Git61 @('-c', 'core.longpaths=true', 'init', '-q')
+            Invoke-Git61 @('config', 'core.longpaths', 'true')
             Invoke-Git61 @('config', 'user.email', 'test@example.com')
             Invoke-Git61 @('config', 'user.name', 'Pester')
             Invoke-Git61 @('config', 'commit.gpgsign', 'false')
@@ -574,7 +577,11 @@ $splat = @{ NuGetApiKey = $NuGetApiKey; WhatIf = $WhatIf; SkipBuild = $SkipBuild
             } finally {
                 Pop-Location
             }
-            return [pscustomobject]@{ ExitCode = $code; Lines = $lines; Text = ($lines -join "`n") }
+            # Windows PowerShell 5.1 word-wraps a child process's warning and error streams at the console
+            # width, and where the wrap falls depends on the length of the temp path. Flat joins all lines
+            # and collapses whitespace so phrase matches do not depend on that wrapping.
+            $flat = (($lines -join ' ') -replace '\s+', ' ')
+            return [pscustomobject]@{ ExitCode = $code; Lines = $lines; Text = ($lines -join "`n"); Flat = $flat }
         }
     }
     AfterAll {
@@ -620,13 +627,13 @@ $splat = @{ NuGetApiKey = $NuGetApiKey; WhatIf = $WhatIf; SkipBuild = $SkipBuild
         try {
             $run = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild')
             $run.ExitCode | Should -Not -Be 0
-            $run.Text | Should -Match 'Refusing to publish'
-            $run.Text | Should -Match 'source/PSCsvSQLiteORM\.psd1'
+            $run.Flat | Should -Match 'Refusing to publish'
+            $run.Flat | Should -Match 'source/PSCsvSQLiteORM\.psd1'
             @($run.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 0
 
             $forced = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild', '-AllowDirty')
             $forced.ExitCode | Should -Be 0
-            $forced.Text | Should -Match 'uncommitted or untracked changes'
+            $forced.Flat | Should -Match 'uncommitted or untracked changes'
             @($forced.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 1
         } finally {
             Invoke-Git61 @('checkout', '--', 'source/PSCsvSQLiteORM.psd1')
@@ -641,7 +648,7 @@ $splat = @{ NuGetApiKey = $NuGetApiKey; WhatIf = $WhatIf; SkipBuild = $SkipBuild
         try {
             $run = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild')
             $run.ExitCode | Should -Not -Be 0
-            $run.Text | Should -Match 'not a git repository'
+            $run.Flat | Should -Match 'not a git repository'
             @($run.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 0
 
             $forced = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild', '-AllowDirty')
