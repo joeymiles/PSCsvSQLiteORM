@@ -515,3 +515,140 @@ Describe 'BUG-059 BUG-060 BUG-076 build-module.ps1 builds the manifest version f
         }
     }
 }
+
+Describe 'BUG-061 publish-module.ps1 publishes the committed build of this checkout' -Tag 'BUG-061' {
+    BeforeAll {
+        $script:RepoRoot61 = Split-Path -Parent $PSScriptRoot
+        $script:Root61 = Join-Path $env:TEMP ("orm_publish_{0}" -f ([guid]::NewGuid().ToString('N')))
+        $script:Copy61 = Join-Path $script:Root61 'repo'
+        New-Item -ItemType Directory -Path $script:Copy61 -Force | Out-Null
+        foreach ($item in @('source', 'docs')) {
+            Copy-Item -Recurse -LiteralPath (Join-Path $script:RepoRoot61 $item) -Destination (Join-Path $script:Copy61 $item)
+        }
+        foreach ($item in @('build-module.ps1', 'publish-module.ps1', '.gitignore')) {
+            Copy-Item -LiteralPath (Join-Path $script:RepoRoot61 $item) -Destination (Join-Path $script:Copy61 $item)
+        }
+        $script:PublishScript61 = Join-Path $script:Copy61 'publish-module.ps1'
+        $script:Version61 = [string](Import-PowerShellDataFile -Path (Join-Path (Join-Path $script:Copy61 'source') 'PSCsvSQLiteORM.psd1')).ModuleVersion
+        $script:ExpectedBase61 = Join-Path (Join-Path (Join-Path $script:Copy61 'output') 'PSCsvSQLiteORM') $script:Version61
+        $script:FakeKey61 = 'oy2fakekeyfakekeyfakekeyfakekey'
+
+        # The copy is its own git repository with everything committed, so the clean tree check can pass.
+        $script:Git61 = Get-Command git -ErrorAction SilentlyContinue
+        function Invoke-Git61 { param([string[]]$GitArgs) & $script:Git61.Source -C $script:Copy61 @GitArgs 2>&1 | Out-Null }
+        if ($script:Git61) {
+            Invoke-Git61 @('init', '-q')
+            Invoke-Git61 @('config', 'user.email', 'test@example.com')
+            Invoke-Git61 @('config', 'user.name', 'Pester')
+            Invoke-Git61 @('config', 'commit.gpgsign', 'false')
+            Invoke-Git61 @('add', '-A')
+            Invoke-Git61 @('commit', '-q', '-m', 'baseline')
+        }
+
+        # A driver script for a child process of THIS host: it stubs Publish-Module so nothing reaches a
+        # repository, then runs the copied publish script from an unrelated directory with the given arguments.
+        $script:Cwd61 = Join-Path $script:Root61 'elsewhere'
+        New-Item -ItemType Directory -Path $script:Cwd61 -Force | Out-Null
+        $script:Driver61 = Join-Path $script:Root61 'publish_driver.ps1'
+        $driver = @'
+param([string]$Script, [string]$NuGetApiKey, [switch]$WhatIf, [switch]$SkipBuild, [switch]$AllowDirty)
+function Publish-Module {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Path, [string]$NuGetApiKey, [string]$Repository)
+    "STUB Publish-Module Path=$Path Repository=$Repository KeyLength=$($NuGetApiKey.Length)"
+}
+$splat = @{ NuGetApiKey = $NuGetApiKey; WhatIf = $WhatIf; SkipBuild = $SkipBuild; AllowDirty = $AllowDirty }
+& $Script @splat
+'@
+        Set-Content -LiteralPath $script:Driver61 -Value $driver -Encoding ASCII
+        $script:HostExe61 = (Get-Process -Id $PID).Path
+        function Invoke-Publish61 {
+            param([string[]]$ScriptArgs = @())
+            $callArgs = @('-NoProfile')
+            if ($PSVersionTable.PSVersion.Major -lt 6) { $callArgs += @('-ExecutionPolicy', 'Bypass') }
+            $callArgs += @('-File', $script:Driver61, '-Script', $script:PublishScript61) + $ScriptArgs
+            Push-Location -LiteralPath $script:Cwd61
+            try {
+                $lines = @(& { $ErrorActionPreference = 'Continue'; & $script:HostExe61 @callArgs 2>&1 } | ForEach-Object { [string]$_ })
+                $code = $LASTEXITCODE
+            } finally {
+                Pop-Location
+            }
+            return [pscustomobject]@{ ExitCode = $code; Lines = $lines; Text = ($lines -join "`n") }
+        }
+    }
+    AfterAll {
+        Close-DbConnections
+        if ($script:Root61 -and (Test-Path -LiteralPath $script:Root61)) {
+            Remove-Item -LiteralPath $script:Root61 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'BUG-061: the script references no machine-specific path, no build-and-test.ps1 and never prints part of the key' {
+        $text = Get-Content -LiteralPath $script:PublishScript61 -Raw
+        $text | Should -Not -Match '(?i)C:\\Users'
+        $text | Should -Not -Match 'build-and-test'
+        $text | Should -Match 'build-module\.ps1'
+        $text | Should -Not -Match 'NuGetApiKey\.Substring'
+    }
+
+    It 'BUG-061: builds with build-module.ps1 and publishes the output folder next to the script' {
+        if (-not $script:Git61) { Set-ItResult -Skipped -Because 'git is not available' }
+        $run = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf')
+        $run.Text | Should -Not -Match 'build-and-test'
+        $run.Text | Should -Match ("Building PSCsvSQLiteORM version {0}" -f [regex]::Escape($script:Version61))
+        $run.Text | Should -Match ("Preparing to publish PSCsvSQLiteORM v{0} from {1}" -f [regex]::Escape($script:Version61), [regex]::Escape($script:ExpectedBase61))
+        $stub = @($run.Lines | Where-Object { $_ -like 'STUB Publish-Module *' })
+        $stub.Count | Should -Be 1
+        $stub[0] | Should -Be ("STUB Publish-Module Path={0} Repository=PSGallery KeyLength={1}" -f $script:ExpectedBase61, $script:FakeKey61.Length)
+        $run.ExitCode | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $script:ExpectedBase61 'PSCsvSQLiteORM.psm1') | Should -BeTrue
+    }
+
+    It 'BUG-061: no fragment of the API key appears in the output' {
+        if (-not $script:Git61) { Set-ItResult -Skipped -Because 'git is not available' }
+        $run = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild')
+        $run.ExitCode | Should -Be 0
+        $run.Text | Should -Not -Match ([regex]::Escape($script:FakeKey61.Substring(0, 6)))
+        $run.Text | Should -Match ("len={0}" -f $script:FakeKey61.Length)
+    }
+
+    It 'BUG-061: refuses to publish a working tree with uncommitted changes unless -AllowDirty is given' {
+        if (-not $script:Git61) { Set-ItResult -Skipped -Because 'git is not available' }
+        $dirty = Join-Path (Join-Path $script:Copy61 'source') 'PSCsvSQLiteORM.psd1'
+        Add-Content -LiteralPath $dirty -Value '# uncommitted edit' -Encoding ASCII
+        try {
+            $run = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild')
+            $run.ExitCode | Should -Not -Be 0
+            $run.Text | Should -Match 'Refusing to publish'
+            $run.Text | Should -Match 'source/PSCsvSQLiteORM\.psd1'
+            @($run.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 0
+
+            $forced = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild', '-AllowDirty')
+            $forced.ExitCode | Should -Be 0
+            $forced.Text | Should -Match 'uncommitted or untracked changes'
+            @($forced.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 1
+        } finally {
+            Invoke-Git61 @('checkout', '--', 'source/PSCsvSQLiteORM.psd1')
+        }
+    }
+
+    It 'BUG-061: refuses when the checkout is not a git repository unless -AllowDirty is given' {
+        if (-not $script:Git61) { Set-ItResult -Skipped -Because 'git is not available' }
+        $gitDir = Join-Path $script:Copy61 '.git'
+        $parked = Join-Path $script:Root61 'git_parked'
+        Move-Item -LiteralPath $gitDir -Destination $parked
+        try {
+            $run = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild')
+            $run.ExitCode | Should -Not -Be 0
+            $run.Text | Should -Match 'not a git repository'
+            @($run.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 0
+
+            $forced = Invoke-Publish61 -ScriptArgs @('-NuGetApiKey', $script:FakeKey61, '-WhatIf', '-SkipBuild', '-AllowDirty')
+            $forced.ExitCode | Should -Be 0
+            @($forced.Lines | Where-Object { $_ -like 'STUB Publish-Module *' }).Count | Should -Be 1
+        } finally {
+            Move-Item -LiteralPath $parked -Destination $gitDir
+        }
+    }
+}
