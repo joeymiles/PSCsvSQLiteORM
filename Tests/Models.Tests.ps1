@@ -1041,3 +1041,148 @@ Describe 'BUG-062 record writes with spaced or dashed columns neither fail nor s
         (Get-Count $script:db062 'SELECT COUNT(*) AS c FROM people') | Should -Be 2
     }
 }
+
+Describe 'E2E1-006 associations honour a non-id ref_column' -Tag 'E2E1-006' {
+    BeforeAll {
+        $script:db006 = New-TestDbPath 'e2e1006'
+        Invoke-DbQuery -Database $script:db006 -Query 'CREATE TABLE corp (id INTEGER PRIMARY KEY, code TEXT, cname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db006 -Query 'CREATE TABLE branch (id INTEGER PRIMARY KEY, corp_code TEXT, bname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db006 -Query "INSERT INTO corp VALUES (1,'AAA','Alpha'),(2,'BBB','Beta')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db006 -Query "INSERT INTO branch VALUES (1,'BBB','b1'),(2,'BBB','b2'),(3,'AAA','b3')" -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $script:db006 -From 'branch' -Column 'corp_code' -To 'corp' -RefColumn 'code'
+        Export-DynamicModelsFromCatalog -Database $script:db006 | Out-Null
+        Set-DynamicORMClass
+        $script:corp006 = New-DynamicRecord -Table 'corp' -Database $script:db006
+        $script:branch006 = New-DynamicRecord -Table 'branch' -Database $script:db006
+
+        # Control database: a foreign key that does point at the parent's id column
+        $script:db006id = New-TestDbPath 'e2e1006id'
+        Invoke-DbQuery -Database $script:db006id -Query 'CREATE TABLE parent (id INTEGER PRIMARY KEY, pname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db006id -Query 'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, cname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db006id -Query "INSERT INTO parent VALUES (1,'p1')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db006id -Query "INSERT INTO child VALUES (1,1,'c1'),(2,1,'c2')" -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $script:db006id -From 'child' -Column 'parent_id' -To 'parent'
+        Export-DynamicModelsFromCatalog -Database $script:db006id | Out-Null
+        Set-DynamicORMClass
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'GetHasMany returns the children matched on the referenced column' {
+        $rows = @($script:corp006.FindById(2).GetHasMany('branch'))
+        $rows.Count | Should -Be 2
+        @($rows | ForEach-Object { $_.GetAttribute('bname') } | Sort-Object) | Should -Be @('b1', 'b2')
+    }
+
+    It 'GetBelongsTo finds the parent by the referenced column' {
+        $parent = $script:branch006.FindById(1).GetBelongsTo('corp')
+        $parent | Should -Not -BeNullOrEmpty
+        $parent.GetAttribute('cname') | Should -Be 'Beta'
+        $script:branch006.FindById(3).GetBelongsTo('corp').GetAttribute('cname') | Should -Be 'Alpha'
+    }
+
+    It 'a record reached through navigation keeps the referenced column' {
+        $child = @($script:corp006.FindById(1).GetHasMany('branch'))[0]
+        $child.GetAttribute('bname') | Should -Be 'b3'
+        $child.GetBelongsTo('corp').GetAttribute('cname') | Should -Be 'Alpha'
+    }
+
+    It 'the association records the referenced column' {
+        $script:corp006.Associations['has_many_branch'].RefColumn | Should -Be 'code'
+        $script:branch006.Associations['belongs_to_corp'].RefColumn | Should -Be 'code'
+    }
+
+    It 'the generated classes carry the referenced column' {
+        $corpFile = Get-Content -LiteralPath (Get-ModelEntry 'corp' $script:db006).ModelPath
+        @($corpFile | Where-Object { $_ -match "HasMany\('branch','corp_code','code'\)" }).Count | Should -Be 1
+        $branchFile = Get-Content -LiteralPath (Get-ModelEntry 'branch' $script:db006).ModelPath
+        @($branchFile | Where-Object { $_ -match "BelongsTo\('corp','corp_code','code'\)" }).Count | Should -Be 1
+    }
+
+    It 'an id relationship still emits the two-argument association and still navigates' {
+        $childFile = Get-Content -LiteralPath (Get-ModelEntry 'child' $script:db006id).ModelPath
+        @($childFile | Where-Object { $_ -match "BelongsTo\('parent','parent_id'\);" }).Count | Should -Be 1
+        @($childFile | Where-Object { $_ -match "BelongsTo\('parent','parent_id','" }).Count | Should -Be 0
+        $parentRec = New-DynamicRecord -Table 'parent' -Database $script:db006id
+        @($parentRec.FindById(1).GetHasMany('child')).Count | Should -Be 2
+        $childRec = New-DynamicRecord -Table 'child' -Database $script:db006id
+        $childRec.FindById(1).GetBelongsTo('parent').GetAttribute('pname') | Should -Be 'p1'
+    }
+
+    It 'the three-argument HasMany/BelongsTo overloads work on a base record' {
+        $base = New-BaseRecord 'corp' $script:db006 @('id', 'code', 'cname')
+        $base.HasMany('branch', 'corp_code', 'code')
+        @($base.FindById(2).GetHasMany('branch')).Count | Should -Be 2
+        $child = New-BaseRecord 'branch' $script:db006 @('id', 'corp_code', 'bname')
+        $child.BelongsTo('corp', 'corp_code', 'code')
+        $child.FindById(2).GetBelongsTo('corp').GetAttribute('cname') | Should -Be 'Beta'
+    }
+
+    It 'a parent whose referenced value matches nothing returns an empty array, not an error' {
+        Invoke-DbQuery -Database $script:db006 -Query "INSERT INTO corp VALUES (3,'CCC','Gamma')" -NonQuery | Out-Null
+        $rows = @($script:corp006.FindById(3).GetHasMany('branch'))
+        $rows.Count | Should -Be 0
+    }
+}
+
+Describe 'E2E1-018 All() returns records like the other finders' -Tag 'E2E1-018' {
+    BeforeAll {
+        $script:db018a = New-TestDbPath 'e2e1018'
+        Invoke-DbQuery -Database $script:db018a -Query 'CREATE TABLE owner (id INTEGER PRIMARY KEY, oname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018a -Query 'CREATE TABLE pet (id INTEGER PRIMARY KEY, owner_id INTEGER, pname TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018a -Query "INSERT INTO owner VALUES (1,'ann'),(2,'bob')" -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018a -Query "INSERT INTO pet VALUES (1,1,'rex'),(2,1,'tom'),(3,2,'sam')" -NonQuery | Out-Null
+        Confirm-DbForeignKey -Database $script:db018a -From 'pet' -Column 'owner_id' -To 'owner'
+        Export-DynamicModelsFromCatalog -Database $script:db018a | Out-Null
+        Set-DynamicORMClass
+        $script:owner018 = New-DynamicRecord -Table 'owner' -Database $script:db018a
+
+        # Table without an id column: the key comes from rowid
+        $script:db018b = New-TestDbPath 'e2e1018rowid'
+        Invoke-DbQuery -Database $script:db018b -Query 'CREATE TABLE thing (name TEXT)' -NonQuery | Out-Null
+        Invoke-DbQuery -Database $script:db018b -Query "INSERT INTO thing VALUES ('x'),('y')" -NonQuery | Out-Null
+        Export-DynamicModelsFromCatalog -Database $script:db018b | Out-Null
+        Set-DynamicORMClass
+        $script:thing018 = New-DynamicRecord -Table 'thing' -Database $script:db018b
+    }
+    AfterAll { Close-DbConnections }
+
+    It 'All() returns the same record type as Where()' {
+        $all = @($script:owner018.All())
+        $all.Count | Should -Be 2
+        $expected = @($script:owner018.Where('1=1', $null))[0].GetType().Name
+        $all[0].GetType().Name | Should -Be $expected
+        $all[0].GetType().Name | Should -Not -Be 'PSCustomObject'
+    }
+
+    It 'records from All() can navigate relationships' {
+        $ann = @($script:owner018.All() | Where-Object { $_.GetAttribute('oname') -eq 'ann' })[0]
+        @($ann.GetHasMany('pet') | ForEach-Object { $_.GetAttribute('pname') } | Sort-Object) | Should -Be @('rex', 'tom')
+    }
+
+    It 'records from All() expose the key and the column accessors' {
+        $all = @($script:owner018.All() | Sort-Object { [int]$_.Id })
+        $all[0].Id | Should -Be 1
+        $all[0].GetAttribute('oname') | Should -Be 'ann'
+    }
+
+    It 'All() on a table without an id column still exposes the rowid key' {
+        $rows = @($script:thing018.All())
+        $rows.Count | Should -Be 2
+        $rows[0].GetType().Name | Should -Not -Be 'PSCustomObject'
+        @($rows | ForEach-Object { [int]$_.Id } | Sort-Object) | Should -Be @(1, 2)
+    }
+
+    It 'AllRows() still returns the plain object projection' {
+        $rows = @($script:owner018.AllRows())
+        $rows.Count | Should -Be 2
+        $rows[0].GetType().Name | Should -Be 'PSCustomObject'
+        @($rows | ForEach-Object { $_.oname } | Sort-Object) | Should -Be @('ann', 'bob')
+    }
+
+    It 'a record from All() can be saved' {
+        $bob = @($script:owner018.All() | Where-Object { $_.GetAttribute('oname') -eq 'bob' })[0]
+        $bob.SetAttribute('oname', 'bobby')
+        { $bob.Save() } | Should -Not -Throw
+        (Get-Count $script:db018a "SELECT COUNT(*) AS c FROM owner WHERE oname = 'bobby'") | Should -Be 1
+    }
+}

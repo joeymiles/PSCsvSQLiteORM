@@ -105,20 +105,21 @@ function New-DynamicModel {
 
     # ---- Associations (emit literal $this.* without string expansion)
     # A value is one foreign key column or a list of them (a child with several foreign keys to the same parent,
-    # BUG-019); one association line is emitted per column, in the given order.
+    # BUG-019); one association line is emitted per column, in the given order. An entry may instead be a
+    # hashtable @{ Column = '<fk column>'; RefColumn = '<referenced column>' } so a foreign key that points at a
+    # non-id column keeps its target in the generated class (E2E1-006); the referenced column is only emitted
+    # when it is not the default 'id'.
     $hmLines = ($HasMany.GetEnumerator() | ForEach-Object {
             $relTable = [string]$_.Key
             foreach ($fkCol in @($_.Value)) {
-                if ($null -eq $fkCol) { continue }
-                '        $this.HasMany(''{0}'',''{1}'');' -f ($relTable -replace "'", "''"), ([string]$fkCol -replace "'", "''")
+                Format-DynamicAssociationLine -Method 'HasMany' -RelatedTable $relTable -Entry $fkCol
             }
         }) -join "`n"
 
     $btLines = ($BelongsTo.GetEnumerator() | ForEach-Object {
             $relTable = [string]$_.Key
             foreach ($fkCol in @($_.Value)) {
-                if ($null -eq $fkCol) { continue }
-                '        $this.BelongsTo(''{0}'',''{1}'');' -f ($relTable -replace "'", "''"), ([string]$fkCol -replace "'", "''")
+                Format-DynamicAssociationLine -Method 'BelongsTo' -RelatedTable $relTable -Entry $fkCol
             }
         }) -join "`n"
 
