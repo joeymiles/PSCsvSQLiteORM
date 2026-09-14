@@ -15,6 +15,10 @@ well as PowerShell 7.
 | **Reference** | [docs/reference.md](docs/reference.md), or `Get-Help about_PSCsvSQLiteORM` |
 | **Licence** | [GNU General Public License v2.0](LICENSE) |
 
+## Demo
+
+![PowerShell CLI demo of PSCsvSQLiteORM — CSV import, relationship discovery, and join query](docs/readme/demo.png)
+
 ## Quick Start
 
 ### 1. Install Dependencies
