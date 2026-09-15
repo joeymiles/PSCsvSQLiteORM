@@ -13,7 +13,7 @@ well as PowerShell 7.
 | **Requires** | [PSSQLite](https://www.powershellgallery.com/packages/PSSQLite) 1.1.0 or later |
 | **Version** | 3.2.0 ([changelog](CHANGELOG.md)) |
 | **Reference** | [docs/reference.md](docs/reference.md), or `Get-Help about_PSCsvSQLiteORM` |
-| **Licence** | [GNU General Public License v2.0](LICENSE) |
+| **Licence** | [MIT](LICENSE) |
 
 ## Demo
 
