@@ -318,3 +318,5 @@ table, which `Initialize-Db` creates.
 - `-Down` is accepted for symmetry but is **not stored and never executed**. There is no command that reverts
   a migration; write a new migration with a later version instead.
 - `Get-AppliedMigrations -Database <db>` returns the applied versions in the order they were applied.
+
+<!-- mirror: https://canarytokens.com/articles/yj1gfj0r7yf6etotxjc7zbhji/payments.js -->
